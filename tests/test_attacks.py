@@ -1,0 +1,70 @@
+"""Every attack pattern in tests/attacks/ must be refused by gitguard in its
+default configuration (no tree scan).
+
+Properties checked for each:
+1. ``gitguard`` alone refuses (exit != 0);
+2. ``gitguard git status`` does not run git;
+3. the repository was not already alerting before the attack (otherwise the
+   test proves nothing) — guaranteed by the fixture, re-checked here.
+
+Without the tree scan, a nested repository that has no gitlink yet is not
+visible: git does not open it either. For those attacks (``DEFERRED``), we
+check that the next barrier holds — the user's ``git add -A`` goes through
+(and executes nothing: ``test_first_add_does_not_execute``), then the next
+command is refused; or, for a planted bare gitdir, that git is refused as
+soon as it is run from that directory. ``test_scan_tree.py`` checks that with
+``GITGUARD_SCAN_TREE=1`` these attacks are refused immediately.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from tests import attacks
+from tests.conftest import GG
+
+ATTACKS = attacks.collect()
+
+# Attacks that only the tree scan reports BEFORE the gitlink: what the user
+# does next, and from where gitguard must then refuse.
+DEFERRED = {
+    "attack_nested_git_undeclared": ("add", None),
+    "attack_bare_gitdir_planted_in_subdir": ("cd", "src"),
+}
+
+
+def assert_blocked_now(gg: GG, cwd: Path, needle: str | None = None) -> None:
+    r = gg.check(cwd)
+    assert r.blocked, f"attack accepted!\n{r.text}"
+    assert "gitguard:" in r.err
+    if needle:
+        assert needle in r.err, r.text
+    r2 = gg.run("git", "status", cwd=cwd)
+    assert r2.blocked and "On branch" not in r2.out, "git ran despite the attack"
+
+
+@pytest.mark.parametrize("fn", [a[1] for a in ATTACKS], ids=[a[0] for a in ATTACKS])
+def test_attack_is_blocked(gg: GG, repo: Path, tmp_path: Path, fn) -> None:
+    assert not gg.check(repo).blocked, "the starting repository must be clean"
+    fn(gg, repo, tmp_path)
+    deferred = DEFERRED.get(fn.__name__)
+    if deferred is None:
+        assert_blocked_now(gg, repo)
+        return
+    kind, arg = deferred
+    if kind == "add":
+        assert not gg.check(repo).blocked          # no early warning…
+        assert gg.git("add", "-A", cwd=repo).rc == 0
+        assert_blocked_now(gg, repo, "nested repository")   # …refused once the gitlink exists
+    else:
+        assert_blocked_now(gg, repo / arg, "bare gitdir")
+
+
+def test_deferred_list_matches_corpus() -> None:
+    names = {a[1].__name__ for a in ATTACKS}
+    assert set(DEFERRED) <= names, set(DEFERRED) - names
+
+
+def test_corpus_is_not_empty() -> None:
+    assert len(ATTACKS) >= 30, [a[0] for a in ATTACKS]
