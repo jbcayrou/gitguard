@@ -420,3 +420,134 @@ def test_split_index_refused_explicitly(gg: GG, repo: Path) -> None:
     assert gg.git("update-index", "--split-index", cwd=repo).rc == 0
     r = gg.check(repo)
     assert r.blocked and "split" in r.err.lower(), r.text
+
+
+# ------------------------------------------ pass 8: exec-mode parsing, auto-trust
+def test_config_env_then_dash_C_checks_target(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[40] `--config-env k=V -C <trapped>`: --config-env was taken for the
+    subcommand, the -C ignored, and gitguard checked the cwd (no repository)."""
+    gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=repo)
+    r = gg.run("git", "--config-env", "user.name=HOME", "-C", str(repo), "status", cwd=tmp_path)
+    assert r.blocked and "On branch" not in r.out
+
+
+def test_gitdir_before_dash_C_checks_target(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[41] `--git-dir=.git -C <trapped>` run from another trusted repository:
+    gitguard resolved .git against the cwd, git against the -C target."""
+    other = tmp_path / "other"
+    gg.git("init", "-q", str(other))
+    gg.trust(other)
+    gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=repo)
+    r = gg.run("git", "--git-dir=.git", "-C", str(repo), "status", cwd=other)
+    assert r.blocked and "On branch" not in r.out
+
+
+def _tpl(tmp_path: Path) -> Path:
+    tpl = tmp_path / "tpl"
+    write_exec(tpl / "hooks/post-checkout")
+    return tpl
+
+
+def test_clone_templatedir_in_included_global_config_no_autotrust(gg: GG, tmp_path: Path) -> None:
+    """[42] init.templateDir set in a file included by ~/.gitconfig"""
+    src, tpl = make_source(gg, tmp_path), _tpl(tmp_path)
+    inc = Path(gg.env["HOME"]) / "extra.cfg"
+    inc.write_text(f"[init]\n\ttemplateDir = {tpl}\n")
+    gg.git("config", "--global", "include.path", str(inc))
+    res = gg.run("git", "clone", "-q", str(src), "c", cwd=tmp_path)
+    assert res.rc == 0 and (tmp_path / "c/.git/hooks/post-checkout").exists()
+    assert gg.check(tmp_path / "c").blocked
+
+
+def test_clone_templatedir_dash_c_no_autotrust(gg: GG, tmp_path: Path) -> None:
+    """[42] `git -c init.templateDir=… clone`"""
+    src, tpl = make_source(gg, tmp_path), _tpl(tmp_path)
+    res = gg.run("git", "-c", f"init.templateDir={tpl}", "clone", "-q", str(src), "c", cwd=tmp_path)
+    assert res.rc == 0 and (tmp_path / "c/.git/hooks/post-checkout").exists()
+    assert gg.check(tmp_path / "c").blocked
+
+
+def test_clone_git_template_dir_env_no_autotrust(gg: GG, tmp_path: Path) -> None:
+    """[42] GIT_TEMPLATE_DIR in the environment"""
+    src, tpl = make_source(gg, tmp_path), _tpl(tmp_path)
+    gg.env["GIT_TEMPLATE_DIR"] = str(tpl)
+    res = gg.run("git", "clone", "-q", str(src), "c", cwd=tmp_path)
+    assert res.rc == 0 and (tmp_path / "c/.git/hooks/post-checkout").exists()
+    assert gg.check(tmp_path / "c").blocked
+
+
+def test_clone_config_parameters_env_no_autotrust(gg: GG, tmp_path: Path) -> None:
+    """[42] init.templateDir through GIT_CONFIG_COUNT/KEY/VALUE"""
+    src, tpl = make_source(gg, tmp_path), _tpl(tmp_path)
+    gg.env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="init.templateDir",
+                  GIT_CONFIG_VALUE_0=str(tpl))
+    res = gg.run("git", "clone", "-q", str(src), "c", cwd=tmp_path)
+    assert res.rc == 0 and (tmp_path / "c/.git/hooks/post-checkout").exists()
+    assert gg.check(tmp_path / "c").blocked
+
+
+@pytest.mark.xfail(strict=True, reason="[44] open: the check runs before git updates the tree")
+def test_checkout_rewrites_tracked_hook_then_runs_it(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[44] OPEN — core.hooksPath in the tree (husky, .githooks) and hooks
+    tracked by git. refs/ and objects/ are volatile: the container commits a
+    rewritten post-checkout on a branch. The state is clean when gitguard
+    checks; `git checkout feat` writes the new hook, then runs it."""
+    mark = tmp_path / "RAN"
+    write_exec(repo / ".githooks/post-checkout", "#!/bin/sh\nexit 0\n")
+    gg.git("add", ".githooks", cwd=repo)
+    gg.git("commit", "-qm", "hooks", cwd=repo)
+    gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
+    gg.trust(repo)
+    # the container
+    gg.git("checkout", "-q", "-b", "feat", cwd=repo)
+    write_exec(repo / ".githooks/post-checkout", f"#!/bin/sh\ntouch '{mark}'\n")
+    gg.git("commit", "-qam", "evil", cwd=repo)
+    gg.git("checkout", "-q", "main", cwd=repo)
+    assert not mark.exists() and not gg.check(repo).blocked
+    # the user
+    gg.run("git", "checkout", "-q", "feat", cwd=repo)
+    assert not mark.exists(), "post-checkout from the container's commit was executed"
+
+
+def test_trust_warns_hooks_in_tree(gg: GG, repo: Path) -> None:
+    """[44] open flaw made visible: hooks under core.hooksPath in the tree."""
+    write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0 and "hooks in the work tree (.githooks)" in r.err, r.text
+    assert "hooks in the work tree" not in gg.run("trust", cwd=gg_plain(gg, repo)).err
+
+
+def gg_plain(gg: GG, repo: Path) -> Path:
+    p = repo.parent / "plain"
+    gg.git("init", "-q", str(p))
+    return p
+
+
+# ------------------------------------------------ pass 9: discovery parity [49]
+def test_invalid_dotgit_dir_is_walked_past(gg: GG, repo: Path) -> None:
+    """[49] a `.git` directory git does not recognise is skipped: `trust`
+    and the check from there concern the parent repository, as for git."""
+    src = repo / "src"
+    (src / ".git").mkdir(parents=True)
+    (src / ".git/config").write_text("[core]\n\tfsmonitor = /tmp/evil\n")
+    assert not gg.check(src).blocked                       # the parent is trusted and clean
+    r = gg.run("trust", cwd=src)
+    assert r.rc == 0 and str(repo) in r.err and not gg.key_for(src).exists(), r.text
+    gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=repo)
+    assert gg.check(src).blocked                           # the parent's trap is seen from src
+
+
+def test_core_worktree_keeps_the_key(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[47] core.worktree redirects the tree, not the identity of the
+    repository: the state stays keyed on the directory holding .git, and a
+    core.worktree added by the sandbox is an ordinary config change (diff)."""
+    other = tmp_path / "other"
+    other.mkdir()
+    gg.git("config", "core.worktree", str(other), cwd=repo)
+    r = gg.check(repo)
+    assert r.blocked and "worktree = " in r.err and "never trusted" not in r.err, r.text
+    assert f"{repo}/.git has changed" in r.err, r.text   # named by its .git, not by the tree
+    gg.trust(repo)
+    assert gg.key_for(repo).exists() and not gg.key_for(other).exists()
+    assert gg.run("list").err.startswith("ok ")

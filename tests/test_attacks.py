@@ -34,6 +34,12 @@ DEFERRED = {
 }
 
 
+# Known open flaws: the attack is in the corpus, the refusal is not there yet.
+# xfail(strict): a fix makes the test XPASS, then remove the entry.
+OPEN = {
+}
+
+
 def assert_blocked_now(gg: GG, cwd: Path, needle: str | None = None) -> None:
     r = gg.check(cwd)
     assert r.blocked, f"attack accepted!\n{r.text}"
@@ -44,7 +50,9 @@ def assert_blocked_now(gg: GG, cwd: Path, needle: str | None = None) -> None:
     assert r2.blocked and "On branch" not in r2.out, "git ran despite the attack"
 
 
-@pytest.mark.parametrize("fn", [a[1] for a in ATTACKS], ids=[a[0] for a in ATTACKS])
+@pytest.mark.parametrize("fn", [
+    pytest.param(fn, marks=pytest.mark.xfail(strict=True, reason=OPEN[fn.__name__]))
+    if fn.__name__ in OPEN else fn for _, fn in ATTACKS], ids=[a[0] for a in ATTACKS])
 def test_attack_is_blocked(gg: GG, repo: Path, tmp_path: Path, fn) -> None:
     assert not gg.check(repo).blocked, "the starting repository must be clean"
     fn(gg, repo, tmp_path)
@@ -64,6 +72,7 @@ def test_attack_is_blocked(gg: GG, repo: Path, tmp_path: Path, fn) -> None:
 def test_deferred_list_matches_corpus() -> None:
     names = {a[1].__name__ for a in ATTACKS}
     assert set(DEFERRED) <= names, set(DEFERRED) - names
+    assert set(OPEN) <= names, set(OPEN) - names
 
 
 def test_corpus_is_not_empty() -> None:

@@ -38,7 +38,8 @@ def test_parse_quotes_keep_hash(tmp_path: Path) -> None:
 
 def test_parse_escapes_and_continuation(tmp_path: Path) -> None:
     out = _cfg(tmp_path, '[alias]\n\tx = "a\\"b" \\\n\t  c\n')
-    assert out == [("alias", "x", 'a"b c')]   # verified: `git config -f` gives exactly this
+    # git 2.50 keeps the internal whitespace as is (verified with `git config -f`)
+    assert out == [("alias", "x", 'a"b \t  c')]
 
 
 def test_parse_boolean_without_value(tmp_path: Path) -> None:
@@ -338,3 +339,40 @@ TRACK = [("branch.feat", "remote", "origin"), ("branch.feat", "merge", "refs/hea
 ])
 def test_branch_tracking_only(old, new, expected) -> None:
     assert gg_mod.branch_tracking_only(old, new) == expected
+
+
+# ------------------------------------------- pass 8: global options, display
+def test_split_global_options_gitdir_resolved_after_all_dash_C() -> None:
+    """[41] git applies -C at once but resolves a relative --git-dir /
+    --work-tree from the final cwd: `--git-dir=.git -C repo` is repo/.git."""
+    o = split_global_options(["--git-dir=.git", "-C", "repo", "status"], Path("/w"))
+    assert o.cwd == Path("/w/repo") and o.gitdir == Path("/w/repo/.git")
+    o = split_global_options(["--work-tree", "t", "-C", "a", "--git-dir", "g", "log"], Path("/w"))
+    assert o.gitdir == Path("/w/a/g") and o.worktree == Path("/w/a/t")
+
+
+@pytest.mark.parametrize("opt", ["--config-env", "--attr-source", "--shallow-file"])
+def test_split_global_options_separate_argument(opt) -> None:
+    """[40] options taking a separate argument: the argument is not the
+    subcommand, and the -C that follows is honoured"""
+    o = split_global_options([opt, "x=Y", "-C", "repo", "status"], Path("/w"))
+    assert o.cwd == Path("/w/repo") and o.rest == ["status"]
+
+
+def test_split_global_options_unknown_option_refused() -> None:
+    """[40] an option gitguard does not know may take an argument: refuse
+    rather than guess (git refuses unknown options too)"""
+    with pytest.raises(Refuse):
+        split_global_options(["--frobnicate", "x", "-C", "repo", "status"], Path("/w"))
+
+
+@pytest.mark.parametrize("raw", [
+    "a\x1b[8mhidden\x1b[0m",          # conceal
+    "a\x1b[30;40mhidden\x1b[0m",      # black on black
+    "a\x1b[38;5;0;48;5;0mhidden",     # 256-colour fg = bg
+    "a\x1b[2;8mhidden",
+])
+def test_san_neutralizes_hiding_sgr(raw) -> None:
+    """[43] an SGR sequence from a file (config diff shown before [y/N]) could
+    hide the rest of the line; only gitguard's own codes are kept"""
+    assert "\x1b" not in san(raw).replace("\x1b[0m", "")

@@ -72,35 +72,19 @@ PARSER_OK = [
     ("non_utf8", b"[alias]\n\tx = \xff\xfe\n[core]\n\thooksPath = .githooks\n"),
     ("include_case", b"[INCLUDE]\n\tPATH = a\n[IncludeIf \"gitdir:/X/\"]\n\tpath = b\n"),
     ("duplicate_keys", b"[core]\n\thooksPath = a\n[core]\n\thooksPath = b\n"),
-]
-
-PARSER_DIVERGENT = [
-    # Security: git sees core.hookspath, gitguard does not (see also E2E below).
-    ("utf8_bom", b"\xef\xbb\xbf[core]\n\thooksPath = .githooks\n",
-     "UTF-8 BOM: git ignores it, gitguard reads `\\ufeff[core]` as a key → empty section"),
-    ("comment_line_backslash_hash", b"[core]\n# note \\\n\thooksPath = .githooks\n",
-     "trailing `\\` on a comment line: git does not continue, gitguard swallows the next line"),
-    ("comment_line_backslash_semi", b"[core]\n; note \\\n\thooksPath = .githooks\n",
-     "same with `;`"),
-    ("inline_comment_backslash_hash", b"[core]\n\tpager = less # x \\\n\thooksPath = .githooks\n",
-     "trailing `\\` inside an end-of-value comment: not a continuation for git"),
-    ("inline_comment_backslash_semi", b"[core]\n\tpager = less ; x \\\n\thooksPath = .githooks\n",
-     "same with `;`"),
-    ("backslash_at_eof", b"[core]\n\thooksPath = .githooks\\",
-     "trailing `\\` without a newline: git ignores it, gitguard keeps `.githooks\\`"),
-    ("nul_in_value", b"[core]\n\thooksPath = .githooks\x00junk\n",
-     "git truncates the value at the NUL (`.githooks`), gitguard keeps `.githooks\\0junk`"),
-    ("internal_whitespace", b"[core]\n\thooksPath = my  \thooks\n",
-     "git 2.50 keeps unquoted internal whitespace as is (`my  \\thooks`), "
-     "_unquote collapses it to one space → `hooksPath = my  hooks` targets another directory; "
-     "test_unit.test_parse_escapes_and_continuation also expects the collapse"),
-    # Fidelity (no known vector):
-    ("subsection_unknown_escape", b'[a "b\\\\c\\"d\\e"]\n\tk = v\n',
-     "subsection: git strips the `\\` before any character, gitguard only before \\ and \""),
-    ("vertical_tab_value", b"[core]\n\thooksPath =\x0b.githooks\n",
-     "git's isspace = \"\\t\\n\\r\"; str.strip() also strips \\v\\f"),
-    ("nbsp_trailing", "[core]\n\thooksPath = .githooks\u00a0\n".encode(),
-     "str.strip() strips the no-break space, git keeps it in the value"),
+    # Formerly divergent (xfail), fixed by the port of git's parser [46]:
+    ("utf8_bom", b"\xef\xbb\xbf[core]\n\thooksPath = .githooks\n"),
+    ("comment_line_backslash_hash", b"[core]\n# note \\\n\thooksPath = .githooks\n"),
+    ("comment_line_backslash_semi", b"[core]\n; note \\\n\thooksPath = .githooks\n"),
+    ("inline_comment_backslash_hash", b"[core]\n\tpager = less # x \\\n\thooksPath = .githooks\n"),
+    ("inline_comment_backslash_semi", b"[core]\n\tpager = less ; x \\\n\thooksPath = .githooks\n"),
+    ("backslash_at_eof", b"[core]\n\thooksPath = .githooks\\"),
+    ("internal_whitespace", b"[core]\n\thooksPath = my  \thooks\n"),
+    ("subsection_unknown_escape", b'[a "b\\\\c\\"d\\e"]\n\tk = v\n'),
+    ("vertical_tab_value", b"[core]\n\thooksPath =\x0b.githooks\n"),
+    ("nbsp_trailing", "[core]\n\thooksPath = .githooks\u00a0\n".encode()),
+    ("trailing_space_then_comment", b"[core]\n\thooksPath = .githooks   # c\n"),
+    ("quoted_then_space", b'[core]\n\thooksPath = "a b"  \n'),
 ]
 
 # Files git rejects (fatal: bad config line): gitguard's tolerance is harmless
@@ -131,10 +115,24 @@ def test_parser_matches_git(tmp_path: Path, data: bytes) -> None:
     _assert_parser_covers_git(tmp_path, data)
 
 
-@pytest.mark.parametrize("data", [
-    pytest.param(c[1], marks=XF(strict=True, reason=c[2]), id=c[0]) for c in PARSER_DIVERGENT])
-def test_parser_divergence(tmp_path: Path, data: bytes) -> None:
-    _assert_parser_covers_git(tmp_path, data)
+def test_parser_nul_refused(tmp_path: Path) -> None:
+    """git truncates a value at a NUL byte (C string); gitguard refuses the
+    file instead of guessing — see test_nul_in_config_fails_closed."""
+    p = tmp_path / "cfg"
+    p.write_bytes(b"[core]\n\thooksPath = .githooks\x00junk\n")
+    assert _git_list(p) == [("core.hookspath", ".githooks")]
+    with pytest.raises(gg_mod.Refuse):
+        parse_git_config(p)
+
+
+@pytest.mark.parametrize("data", [c[1] for c in GIT_REJECTS], ids=[c[0] for c in GIT_REJECTS])
+def test_parser_refuses_what_git_rejects(tmp_path: Path, data: bytes) -> None:
+    """Same port, same verdict: a file git dies on is refused (not silently
+    read differently)."""
+    p = tmp_path / "cfg"
+    p.write_bytes(data)
+    with pytest.raises(gg_mod.Refuse):
+        parse_git_config(p)
 
 
 @pytest.mark.parametrize("data", [c[1] for c in GIT_REJECTS], ids=[c[0] for c in GIT_REJECTS])
@@ -171,10 +169,9 @@ def test_hookspath_e2e_control(gg: GG, repo: Path) -> None:
     _hookspath_e2e(gg, repo, lambda b: b + b"[core]\n\thooksPath = .githooks\n")
 
 
-@pytest.mark.parametrize("edit", [
-    pytest.param(c[1], marks=XF(strict=True, reason="parser divergence (section 1)"), id=c[0])
-    for c in E2E_PARSER])
-def test_hookspath_e2e_divergence(gg: GG, repo: Path, edit) -> None:
+@pytest.mark.parametrize("edit", [c[1] for c in E2E_PARSER], ids=[c[0] for c in E2E_PARSER])
+def test_hookspath_e2e_parser_cases(gg: GG, repo: Path, edit) -> None:
+    """Formerly divergent [46]: git honours the hooksPath, so must gitguard."""
     _hookspath_e2e(gg, repo, edit)
 
 
@@ -202,9 +199,9 @@ def _git_path(tmp_path: Path, value: str, env: dict) -> str | None:
 @pytest.mark.parametrize("value", [
     "~/x",
     "/abs/x",
-    pytest.param(f"~{getpass.getuser()}/x", marks=XF(strict=True, reason=(
-        "`~user/`: git expands it (getpwnam), _expand2 does not → `core.hooksPath = ~jb/vol/hooks` "
-        "or `include.path = ~jb/vol/x.cfg` never watched")), id="tilde_user"),
+    pytest.param(f"~{getpass.getuser()}/x", id="tilde_user"),   # [50]
+    pytest.param(f"~{getpass.getuser()}", id="tilde_user_bare"),
+    "~",
 ])
 def test_path_expansion_matches_git(gg: GG, tmp_path: Path, monkeypatch, value: str) -> None:
     monkeypatch.setenv("HOME", gg.env["HOME"])
@@ -262,16 +259,13 @@ def test_includeif_any_condition_followed(gg: GG, repo: Path, cond: str) -> None
 # ======================= 4. value tokens vs what sh actually executes
 # Alias value (without the `!`) → git hands it to sh. If the tree script it
 # launches is not recognised as a path, its rewrite goes through.
-SHELL_OK = ["./tool.sh", "sh tool.sh", "sh -c ./tool.sh", '"./tool.sh"']
-SHELL_DIVERGENT = [
-    ("and_and", "./tool.sh&&true"),
-    ("pipe", "./tool.sh|cat"),
-    ("redirect", "sh<tool.sh"),
-    ("subshell", "(./tool.sh)"),
-    ("cmd_subst", "echo $(./tool.sh)"),
-    ("function", "f() { ./tool.sh; }; f"),        # very common alias form
-    ("semicolon", "./tool.sh;true"),
-]
+SHELL_OK = ["./tool.sh", "sh tool.sh", "sh -c ./tool.sh", '"./tool.sh"',
+            # sh operators: split since [37] (were xfail)
+            "./tool.sh&&true", "./tool.sh|cat", "sh<tool.sh", "(./tool.sh)",
+            "echo $(./tool.sh)", "f() { ./tool.sh; }; f", "./tool.sh;true",
+            # sh expansions at the top of the tree [37]
+            "$PWD/tool.sh", "${PWD}/tool.sh", "$(git rev-parse --show-toplevel)/tool.sh",
+            "T=./tool.sh; $T"]
 
 
 def _alias_e2e(gg: GG, repo: Path, cmd: str) -> None:
@@ -290,14 +284,6 @@ def _alias_e2e(gg: GG, repo: Path, cmd: str) -> None:
 
 @pytest.mark.parametrize("cmd", SHELL_OK)
 def test_alias_script_watched(gg: GG, repo: Path, cmd: str) -> None:
-    _alias_e2e(gg, repo, cmd)
-
-
-@pytest.mark.parametrize("cmd", [
-    pytest.param(c, id=n, marks=XF(strict=True, reason=(
-        "_value_tokens does not split on sh operators (&& | < ( ) $( ; {)")))
-    for n, c in SHELL_DIVERGENT])
-def test_alias_script_shell_operators(gg: GG, repo: Path, cmd: str) -> None:
     _alias_e2e(gg, repo, cmd)
 
 
@@ -347,12 +333,33 @@ def test_discovery_linked_worktree(explicit: GG, repo: Path, tmp_path: Path, mon
     _assert_same_repo(explicit, tmp_path / "wt", monkeypatch)
 
 
-@XF(strict=True, reason=(
-    "`.git` directory invalid for git (no HEAD/objects/refs): git ignores it and walks up "
-    "to the parent; gitguard stops on it and checks (then may trust) another gitdir"))
 def test_discovery_invalid_dotgit_dir_skipped_by_git(explicit: GG, repo: Path, monkeypatch) -> None:
+    """[49] `.git` directory invalid for git (no HEAD/objects/refs): git
+    ignores it and walks up to the parent; gitguard stopped on it."""
     (repo / "src/.git").mkdir(parents=True)
     (repo / "src/.git/config").write_text("[core]\n")
+    _assert_same_repo(explicit, repo / "src", monkeypatch)
+
+
+@pytest.mark.parametrize("layout", ["head_symlink", "commondir", "head_sha", "head_ref_tab"])
+def test_discovery_gitdir_variants_match_git(explicit: GG, repo: Path, tmp_path: Path,
+                                             monkeypatch, layout: str) -> None:
+    """[49] is_git_directory as git has it: HEAD may be a symlink to refs/…,
+    a detached SHA, `ref:<tab>refs/…`; objects/refs may live behind `commondir`."""
+    g = repo / "src/.git"
+    g.mkdir(parents=True)
+    (g / "config").write_text("[core]\n")
+    if layout == "commondir":
+        (g / "HEAD").write_text("ref: refs/heads/main\n")
+        (g / "commondir").write_text("../../.git\n")
+    else:
+        (g / "objects").mkdir(); (g / "refs").mkdir()
+        if layout == "head_symlink":
+            (g / "HEAD").symlink_to("refs/heads/nope")
+        elif layout == "head_sha":
+            (g / "HEAD").write_text("0" * 40 + "\n")
+        else:
+            (g / "HEAD").write_text("ref:\trefs/heads/main\n")
     _assert_same_repo(explicit, repo / "src", monkeypatch)
 
 
@@ -377,10 +384,9 @@ def test_planted_gitdir_refused_by_git_with_explicit(explicit: GG, repo: Path, l
     assert r.rc != 0 or Path(r.out.strip()).resolve() == (repo / ".git").resolve(), r.text
 
 
-@XF(strict=True, reason=(
-    "core.worktree in .git/config: git takes that directory as the root (and resolves a "
-    "relative core.hooksPath there), gitguard keeps the directory containing .git"))
 def test_core_worktree_hookspath(explicit: GG, repo: Path, tmp_path: Path) -> None:
+    """[47] core.worktree in .git/config: git takes that directory as the root
+    and resolves a relative core.hooksPath there."""
     other = tmp_path / "other"
     write_exec(other / ".githooks/pre-commit", BENIGN)
     explicit.git("config", "core.worktree", str(other), cwd=repo)
@@ -472,12 +478,26 @@ def test_default_system_config_is_real_gits(tmp_path: Path) -> None:
     assert Path(r.stdout.strip()).resolve() == Path("/etc/gitconfig").resolve()
 
 
-@XF(strict=True, reason=(
-    "GIT_CONFIG_COUNT/KEY_n/VALUE_n (and GIT_CONFIG_PARAMETERS, `-c`): git honours them, "
-    "config_refs does not read them → a hooksPath set by the environment is never watched"))
-def test_env_config_hookspath(gg: GG, repo: Path) -> None:
-    gg.env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath",
-                  GIT_CONFIG_VALUE_0=".githooks")
+@pytest.mark.parametrize("how", ["count", "parameters", "parameters_old", "dash_c"])
+def test_env_config_hookspath(gg: GG, repo: Path, how: str) -> None:
+    """[48] GIT_CONFIG_COUNT/KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS (both
+    syntaxes) and `-c`: git honours them, so does config_refs."""
+    if how == "count":
+        gg.env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath",
+                      GIT_CONFIG_VALUE_0=".githooks")
+    elif how == "parameters":
+        gg.env["GIT_CONFIG_PARAMETERS"] = "'user.x'='a b' 'core.hooksPath'='.githooks'"
+    elif how == "parameters_old":
+        gg.env["GIT_CONFIG_PARAMETERS"] = "'core.hooksPath=.githooks'"
+    else:
+        write_exec(repo / ".githooks/pre-commit", BENIGN)
+        gg.trust(repo)
+        write_exec(repo / ".githooks/pre-commit", EVIL)
+        r = gg.run("git", "-c", "core.hooksPath=.githooks", "status", cwd=repo)
+        assert r.blocked and "On branch" not in r.out, r.text
+        r = gg.run("git", "status", cwd=repo)
+        assert not r.blocked, r.text        # without -c the hook is not git's
+        return
     write_exec(repo / ".githooks/pre-commit", BENIGN)
     assert gg.git("config", "--get", "core.hookspath", cwd=repo).out.strip() == ".githooks"
     gg.trust(repo)

@@ -228,11 +228,14 @@ def test_safe_directory_global_does_not_watch_siblings(gg: GG, repo: Path, tmp_p
 
 
 def test_local_remote_commits_do_not_alert(gg: GG, repo: Path, tmp_path: Path) -> None:
-    """[25] remote.origin.url = local repository: commits over there, no alert here."""
+    """[25] remote.origin.url = local repository: commits over there, no alert
+    here. Only its config and hooks/ are watched [45], never the directory."""
     other = make_source(gg, tmp_path, "other")
     gg.git("remote", "add", "origin", str(other), cwd=repo)
     r = gg.trust(repo)
-    assert "ext:" not in r.err, r.err
+    o = other.resolve()
+    ext = {t[4:] for t in r.err.split() if t.startswith("ext:")}
+    assert ext == {f"{o}/.git/config", f"{o}/.git/hooks"}, r.err
     (other / "b").write_text("b\n")
     gg.git("add", "b", cwd=other)
     gg.git("commit", "-qm", "b", cwd=other)
@@ -282,3 +285,31 @@ def test_nested_submodule_and_slashed_name_still_anchored(gg: GG, repo: Path, tm
     assert gg.git("gc", "-q", cwd=sub).rc == 0
     r = gg.check(repo)
     assert not r.blocked, r.text
+
+
+def test_push_fetch_local_remote_no_alert(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[45] a local remote's config and hooks/ are watched: an ordinary push
+    and fetch to/from it must not alert."""
+    bare = tmp_path / "remote.git"
+    assert gg.git("init", "-q", "--bare", str(bare)).rc == 0
+    gg.git("remote", "add", "origin", str(bare), cwd=repo)
+    gg.trust(repo)
+    for args in (["push", "-q", "origin", "HEAD:refs/heads/main"], ["fetch", "-q", "origin"],
+                 ["push", "-q", "origin", "HEAD:refs/heads/other"]):
+        r = gg.run("git", *args, cwd=repo)
+        assert r.rc == 0, r.text
+    assert not gg.check(repo).blocked, gg.check(repo).text
+
+
+def test_remote_of_remote_not_followed(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[45] pushing to A does not push to A's remotes: A's own remotes are not
+    pulled into the fingerprint."""
+    far = tmp_path / "far.git"
+    near = tmp_path / "near.git"
+    gg.git("init", "-q", "--bare", str(far))
+    gg.git("init", "-q", "--bare", str(near))
+    gg.git("--git-dir", str(near), "remote", "add", "up", str(far))
+    gg.git("remote", "add", "origin", str(near), cwd=repo)
+    gg.trust(repo)
+    (far / "hooks/pre-receive").write_text("#!/bin/sh\n")
+    assert not gg.check(repo).blocked

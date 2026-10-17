@@ -84,14 +84,26 @@ After an upgrade that changes what the fingerprint contains: `gitguard retrust`.
 ## What the script checks, in order
 
 1. **Root discovery without calling git** (`find_root`): walk up the
-   directories and at each level, **in git's order**: does `.git` exist? If
-   not, is the directory itself a gitdir (`HEAD` + `objects/` + `refs/`,
-   `is_bare_gitdir`)? In that second case we refuse: an unhandled bare
-   repository, or a booby-trapped directory git would use instead of the
-   repository (flaw [23]). Calling `git rev-parse` would already read the
-   trapped config — never reintroduce that. With `--git-dir`/`GIT_DIR`, the
-   checked tree is `--work-tree`/`GIT_WORK_TREE`, else `core.worktree`, else
-   the cwd ([28]).
+   directories and at each level, **in git's order**: is `.git` a file (or a
+   symlink, refused later), or a directory git recognises? If not, is the
+   directory itself a gitdir? That recognition is `is_bare_gitdir`, a port of
+   git's `is_git_directory`: a valid `HEAD` (symlink to `refs/…`, `ref:
+   refs/…` or a hex id, `_validate_headref`) and `objects` + `refs`
+   reachable in the common dir (the directory or what its `commondir` file
+   names). A `.git` directory git does not recognise is **walked past**, as
+   git does — stopping on it checked, and let the user trust, a bogus gitdir
+   while git used the parent's ([49]). In the "directory itself is a gitdir"
+   case we refuse: an unhandled bare repository, or a booby-trapped directory
+   git would use instead of the repository (flaw [23]). Calling `git
+   rev-parse` would already read the trapped config — never reintroduce
+   that. With `--git-dir`/`GIT_DIR`, the checked tree is
+   `--work-tree`/`GIT_WORK_TREE`, else `core.worktree`, else the cwd ([28]).
+   Without them, a `core.worktree` in the config (common `config`, then
+   `config.worktree` if `extensions.worktreeConfig`) redirects the tree as
+   git does ([47]); the state key, `.root` and the messages stay on the
+   directory holding `.git` (`Repo.anchor`, `Repo.label`): a `core.worktree`
+   written by the sandbox is an ordinary config change shown in the diff,
+   not a "never trusted" repository.
 2. **`resolve_gitdir`** (in `open_repo`): `.git` must not be a symlink; if it
    is a `gitdir:` file, the target must not be *inside* the work tree
    (legitimate worktrees and submodules point outside).
@@ -114,8 +126,11 @@ After an upgrade that changes what the fingerprint contains: `gitguard retrust`.
    - `check_rebase_todo`: no `exec`/`x` line in `rebase-merge/git-rebase-todo`,
      `rebase-apply/git-rebase-todo` or `sequencer/todo` — these files live in
      volatile directories (git rewrites them at every step, they cannot be
-     fingerprinted) but git executes their `exec` lines.
-     `GITGUARD_ALLOW_REBASE_EXEC=1` for people who run `rebase --exec`.
+     fingerprinted) but git executes their `exec` lines. Any blank after the
+     command word counts (`exec<TAB>…`, [35]), and the todo files of every
+     nested gitdir root (`modules/<x>`, `worktrees/<x>`, `gitdir_roots`) are
+     read too: `submodule foreach 'git rebase --continue'` runs an unwrapped
+     git ([36]). `GITGUARD_ALLOW_REBASE_EXEC=1` for people who run `rebase --exec`.
    - no control character in a watched name; no symlink in the first two
      levels of the gitdir; `config` and `hooks/` (of the gitdir and of the
      commondir) belong to the user and are not world-writable; no path named
@@ -175,34 +190,72 @@ lefthook, pre-commit put the hooks in the tree), `include.path`/`includeIf`
 earlier left a payload at the 7th level), and **any token of a value that
 exists as a file** (relative to the root, `./x` or absolute) — `alias.x = !sh
 tool.sh` counts, `core.pager = cat` does not since `cat` does not exist in
-the tree. **A directory is only retained for the keys that read its content**
+the tree. Tokens come from a whitespace split, a `shlex` split, the whole
+value and a split on sh operators and `=` (`&&`, `|`, `(…)`, `f() { …; }`,
+`T=./t.sh`), on the value and on its expanded form: `$PWD`, `${PWD}` and
+`$(git rev-parse --show-toplevel)` are the root (where a `!` alias runs),
+other variables are expanded from gitguard's environment, which git inherits
+([37]). **A directory is only retained for the keys that read its content**
 (`DIR_KEYS`: `core.hooksPath`, `init.templateDir`): git executes files, and a
 directory in any other value is a program argument (`safe.directory =
-~/projects`, `remote.origin.url = /local/repo`, `!make -C src`).
+~/projects`, `remote.origin.url = /local/repo`, `!make -C src`). Exception,
+a **local remote** (`remote.*.url`/`pushurl` = a path or `file://` to a
+repository, `_local_remote`): `push` runs its hooks and honours its config,
+so its `config` and `hooks/` are watched (scope `ext` or `wt`) and that
+config is parsed like the others — but its own remotes are not followed
+([45]); +1.4 ms per command with one local remote.
 Fingerprinting it alerted on every neighbouring file and, worse, `restore`
 deleted there ([25]). Under the root → scope `wt`; outside the tree but
 writable by the user (e.g. `../shared-hooks` in the same mounted volume) →
-scope `ext` with an absolute path; outside the tree and not writable
-(`/usr/share/…`) → ignored. Files and symlinks under these paths are hashed
-like those of the gitdir. Reason: a sandbox that only has the tree writable
+scope `ext` with an absolute path; outside the tree and not replaceable
+(`_replaceable`: neither the file nor any parent directory writable,
+`/usr/share/…`) → ignored. A 0555 script in a writable directory is watched:
+it can be unlinked and recreated ([38]); the cost is that a read-only binary
+under a user-owned tree named by absolute path (Homebrew Cellar,
+`gpg.program = /opt/homebrew/bin/gpg`) is hashed on every command
+(~1 ms/MB). Files and symlinks under these paths are hashed like those of the
+gitdir. Reason: a sandbox that only has the tree writable
 can rewrite `.githooks/pre-commit` without touching `.git`, and the trusted
 config executes it. The config is parsed by `parse_git_config`, **never**
-with `git config` (git would honour the config we are judging).
+with `git config` (git would honour the config we are judging). The parser
+is a **character-level port of git's config.c** (`_Src`, `_parse_value`,
+`_parse_section`, `_parse_config_text`), checked against `git config -f` in
+`tests/test_git_parity.py`: the earlier regex-and-split parser diverged on a
+UTF-8 BOM, a `\` ending a comment line, a `\` at EOF, internal whitespace
+(git keeps it as is) and on the characters git's `isspace` does not know
+(`\v`, `\f`, NBSP — never use `str.strip()` on a config value), each one
+hiding a `core.hooksPath` ([46]). A line git dies on ("bad config line")
+is **refused** rather than read differently; a NUL byte too (git truncates
+the value, a C string). `~user/` is expanded like `~/` ([50]). The cost is
+~2 ms for a 17 KB config.
 
 **Config files parsed** (not merely hashed): `config` and `config.worktree`
 of the gitdir **and of the commondir** (a linked worktree has no `config` of
-its own and uses the main repository's), then `/etc/gitconfig` (or
+its own and uses the main repository's), the `config` of every submodule
+gitdir (`.git/modules/<x>/config`, `_submodule_configs`) with its relative
+values resolved against **the submodule's tree** (its `core.worktree`):
+hashed before, never parsed, so the hooksPath and alias scripts it names were
+not watched ([39]), then `/etc/gitconfig` (or
 `GIT_CONFIG_SYSTEM`), `~/.gitconfig`, `GIT_CONFIG_GLOBAL`,
 `$XDG_CONFIG_HOME/git/config`. Their values name paths the sandbox can write
 — a **global** `core.hooksPath` or `include.path` pointing into the mounted
 volume was a complete bypass ([16]). The global config is also hashed as is
-(scope `global`), but never restored.
+(scope `global`), but never restored. Last, the **config git takes from its
+environment and command line** (`env_config`: `GIT_CONFIG_PARAMETERS` in
+both of git's quoting syntaxes, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
+`VALUE_n`, and in exec mode the `-c`/`--config-env` of the command,
+`CLI_CONFIG`/`CLI_CONFIG_ENV` set by `apply_global_options`): the sandbox
+cannot write it, but a value may name a path in the volume ([48]). A
+relative `include.path` from there is ignored, as git refuses it.
 
 ## Display and sanitization
 
 `san()` neutralizes the control characters of a text about to be displayed,
-**except SGR sequences** (`ESC [ … m`: colour, bold, reset), which can neither
-clear the screen, nor move the cursor, nor fake a message. Consequence: `san`
+**except the SGR sequences gitguard itself emits** (`ESC[0m`, `ESC[m`,
+`ESC[1m`, `ESC[31/32/33/36m`), which can neither clear the screen, nor move
+the cursor, nor hide text. Any other SGR is neutralized: conceal (`8`),
+background colours or 256-colour fg = bg made the rest of a config line
+invisible in the diff shown before `[y/N]` ([43]). Consequence: `san`
 is idempotent on a message already coloured via `STYLE`, and everything can
 go through it without precaution — `info/warn/fail/hint` always neutralize,
 `Refuse` neutralizes at construction, there is no "raw" mode. `\n` is
@@ -220,8 +273,9 @@ refusal message.
 
 ## Organization of gitguard.py
 
-`is_bare_gitdir` / `find_root` (discovery, git's order); `Repo`
-(root/gitdir/common, `nested` and `gitfiles` cached) → `open_repo`;
+`_validate_headref` / `is_bare_gitdir` / `find_root` (discovery, git's
+order); `Repo` (root/gitdir/common/anchor, `nested` and `gitfiles` cached) →
+`open_repo` (gitfile, commondir, `core.worktree`);
 `check_structure` (refuses; `check_split_index`, `check_rebase_todo`);
 `config_refs` (what the config makes git read outside the gitdir; `DIR_KEYS`
 for the keys that accept a directory; `global_config_files` for the
@@ -233,7 +287,10 @@ gitdir (volatile pruned): the fingerprint and the control-character scan of
 `walk_gitdir` and `gitdir_excluded` (two copies had drifted apart: flaw [22]).
 `Manifest` (version/root/refs/entries, `current`) ← `load_manifest`;
 `changes` / `show_changes` / `restore`; `entries` / `cmd_list` / `cmd_forget` /
-`cmd_retrust`; exec mode: `split_global_options` (pure, tested) →
+`cmd_retrust`; exec mode: `split_global_options` (pure, tested; knows every
+option of git.c `handle_options`, **refuses an unknown one** rather than
+guess whether it takes an argument [40]; resolves a relative `--git-dir` /
+`--work-tree` from the cwd *after all* `-C`, as git does [41]) →
 `apply_global_options` (chdir, GIT_DIR) and `parse_new_repo`, then `run_git`.
 Invoked through a symlink named `git`, `main` strips `argv[0]` (forgotten in
 one version: the symlink path went to git, exec mode unusable — tested
@@ -268,8 +325,13 @@ basename without `.git`). After git succeeds, `save_trust` is called
 **unless**:
 - a `.git` already existed in the target before the command (a `git init`
   "reinitialises" without erasing: it would bless a trapped repository);
-- `--template=` **or** `init.templateDir` in the global/system config (copies
-  hooks from an arbitrary directory the sandbox can write);
+- `--template=`, **or** a template directory from any source git reads
+  (`_template_dir_configured`): `init.templateDir` in the global/system
+  config or a file it includes, global `-c`/`--config-env`,
+  `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`, `GIT_CONFIG_PARAMETERS`,
+  `GIT_TEMPLATE_DIR` ([42]) — it copies hooks from an arbitrary directory the
+  sandbox can write. (clone's own `-c` is applied after the template: no
+  effect, verified with git 2.50);
 - `--bare`, `--mirror`, `--separate-git-dir`.
 In those cases we warn and leave a manual `gitguard trust`.
 
@@ -386,7 +448,7 @@ into the tree was not watched.
 
 ## Tests
 
-**`python3 -m pytest`** (~385 tests of which 26 expected failures, ~100 s),
+**`python3 -m pytest`** (~460 tests of which 1 expected failure, ~100 s),
 to run before any change:
 
 - `tests/attacks/` — **the attack corpus**, one module per family (`gitdir`,
@@ -435,9 +497,11 @@ Rule: any new vector or false positive discovered must first become a test.
 
 ## Adversarial review playbook
 
-gitguard has been through seven adversarial review passes (the numbered
-catalogue in `tests/attacks/__init__.py` is their output: 31 bypasses and
-false positives, two of them RCEs found after the tool was believed solid).
+gitguard has been through nine adversarial review passes (the numbered
+catalogue in `tests/attacks/__init__.py` is their output: 50 bypasses and
+false positives, two of them RCEs found after the tool was believed solid;
+[44] is still open, see "Known limitations"; the ninth pass was the
+promotion of the git-parity `xfail`s [46]–[50]).
 The method that worked, for the next pass — by a human or by agents that know
 nothing of the previous ones:
 
@@ -531,16 +595,25 @@ content; fail closed on anything the parser cannot make sense of.
   see "Tree scan" for the two residual cases (hook/alias re-invoking git
   during the `add`, unwrapped git client).
 - `core.splitIndex`: refused (gitlinks in `sharedindex.*`, not read).
-- Known parity gaps with git, documented as `xfail(strict=True)` in
-  `tests/test_git_parity.py`: config set through the environment
-  (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`, `-c`) is not read; `core.worktree`
-  in `.git/config` is ignored for the root (git resolves a relative
-  `core.hooksPath` there); `~user/` is not expanded; a tree script reached
-  through a shell operator in an alias (`./tool.sh&&true`, `f() { ./tool.sh; }`)
-  is not watched; an invalid `.git` directory (no HEAD/objects/refs) stops
-  discovery where git walks past it; the parser diverges from git on a UTF-8
-  BOM, a trailing `\` on a comment line, a trailing `\` at EOF and NUL in a
-  value (the last one fails closed).
+- Parity gaps with git are tracked in `tests/test_git_parity.py` as
+  `xfail(strict=True)`; none is open at the moment (the former ones, [46] to
+  [50], are fixed). Deliberate divergences, fail-closed: NUL in a config
+  (refused, git truncates), a bad config line (refused, git dies).
+  `core.bare = true` in a non-bare layout is not handled (git then has no
+  work tree).
+- **Open [44]**: hooks tracked in the tree under `core.hooksPath` (husky,
+  `.githooks`). The container can create objects and move refs (volatile);
+  `git checkout`/`merge`/`reset`/`pull` of its commit rewrites the hook
+  *after* the check, and git runs it in the same command. Test:
+  `test_checkout_rewrites_tracked_hook_then_runs_it` (xfail). `gitguard
+  trust` warns when a hooks directory is in the tree. Forcing git onto the
+  trusted copy (`-c core.hooksPath=<backup>`) was ruled out: husky v9's
+  `.husky/_/h` runs `.husky/<hook>` from the tree anyway, and hooks that
+  load neighbouring files would break. `OPEN` in `tests/test_attacks.py` is
+  the place for a future open attack that fits the corpus.
+- A `-c`/`--config-env` given to a git that gitguard did not wrap (hook,
+  alias, IDE) is invisible; the one of the wrapped command and the
+  environment are read ([48]).
 - gitguard.py has no dependency outside the stdlib (diff via `difflib`); the
   tests need `pytest` and `git`.
 

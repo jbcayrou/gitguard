@@ -38,7 +38,7 @@ import stat
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 from typing import Iterator
@@ -125,15 +125,20 @@ class Style:
 
 STYLE = Style(sys.stderr.isatty() and not os.environ.get("NO_COLOR"))
 _CTRL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")   # everything but \n (handled separately)
-_SGR = re.compile(r"\x1b\[[0-9;]*m")                   # ESC [ … m: colour/bold, harmless
+# Only the SGR codes Style emits (reset, bold, red/green/yellow/cyan). Any
+# other SGR is neutralized: conceal (8), fg = bg (30;40, 38;5;n;48;5;n)…
+# hid the rest of a config line in the diff shown before [y/N]. [43]
+_SGR = re.compile(r"\x1b\[(?:0|1|3[1236])?m")
 
 
 def san(s: object) -> str:
     """Neutralize control characters in text about to be displayed.
 
-    SGR sequences (colours, bold, reset) are kept: they can neither clear the
-    screen, nor move the cursor, nor fake a message — an attacker who colours
-    a file name gains nothing. Any other control character (lone ESC, erase
+    The SGR sequences gitguard itself emits (reset, bold, four foreground
+    colours) are kept: they can neither clear the screen, nor move the cursor,
+    nor hide text — an attacker who colours a file name gains nothing. Any
+    other SGR (conceal, background colours, 256/true colour) is neutralized:
+    it could make the rest of a line invisible. [43] Any other control character (lone ESC, erase
     CSI, \\r, tab, \\x7f…) becomes "?". Newlines are preserved: a file name that
     contains one is already refused by check_structure; in a message they are
     intended.
@@ -178,86 +183,195 @@ def rule() -> None:
 
 
 # ------------------------------------------------------------ config parser
-_SECTION = re.compile(r'^\s*\[\s*([^\s\]"]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]')
+# A character-by-character port of git's config.c (git_parse_source,
+# get_base_var, get_extended_base_var, get_value, parse_value), so that what
+# gitguard reads is what git reads. The previous regex-and-split parser
+# diverged on a UTF-8 BOM, a `\` ending a comment line, a `\` at EOF,
+# internal whitespace (kept as is by git) and on the characters git's isspace
+# does not know (\v, \f, NBSP): each one hid a `core.hooksPath`. [46]
+_GIT_SPACE = " \t\r\n"          # git's isspace (sane_ctype), NOT str.isspace
+
+
+class _Src:
+    """get_next_char: `\\r\\n` reads as `\\n`; at EOF a `\\n` is returned and
+    `eof` set, as git does."""
+    __slots__ = ("text", "i", "eof", "line")
+
+    def __init__(self, text: str) -> None:
+        self.text, self.i, self.eof, self.line = text, 0, False, 1
+
+    def get(self) -> str:
+        if self.i >= len(self.text):
+            self.eof = True
+            return "\n"
+        c = self.text[self.i]
+        self.i += 1
+        if c == "\r" and self.i < len(self.text) and self.text[self.i] == "\n":
+            self.i += 1
+            c = "\n"
+        if c == "\n":
+            self.line += 1
+        return c
+
+
+def _iskeychar(c: str) -> bool:
+    return c.isascii() and (c.isalnum() or c == "-")
+
+
+def _parse_value(src: _Src) -> str | None:
+    """parse_value. None where git dies (bad escape, unterminated quote).
+    Leading whitespace skipped, trailing whitespace trimmed, internal
+    whitespace kept as is; `#`/`;` outside quotes start a comment; `\\` + newline
+    continues the value — inside a comment nothing is special any more."""
+    out: list[str] = []
+    quote = comment = False
+    trim = -1                       # length before the trailing whitespace
+    while True:
+        c = src.get()
+        if c == "\n":
+            if quote:
+                return None
+            if trim >= 0:
+                del out[trim:]
+            return "".join(out)
+        if comment:
+            continue
+        if c in _GIT_SPACE and not quote:
+            if trim < 0:
+                trim = len(out)
+            if out:
+                out.append(c)
+            continue
+        if not quote and c in "#;":
+            comment = True
+            continue
+        trim = -1
+        if c == "\\":
+            c = src.get()
+            if c == "\n":
+                continue
+            if c in "tbn":
+                c = {"t": "\t", "b": "\b", "n": "\n"}[c]
+            elif c not in "\\\"":
+                return None
+            out.append(c)
+            continue
+        if c == '"':
+            quote = not quote
+            continue
+        out.append(c)
+
+
+def _parse_section(src: _Src) -> str | None:
+    """get_base_var / get_extended_base_var, after the `[`: `base` (lower-cased,
+    `.` allowed) or `base "subsection"` (kept as is, `\\x` is `x`). None where
+    git dies."""
+    name: list[str] = []
+    while True:
+        c = src.get()
+        if src.eof:
+            return None
+        if c == "]":
+            break
+        if c in _GIT_SPACE:
+            while c in _GIT_SPACE:
+                if c == "\n":
+                    return None
+                c = src.get()
+            if c != '"':
+                return None
+            name.append(".")
+            while True:
+                c = src.get()
+                if c == "\n":
+                    return None
+                if c == '"':
+                    break
+                if c == "\\":
+                    c = src.get()
+                    if c == "\n":
+                        return None
+                name.append(c)
+            if src.get() != "]":
+                return None
+            break
+        if not (_iskeychar(c) or c == "."):
+            return None
+        name.append(c.lower())
+    return "".join(name) or None
+
+
+def _parse_config_text(text: str, where: str) -> list[tuple[str, str, str]]:
+    """git_parse_source. A line git rejects makes git die before running
+    anything: gitguard refuses too, rather than guess what follows."""
+    out: list[tuple[str, str, str]] = []
+    if text.startswith("﻿"):          # UTF-8 BOM, only at the very start
+        text = text[1:]
+    src = _Src(text)
+    section = ""
+    comment = False
+    while True:
+        c = src.get()
+        if c == "\n":
+            if src.eof:
+                return out
+            comment = False
+            continue
+        if comment or c in _GIT_SPACE:
+            continue
+        if c in "#;":
+            comment = True
+            continue
+        if c == "[":
+            sec = _parse_section(src)
+            if sec is None:
+                break
+            section = sec
+            continue
+        if not (c.isascii() and c.isalpha()):
+            break
+        key = [c.lower()]
+        while True:
+            c = src.get()
+            if src.eof or not _iskeychar(c):
+                break
+            key.append(c.lower())
+        while c in " \t":
+            c = src.get()
+        if c == "\n":
+            value = "true"
+        elif c == "=":
+            v = _parse_value(src)
+            if v is None:
+                break
+            value = v
+        else:
+            break
+        out.append((section, "".join(key), value))
+    raise Refuse(f"{where}: bad config line {src.line - (1 if src.eof else 0)} (git refuses it too)")
 
 
 def parse_git_config(path: Path) -> list[tuple[str, str, str]]:
     """Return [(section, key, value)], section lower-cased with its subsection
-    ("includeIf.gitdir:x"), key lower-cased. Handles comments, quotes, escapes
-    and line continuations. Never via `git config`: git would honour the very
-    config we are trying to judge."""
-    out: list[tuple[str, str, str]] = []
+    ("includeIf.gitdir:x"), key lower-cased, exactly as git reads them. Never
+    via `git config`: git would honour the very config we are trying to judge.
+    A NUL byte makes git truncate the value (C string): refused instead, a
+    config is never meant to contain one."""
     try:
         text = path.read_text(errors="surrogateescape")
     except OSError:
-        return out
-    section = ""
-    lines = text.split("\n")
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        # Continuation: a trailing UNESCAPED `\` (odd number of `\`);
-        # `foo\\` is the value `foo\` for git, not a continuation.
-        while _odd_trailing_backslashes(line) and i + 1 < len(lines):
-            i += 1
-            line = line[:-1] + lines[i]
-        i += 1
-        s = line.strip()
-        if not s or s[0] in "#;":
-            continue
-        m = _SECTION.match(line)
-        if m:
-            section = m.group(1).lower()
-            if m.group(2) is not None:
-                section += "." + m.group(2).replace('\\"', '"').replace("\\\\", "\\")
-            # git accepts a key right after `]` on the same line
-            # (`[core]hooksPath = x`): dropping it hid an executed path. [21]
-            line = line[m.end():]
-            s = line.strip()
-            if not s or s[0] in "#;":
-                continue
-        if "=" in line:
-            key, _, raw = line.partition("=")
-            value = _unquote(raw)
-        else:
-            key, value = s, "true"
-        out.append((section, key.strip().lower(), value))
-    return out
-
-
-def _odd_trailing_backslashes(line: str) -> bool:
-    n = len(line) - len(line.rstrip("\\"))
-    return n % 2 == 1
+        return []
+    if "\0" in text:
+        raise Refuse(f"{path}: NUL byte in a config file")
+    return _parse_config_text(text, str(path))
 
 
 def _unquote(raw: str) -> str:
-    """Config value: outer whitespace outside quotes stripped, quotes removed,
-    escapes resolved, trailing comment (# or ;) outside quotes ignored.
-    Like git: whitespace inside quotes is kept, whitespace between two
-    segments is collapsed according to the raw text."""
-    res: list[str] = []
-    i, quoted = 0, False
-    raw = raw.strip()
-    while i < len(raw):
-        ch = raw[i]
-        if ch == "\\" and i + 1 < len(raw):
-            nxt = raw[i + 1]
-            res.append({"n": "\n", "t": "\t", "b": "\b"}.get(nxt, nxt))
-            i += 2
-            continue
-        if ch == '"':
-            quoted = not quoted
-        elif ch in "#;" and not quoted:
-            break
-        elif ch in " \t" and not quoted:
-            # git collapses any run of unquoted whitespace to a single space
-            if res and res[-1] != " ":
-                res.append(" ")
-        else:
-            res.append(ch)
-        i += 1
-    value = "".join(res)
-    return value if raw.rstrip().endswith('"') else value.rstrip()
+    """A config value as git would read the text after `=`."""
+    v = _parse_value(_Src(raw))
+    if v is None:
+        raise ValueError(f"bad config value {raw!r}")
+    return v
 
 
 # ---------------------------------------------------------- repo / gitdir
@@ -268,13 +382,22 @@ def key_for(root: Path) -> Path:
 
 @dataclass
 class Repo:
-    root: Path        # work tree root, canonical
+    root: Path        # work tree root, canonical (core.worktree honoured)
     gitdir: Path      # real gitdir (resolved if gitfile)
     common: Path      # commondir (== gitdir outside a linked worktree)
+    # Directory whose `.git` was discovered: the state key and `.root` are
+    # derived from it, not from a `core.worktree` the config may redirect
+    # the tree to (that redirection is itself a config change). [47]
+    anchor: Path | None = None
 
     @property
     def key(self) -> Path:
-        return key_for(self.root)
+        return key_for(self.anchor or self.root)
+
+    @property
+    def label(self) -> Path:
+        """How the repository is named to the user: the directory holding `.git`."""
+        return self.anchor or self.root
 
     @cached_property
     def nested(self) -> list[Path]:
@@ -295,11 +418,44 @@ class Repo:
         return sorted(out)
 
 
+def _validate_headref(p: Path) -> bool:
+    """git's validate_headref: a symlink to `refs/…`, or a file holding
+    `ref: refs/…` (any git whitespace after the colon) or a hex object id."""
+    try:
+        st = p.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return os.readlink(p).startswith("refs/")
+    try:
+        with open(p, "rb") as fh:
+            buf = fh.read(255).split(b"\0", 1)[0]
+    except OSError:
+        return False
+    if buf.startswith(b"ref:") and buf[4:].lstrip(b" \t\r\n").startswith(b"refs/"):
+        return True
+    return re.match(rb"[0-9a-fA-F]{40}", buf) is not None
+
+
 def is_bare_gitdir(d: Path) -> bool:
-    """What git calls is_git_directory: HEAD (file) + objects/ + refs/.
-    This is how git recognises a bare repository — or any directory a
-    container has stuffed with these three names."""
-    return (d / "HEAD").is_file() and (d / "objects").is_dir() and (d / "refs").is_dir()
+    """git's is_git_directory, the test behind its discovery: a valid HEAD,
+    then `objects` and `refs` reachable (access X_OK) in the common dir — the
+    directory itself, or what its `commondir` file names. This is how git
+    recognises a bare repository, or any directory a container has stuffed
+    with these names. The former "HEAD file + objects/ + refs/ here" missed a
+    `HEAD` symlink and a `commondir` redirection git accepts. [49]"""
+    if not _validate_headref(d / "HEAD"):
+        return False
+    common = d
+    cd = d / "commondir"
+    if cd.is_file():
+        try:
+            common = d / cd.read_text(errors="surrogateescape").rstrip("\r\n")
+        except OSError:
+            return False
+    objects = Path(os.environ["GIT_OBJECT_DIRECTORY"]) if os.environ.get("GIT_OBJECT_DIRECTORY") \
+        else common / "objects"
+    return os.access(objects, os.X_OK) and os.access(common / "refs", os.X_OK)
 
 
 def find_root(cwd: Path) -> Path | None:
@@ -323,8 +479,18 @@ def find_root(cwd: Path) -> Path | None:
         return cwd.resolve()
     d = cwd.resolve()
     while True:
-        if (d / ".git").exists() or (d / ".git").is_symlink():
-            return d
+        g = d / ".git"
+        if g.is_symlink() or g.is_file():
+            return d                  # gitfile (a symlink is refused by open_repo)
+        if g.is_dir():
+            # A `.git` directory that is not a repository for git (no valid
+            # HEAD, objects or refs) is skipped by git, which keeps walking
+            # up; stopping on it checked — and let the user trust — a bogus
+            # gitdir while git used the parent's. [49]
+            if is_bare_gitdir(g):
+                return d
+        elif g.exists():
+            return d                  # neither file nor directory: refused later
         if is_bare_gitdir(d):
             raise Refuse(f"bare gitdir found before any .git: {d} — bare repository (not "
                          f"handled by gitguard) or booby-trapped directory. Run /usr/bin/git "
@@ -360,7 +526,26 @@ def open_repo(root: Path) -> Repo:
     cd = g / "commondir"
     if cd.is_file():
         common = (g / cd.read_text().strip()).resolve()
-    return Repo(root, g.resolve(), common)
+    anchor = root
+    if not os.environ.get("GIT_DIR"):
+        # core.worktree: git takes that directory as the work tree (relative
+        # to the gitdir) and resolves a relative core.hooksPath there; the
+        # directory containing `.git` was kept, and the hooks never watched.
+        # Read where git reads it: the common config, then config.worktree
+        # if extensions.worktreeConfig is set. [47]
+        wt, ext = None, False
+        for section, key, value in parse_git_config(common / "config"):
+            if section == "core" and key == "worktree":
+                wt = value
+            elif section == "extensions" and key == "worktreeconfig":
+                ext = value.lower() in ("true", "yes", "on", "1")
+        if ext:
+            for section, key, value in parse_git_config(g / "config.worktree"):
+                if section == "core" and key == "worktree":
+                    wt = value
+        if wt:
+            root = _expand2(wt, g)[1]
+    return Repo(root, g.resolve(), common, anchor)
 
 
 # ------------------------------------------------------- structural checks
@@ -521,20 +706,44 @@ def nested_repo_hint(n: Path) -> str:
             f"If this is intended, add the directory to GITGUARD_PRUNE.")
 
 
+def gitdir_roots(base: Path) -> Iterator[Path]:
+    """`base`, then every gitdir root nested under `modules/` or `worktrees/`
+    (a submodule name may contain `/`; a submodule has its own `modules/`).
+    Recognised like _child_root (HEAD or commondir). Lists only those two
+    directories, never a root's objects/: a handful of iterdir calls."""
+    yield base
+    stack = [base / "modules", base / "worktrees"]
+    while stack:
+        d = stack.pop()
+        try:
+            children = [c for c in d.iterdir() if c.is_dir() and not c.is_symlink()]
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as e:
+            raise Refuse(f"unreadable directory {d}: {e.strerror}")
+        for c in children:
+            if (c / "HEAD").exists() or (c / "commondir").exists():
+                yield from gitdir_roots(c)
+            else:
+                stack.append(c)
+
+
 def check_rebase_todo(repo: Repo) -> None:
     """Rebase/cherry-pick todo lists live in volatile directories (git rewrites
     them at every step, so they cannot be part of the fingerprint) but accept
     `exec <cmd>` lines that git runs verbatim. The container can inject some
     during an in-progress rebase: refuse their presence, unless the user runs
-    `--exec` rebases themselves."""
+    `--exec` rebases themselves. Also in submodules and linked worktrees:
+    `submodule foreach 'git rebase --continue'` runs an unwrapped git. [36]"""
     if os.environ.get("GITGUARD_ALLOW_REBASE_EXEC"):
         return
-    for rel in TODO_FILES:
-        p = repo.gitdir / rel
+    roots = dict.fromkeys([*gitdir_roots(repo.gitdir), *gitdir_roots(repo.common)])
+    for p in (r / rel for r in roots for rel in TODO_FILES):
         if not p.is_file():
             continue
         for line in p.read_text(errors="surrogateescape").splitlines():
-            word = line.strip().split(" ", 1)[0]
+            # git accepts any blank after the command word (`exec<TAB>cmd`). [35]
+            word = (line.split(None, 1) or [""])[0]
             if word in ("exec", "x"):
                 raise Refuse(
                     f"`exec` line in {p}: git would run it on the next "
@@ -619,6 +828,112 @@ def xdg_config_home() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
 
 
+CLI_CONFIG: list[str] = []       # `-c key=value` of the git command being run (exec mode)
+CLI_CONFIG_ENV: list[str] = []   # `--config-env key=VAR` of that command
+
+
+def _sq_dequote_step(s: str, i: int) -> tuple[str, int] | None:
+    """git's sq_dequote_step: the single-quoted word starting at s[i] and the
+    index just after it; the sequences `'\\''` and `'\\!'` inside the word stand
+    for the quoted character. None if the text is not a quoted word."""
+    if i >= len(s) or s[i] != "'":
+        return None
+    out: list[str] = []
+    i += 1
+    while True:
+        if i >= len(s):
+            return None
+        c = s[i]
+        i += 1
+        if c != "'":
+            out.append(c)
+            continue
+        if i + 2 < len(s) and s[i] == "\\" and s[i + 1] in "'!" and s[i + 2] == "'":
+            out.append(s[i + 1])
+            i += 3
+            continue
+        return "".join(out), i
+
+
+def _parse_config_env_list(env: str) -> list[tuple[str, str | None]]:
+    """GIT_CONFIG_PARAMETERS as git's parse_config_env_list reads it: words
+    `'key'='value'`, `'key'=` (no value: boolean true) or the old style
+    `'key=value'`, separated by whitespace. Refuse what git would die on."""
+    out: list[tuple[str, str | None]] = []
+    i = 0
+    while True:
+        while i < len(env) and env[i] in _GIT_SPACE:
+            i += 1
+        if i >= len(env):
+            return out
+        r = _sq_dequote_step(env, i)
+        if r is None:
+            raise Refuse("bogus format in GIT_CONFIG_PARAMETERS")
+        key, i = r
+        if i >= len(env) or env[i] in _GIT_SPACE:
+            k, eq, v = key.partition("=")
+            out.append((k, v if eq else None))
+        elif env[i] == "=":
+            i += 1
+            if i < len(env) and env[i] == "'":
+                r = _sq_dequote_step(env, i)
+                if r is None or (r[1] < len(env) and env[r[1]] not in _GIT_SPACE):
+                    raise Refuse("bogus format in GIT_CONFIG_PARAMETERS")
+                out.append((key, r[0]))
+                i = r[1]
+            elif i >= len(env) or env[i] in _GIT_SPACE:
+                out.append((key, None))
+            else:
+                raise Refuse("bogus format in GIT_CONFIG_PARAMETERS")
+        else:
+            raise Refuse("bogus format in GIT_CONFIG_PARAMETERS")
+
+
+def _split_config_key(k: str) -> tuple[str, str] | None:
+    """git_config_parse_key: `section[.subsection].key` → (section lower-cased
+    with the subsection kept as is, key lower-cased); None if no dot."""
+    if "." not in k:
+        return None
+    section, _, key = k.rpartition(".")
+    head, dot, sub = section.partition(".")
+    return head.lower() + (dot + sub if dot else ""), key.lower()
+
+
+def env_config() -> list[tuple[str, str, str]]:
+    """Config git takes from its environment and command line, in git's order
+    (git_config_from_parameters): GIT_CONFIG_PARAMETERS — which a parent git
+    feeds from its own `-c` — and this command's `-c` / `--config-env` (git
+    appends them to it), then GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/VALUE_n. The
+    sandbox cannot write any of it, but a value may name a path in the
+    volume (`core.hooksPath`, `include.path`): git honours it. [48]"""
+    pairs = _parse_config_env_list(os.environ.get("GIT_CONFIG_PARAMETERS", ""))
+    for c in CLI_CONFIG:
+        k, eq, v = c.partition("=")
+        pairs.append((k, v if eq else None))
+    for spec in CLI_CONFIG_ENV:
+        k, eq, var = spec.rpartition("=")
+        if not eq or var not in os.environ:
+            raise Refuse(f"--config-env {spec!r}: missing '=' or environment variable (git refuses it too)")
+        pairs.append((k, os.environ[var]))
+    count = os.environ.get("GIT_CONFIG_COUNT")
+    if count is not None:
+        try:
+            n = int(count)
+        except ValueError:
+            raise Refuse(f"bogus GIT_CONFIG_COUNT {count!r} (git refuses it too)")
+        for i in range(n):
+            k, v = os.environ.get(f"GIT_CONFIG_KEY_{i}"), os.environ.get(f"GIT_CONFIG_VALUE_{i}")
+            if k is None or v is None:
+                raise Refuse(f"GIT_CONFIG_COUNT={n} but GIT_CONFIG_KEY_{i}/VALUE_{i} missing (git refuses it too)")
+            pairs.append((k, v))
+    out = []
+    for k, v in pairs:
+        sk = _split_config_key(k)
+        if sk is not None:
+            out.append((*sk, "true" if v is None else v))
+    return out
+
+
 def global_config_files() -> list[Path]:
     """System and global config files git may read. Deliberately broad
     (GIT_CONFIG_GLOBAL *and* ~/.gitconfig *and* XDG): watching one file too
@@ -693,11 +1008,12 @@ def config_refs(repo: Repo) -> list[tuple[str, Path]]:
             return
         if repo.root in p.parents:
             out[p] = "wt"
-        elif os.access(p, os.W_OK):
+        elif _replaceable(p):
             out[p] = "ext"
 
     # .lfsconfig: git-lfs reads lfs.customtransfer.*.path from it (a program it runs). [34]
-    for special in [repo.root / ".git", repo.root / ".gitmodules", repo.root / ".lfsconfig"]:
+    for special in [repo.label / ".git", repo.root / ".gitmodules",
+                    repo.root / ".lfsconfig"]:
         if special.is_file():
             out[special] = "wt"
     for n in repo.gitfiles:
@@ -708,33 +1024,108 @@ def config_refs(repo: Repo) -> list[tuple[str, Path]]:
     # worktree has no `config` of its own and uses commondir/config), then
     # system and global — their values also name paths the container can
     # write (global core.hooksPath, global include.path…).
-    queue = [repo.gitdir / "config", repo.gitdir / "config.worktree",
-             repo.common / "config", repo.common / "config.worktree",
-             *global_config_files()]
+    # Each config file comes with the directory its relative values are
+    # resolved against: the root, or the submodule's own tree for the config
+    # of `.git/modules/<x>` (hashed by walk_gitdir, but its hooksPath and
+    # alias scripts live in the submodule's tree and were never watched). [39]
+    # Third element: follow `remote.*.url`. Not for the config of a remote
+    # itself — pushing to A does not push to A's remotes.
+    queue = [(f, repo.root, True) for f in (repo.gitdir / "config", repo.gitdir / "config.worktree",
+                                            repo.common / "config", repo.common / "config.worktree",
+                                            *global_config_files())]
+    queue += [(f, b, True) for f, b in _submodule_configs(repo)]
     seen: set[Path] = set()
+    nxt: list[tuple[Path, Path, bool]] = []
+
+    def consider(section: str, key: str, value: str, base: Path, cfdir: Path | None,
+                 remotes: bool) -> None:
+        if (section, key) in DIR_KEYS:
+            add(*_expand2(value, base), allow_dir=True)
+        elif section.startswith("include") and key == "path":
+            # Relative to the including file; from the command line or the
+            # environment git only accepts an absolute path ("relative config
+            # includes must come from files").
+            if cfdir is None and not _expand2(value, Path("/"))[0].is_absolute():
+                return
+            literal, p = _expand2(value, cfdir or base)
+            if p.is_file():
+                nxt.append((p, base, remotes))
+            add(literal, p)
+        elif remotes and section.startswith("remote.") and key in ("url", "pushurl"):
+            # A local remote: `push` runs its hooks and honours its
+            # config (hooksPath…). Only those, never the whole
+            # directory ([25]): its config and its hooks/. [45]
+            r = _local_remote(value, base)
+            if r is not None:
+                gd, rbase = r
+                add(gd / "config", gd / "config")
+                add(gd / "hooks", gd / "hooks", allow_dir=True)
+                nxt.append((gd / "config", rbase, False))
+        else:
+            for tok in _value_tokens(value):
+                if tok and tok not in (".", "..") and not tok.startswith("-"):
+                    add(*_expand2(tok, base))
+
+    # Config git takes from its environment and command line (GIT_CONFIG_*,
+    # `-c`): not writable by the sandbox, but its values may name paths in
+    # the volume, which git honours like any other. [48]
+    for section, key, value in env_config():
+        consider(section, key, value, repo.root, None, True)
     # +1: the first round consumes the base files; git then follows
     # INCLUDE_DEPTH levels of includes. With range(INCLUDE_DEPTH) the 10th
     # level was hashed but never parsed. [17]
     for _ in range(INCLUDE_DEPTH + 1):
-        nxt: list[Path] = []
-        for cf in queue:
+        for cf, base, remotes in queue:
             if cf in seen or not cf.is_file():
                 continue
             seen.add(cf)
             for section, key, value in parse_git_config(cf):
-                if (section, key) in DIR_KEYS:
-                    add(*_expand2(value, repo.root), allow_dir=True)
-                elif section.startswith("include") and key == "path":
-                    literal, p = _expand2(value, cf.parent)
-                    if p.is_file():
-                        nxt.append(p)
-                    add(literal, p)
-                else:
-                    for tok in _value_tokens(value):
-                        if tok and tok not in (".", "..") and not tok.startswith("-"):
-                            add(*_expand2(tok, repo.root))
-        queue = nxt
+                consider(section, key, value, base, cf.parent, remotes)
+        queue, nxt = nxt, []
     return sorted(((scope, p) for p, scope in out.items()), key=lambda t: str(t[1]))
+
+
+def _replaceable(p: Path) -> bool:
+    """Can the user — hence a container running as the user on a mounted
+    volume — rewrite `p` or replace it? A 0555 script in a writable directory
+    is unlinked and recreated: testing the file alone ignored it. [38]
+    (Cost: a read-only file under a user-owned tree, e.g. a Homebrew binary
+    named by absolute path in gpg.program, is now hashed: ~1 ms per MB.)"""
+    return os.access(p, os.W_OK) or any(os.access(q, os.W_OK) for q in p.parents)
+
+
+def _local_remote(url: str, base: Path) -> tuple[Path, Path] | None:
+    """(gitdir, base for its relative values) if the remote URL designates a
+    local repository (path or file://), else None. Like git: a `host:path`
+    without a `/` before the colon is ssh; `<path>.git` is tried too."""
+    v = url[len("file://"):] if url.startswith("file://") else url
+    if "://" in v or (":" in v.split("/", 1)[0] and not v.startswith(("/", ".", "~"))):
+        return None
+    p = _expand2(v, base)[1]
+    for cand in (p, p.with_name(p.name + ".git")):
+        if (cand / ".git").is_dir():
+            return cand / ".git", cand
+        if is_bare_gitdir(cand):
+            return cand, cand
+    return None
+
+
+def _submodule_configs(repo: Repo) -> list[tuple[Path, Path]]:
+    """(config file, submodule tree) for every nested gitdir that has a
+    `core.worktree` (submodules; a linked worktree's gitdir has none and is
+    checked when git runs there). A few small files: no measurable cost."""
+    out = []
+    for r in dict.fromkeys([*gitdir_roots(repo.gitdir), *gitdir_roots(repo.common)]):
+        if r in (repo.gitdir, repo.common) or not (r / "config").is_file():
+            continue
+        wt = None
+        for section, key, value in parse_git_config(r / "config"):
+            if section == "core" and key == "worktree":
+                wt = value
+        if wt:
+            base = _expand2(wt, r)[1]
+            out += [(r / "config", base), (r / "config.worktree", base)]
+    return out
 
 
 # Keys whose designated directory git reads the content of (hooks executed,
@@ -743,28 +1134,41 @@ def config_refs(repo: Repo) -> list[tuple[str, Path]]:
 DIR_KEYS = {("core", "hookspath"), ("init", "templatedir")}
 
 
+_SH_SPLIT = re.compile(r"[\s;&|()<>{}=`'\"]+")
+_SH_TOPLEVEL = re.compile(r"\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)"
+                          r"|`\s*git\s+rev-parse\s+--show-toplevel\s*`")
+_SH_PWD = re.compile(r"\$(?:PWD\b|\{PWD\})")
+
+
 def _value_tokens(value: str) -> set[str]:
     """Path candidates of a config value: whitespace split, sh-style split (a
     quoted path, `!"./my tool.sh"`, is a single word for git, which hands the
-    value to the shell) and the whole value (programs run without a shell).
-    An unrecognised path with spaces went unwatched while git executed it."""
-    toks = set(value.split())
-    try:
-        toks |= set(shlex.split(value))
-    except ValueError:
-        pass                              # unbalanced quotes: sh would refuse too
-    toks.add(value.strip())
+    value to the shell), the whole value (programs run without a shell), and
+    a split on sh operators and `=` (`./t.sh&&x`, `(./t.sh)`, `f() { ./t.sh; }`,
+    `T=./t.sh`, `--rcfile=./t`). Done on the value and on its sh-expanded
+    form: `$PWD`, `${PWD}` and `$(git rev-parse --show-toplevel)` are the top
+    of the tree (where a `!` alias runs), other variables come from the
+    environment git inherits from gitguard. [37]"""
+    expanded = os.path.expandvars(_SH_PWD.sub(".", _SH_TOPLEVEL.sub(".", value)))
+    toks: set[str] = set()
+    for v in {value, expanded}:
+        toks |= set(v.split()) | set(_SH_SPLIT.split(v))
+        try:
+            toks |= set(shlex.split(v))
+        except ValueError:
+            pass                          # unbalanced quotes: sh would refuse too
+        toks.add(v.strip())
     return {t.lstrip("!").strip("\"'") for t in toks}
 
 
 def _expand2(value: str, base: Path) -> tuple[Path, Path]:
     """(literal path, canonical path) — the literal detects symlinks, the
-    canonical one is hashed."""
-    if value.startswith("~/"):
-        literal = Path.home() / value[2:]
-    else:
-        p = Path(value)
-        literal = p if p.is_absolute() else base / p
+    canonical one is hashed. Like git's interpolate_path: `~/x` is $HOME/x,
+    `~user/x` is that user's home (getpwnam) — only `~/` was expanded, so a
+    `core.hooksPath = ~jb/vol/hooks` was never watched. [50] An unknown user
+    stays literal (git dies on it)."""
+    p = Path(os.path.expanduser(value)) if value.startswith("~") else Path(value)
+    literal = p if p.is_absolute() else base / p
     return literal, literal.resolve()
 
 
@@ -1002,7 +1406,7 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]] | None = None,
     key = repo.key
     tmp = Path(str(key) + ".tmp")
     tmp.write_text(json.dumps({
-        "version": FORMAT_VERSION, "root": str(repo.root),
+        "version": FORMAT_VERSION, "root": str(repo.label),
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         # Roots designated by the trusted config: the only zones where
         # `restore` allows itself to delete (outside the gitdir).
@@ -1015,7 +1419,7 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]] | None = None,
     new = Path(str(key) + ".d.tmp")
     shutil.rmtree(new, ignore_errors=True)
     new.mkdir()
-    (new / ".root").write_text(str(repo.root) + "\n")
+    (new / ".root").write_text(str(repo.label) + "\n")
     for (scope, rel), e in man.items():
         if scope == "global":
             continue
@@ -1077,7 +1481,7 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
             trusted_refs: list[tuple[str, Path]]) -> None:
     bak = Path(str(key) + ".d")
     if not bak.is_dir():
-        raise Refuse(f"no backup for {repo.root} (run 'gitguard trust' again when the repository is clean)")
+        raise Refuse(f"no backup for {repo.label} (run 'gitguard trust' again when the repository is clean)")
     plan = [(("delete" if a == "added" else "restore"), k)
             for a, k in changes(old, new) if k[0] != "global"]
     # A deletion may only target the inside of the gitdir or of a root that the
@@ -1093,7 +1497,7 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
             raise Refuse(f"{scope}:{path} is outside the paths designated by the trusted "
                          f"config: refusing to delete. Inspect the repository by hand.")
     if not plan:
-        info(f"nothing to restore, {repo.root} is in the trusted state")
+        info(f"nothing to restore, {repo.label} is in the trusted state")
         return
     err(STYLE.bold(f"Actions on {san(repo.root)}:"))
     for action, (scope, path) in plan:
@@ -1126,7 +1530,7 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
         if action == "restore":
             _copy_entry(bak / scope / path.lstrip("/"), dst)
     if manifest(repo, config_refs(repo)) == old:
-        info(f"{len(plan)} file(s) restored, {repo.root} matches the trusted state again")
+        info(f"{len(plan)} file(s) restored, {repo.label} matches the trusted state again")
     else:
         warn("restore done, but the fingerprint still differs — check with 'gitguard diff'")
 
@@ -1228,7 +1632,22 @@ def cmd_retrust() -> None:
 
 
 # -------------------------------------------------------- exec mode (git …)
-GLOBAL_WITH_ARG = {"-c", "--namespace", "--exec-path", "-C", "--git-dir", "--work-tree"}
+# git.c handle_options(): options taking a separate argument, options also
+# accepted as `--opt=value`, and flags. Anything else is refused: an unknown
+# option may take an argument, and guessing wrong made gitguard take
+# `--config-env`'s argument for the subcommand, ignore the `-C` that followed
+# and check another directory than git's. git refuses unknown options too. [40]
+GLOBAL_WITH_ARG = {"-c", "--config-env", "--namespace", "-C", "--git-dir", "--work-tree",
+                   "--attr-source", "--shallow-file", "--super-prefix"}
+GLOBAL_WITH_EQ = ("--config-env=", "--namespace=", "--git-dir=", "--work-tree=",
+                  "--attr-source=", "--shallow-file=", "--super-prefix=", "--exec-path=",
+                  "--list-cmds=")
+GLOBAL_FLAGS = {"-p", "--paginate", "-P", "--no-pager", "--no-replace-objects", "--bare",
+                "--literal-pathspecs", "--no-literal-pathspecs", "--glob-pathspecs",
+                "--noglob-pathspecs", "--icase-pathspecs", "--no-optional-locks",
+                "--no-advice", "--no-lazy-fetch", "--exec-path", "--html-path",
+                "--man-path", "--info-path"}
+GLOBAL_STOP = {"-h", "--help", "-v", "--version"}   # git turns them into a command
 
 
 @dataclass
@@ -1237,6 +1656,8 @@ class GlobalOpts:
     gitdir: Path | None       # --git-dir, relative to that cwd
     worktree: Path | None     # --work-tree, relative to that cwd
     rest: list[str]           # from the subcommand onwards
+    config: list[str] = field(default_factory=list)      # -c arguments (`key=value`)
+    config_env: list[str] = field(default_factory=list)  # --config-env arguments (`key=VAR`)
 
 
 def split_global_options(args: list[str], cwd: Path) -> GlobalOpts:
@@ -1244,31 +1665,50 @@ def split_global_options(args: list[str], cwd: Path) -> GlobalOpts:
     `--work-tree` does **not** change gitdir discovery — git does it from the
     cwd (or GIT_DIR); moving there made gitguard check another repository
     while git executed the config of the cwd's repository [18]. It does
-    however designate the tree to check when `--git-dir` is given [28]."""
-    gitdir: Path | None = None
-    worktree: Path | None = None
+    however designate the tree to check when `--git-dir` is given [28].
+    git applies each `-C` at once but only stores `--git-dir`/`--work-tree`
+    (setenv): a relative one is resolved from the *final* cwd —
+    `--git-dir=.git -C repo` is `repo/.git`. [41]"""
+    gitdir: str | None = None
+    worktree: str | None = None
+    config: list[str] = []
+    config_env: list[str] = []
     i = 0
     while i < len(args):
         a = args[i]
-        if a in GLOBAL_WITH_ARG and i + 1 >= len(args):
-            raise Refuse(f"option {a} without an argument")
-        if a == "-C":
-            cwd = cwd / args[i + 1]; i += 2
-        elif a.startswith("--git-dir="):
-            gitdir = cwd / a[len("--git-dir="):]; i += 1
-        elif a == "--git-dir":
-            gitdir = cwd / args[i + 1]; i += 2
-        elif a.startswith("--work-tree="):
-            worktree = cwd / a[len("--work-tree="):]; i += 1
-        elif a == "--work-tree":
-            worktree = cwd / args[i + 1]; i += 2
-        elif a in GLOBAL_WITH_ARG:
-            i += 2                       # -c, --namespace, --exec-path
-        elif a.startswith("-"):
-            i += 1                       # --no-pager, -p, --bare…
-        else:
+        if a in GLOBAL_WITH_ARG:
+            if i + 1 >= len(args):
+                raise Refuse(f"option {a} without an argument")
+            v = args[i + 1]
+            i += 2
+            if a == "-C":
+                cwd = cwd / v
+            elif a == "--git-dir":
+                gitdir = v
+            elif a == "--work-tree":
+                worktree = v
+            elif a == "-c":
+                config.append(v)
+            elif a == "--config-env":
+                config_env.append(v)
+        elif a.startswith(GLOBAL_WITH_EQ):
+            i += 1
+            opt, v = a.split("=", 1)
+            if opt == "--git-dir":
+                gitdir = v
+            elif opt == "--work-tree":
+                worktree = v
+            elif opt == "--config-env":
+                config_env.append(v)
+        elif a in GLOBAL_FLAGS:
+            i += 1
+        elif a in GLOBAL_STOP or not a.startswith("-"):
             break
-    return GlobalOpts(cwd, gitdir, worktree, args[i:])
+        else:
+            raise Refuse(f"unknown git global option {a!r}: gitguard cannot tell "
+                         f"which repository git would use")
+    return GlobalOpts(cwd, None if gitdir is None else cwd / gitdir,
+                      None if worktree is None else cwd / worktree, args[i:], config, config_env)
 
 
 def apply_global_options(args: list[str]) -> Path:
@@ -1285,6 +1725,8 @@ def apply_global_options(args: list[str]) -> Path:
         os.environ["GIT_DIR"] = str(o.gitdir.resolve())
     if o.worktree is not None:
         os.environ["GIT_WORK_TREE"] = str(o.worktree.resolve())
+    CLI_CONFIG[:] = o.config
+    CLI_CONFIG_ENV[:] = o.config_env
     return orig
 
 
@@ -1293,13 +1735,32 @@ CLONE_WITH_ARG = {"-o", "-b", "--branch", "--origin", "-u", "--upload-pack", "--
                   "--object-format", "--initial-branch", "--ref-format", "--template"}
 
 
-def _template_dir_configured() -> bool:
-    """`init.templateDir` in the global/system config copies hooks into every
-    new repository: like `--template=`, it rules out auto-trust."""
-    for f in global_config_files():
-        for section, key, _ in parse_git_config(f):
-            if section == "init" and key == "templatedir":
-                return True
+def _template_dir_configured(cli_config: list[str]) -> bool:
+    """A template directory copies hooks into every new repository: like
+    `--template=`, it rules out auto-trust. Every source git reads: the
+    global/system config *and the files it includes*, `-c`/`--config-env`,
+    GIT_CONFIG_COUNT/KEY_n, GIT_CONFIG_PARAMETERS, GIT_TEMPLATE_DIR. [42]"""
+    if os.environ.get("GIT_TEMPLATE_DIR"):
+        return True
+    if "init.templatedir" in os.environ.get("GIT_CONFIG_PARAMETERS", "").lower():
+        return True
+    keys = [c.split("=", 1)[0] for c in cli_config]
+    keys += [v for k, v in os.environ.items() if k.startswith("GIT_CONFIG_KEY_")]
+    if any(k.strip().lower() == "init.templatedir" for k in keys):
+        return True
+    queue, seen = list(global_config_files()), set()
+    for _ in range(INCLUDE_DEPTH + 1):
+        nxt = []
+        for f in queue:
+            if f in seen or not f.is_file():
+                continue
+            seen.add(f)
+            for section, key, value in parse_git_config(f):
+                if section == "init" and key == "templatedir":
+                    return True
+                if section.startswith("include") and key == "path":
+                    nxt.append(_expand2(value, f.parent)[1])
+        queue = nxt
     return False
 
 
@@ -1327,7 +1788,7 @@ def parse_new_repo(args: list[str]) -> tuple[str, Path] | None:
             j += 1
         else:
             positional.append(a); j += 1
-    if template or _template_dir_configured():
+    if template or _template_dir_configured(o.config + o.config_env):
         warn("templateDir: no auto-trust, run 'gitguard trust' after inspection")
         return None
     if bare:
@@ -1450,7 +1911,7 @@ def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
     if old is None or not old.current:
         rule()
         why = "trusted by an older version" if old else "never trusted"
-        raise Refuse(f"repository {why}: {repo.root}\n  Inspect .git/config and .git/hooks, then:  "
+        raise Refuse(f"repository {why}: {repo.label}\n  Inspect .git/config and .git/hooks, then:  "
                      + STYLE.cyan("gitguard trust"))
     if old.entries == new:
         return
@@ -1462,14 +1923,14 @@ def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
                  f"→ reference updated")
             return
     rule()
-    warn(STYLE.bold(f"{repo.root}/.git has changed since the last trust"))
+    warn(STYLE.bold(f"{repo.label}/.git has changed since the last trust"))
     show_changes(repo, old.entries, new, key)
     err("")
     rule()
     if interactive and ask_on_tty(STYLE.yellow(
             "Trust this state and run git? [y/N] ")):
         save_trust(repo, refs, new)
-        info(f"trust state recorded for {repo.root}")
+        info(f"trust state recorded for {repo.label}")
         return
     hint("If legitimate:  gitguard trust      Otherwise:  gitguard restore")
     raise Refuse("refusing to run git.")
@@ -1523,24 +1984,31 @@ def main(argv: list[str]) -> int:
 
     if mode == "trust":
         save_trust(repo, refs, new)
-        info(f"trust state recorded for {repo.root}")
+        info(f"trust state recorded for {repo.label}")
         wt = [f"{s}:{p}" for s, p in refs]
         if wt:
             hint(f"the config references outside the gitdir: {' '.join(wt)} → watched too")
+        # A directory in the refs comes from DIR_KEYS (hooksPath, templateDir). [44]
+        intree = [p for s, p in refs if s == "wt" and p.is_dir()]
+        if intree:
+            warn(f"hooks in the work tree ({' '.join(str(p.relative_to(repo.root)) for p in intree)}): "
+                 f"if git tracks them, a checkout/merge/reset/pull of a commit someone else "
+                 f"created replaces them after the check, and git runs the new version in the "
+                 f"same command. Review incoming changes to these files.")
         check_safe_bare()
         return 0
     if mode == "diff":
         if old is None:
-            raise Refuse(f"no trust state for {repo.root} (gitguard trust)")
+            raise Refuse(f"no trust state for {repo.label} (gitguard trust)")
         if old.entries == new:
-            info(f"no changes in {repo.root}")
+            info(f"no changes in {repo.label}")
         else:
-            warn(f"changes in {repo.root}/.git:")
+            warn(f"changes in {repo.label}/.git:")
             show_changes(repo, old.entries, new, key)
         return 0
     if mode == "restore":
         if old is None:
-            raise Refuse(f"no trust state for {repo.root} (gitguard trust)")
+            raise Refuse(f"no trust state for {repo.label} (gitguard trust)")
         restore(repo, key, old.entries, new, yes, old.refs)
         return 0
 

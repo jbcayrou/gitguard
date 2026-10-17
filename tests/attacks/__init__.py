@@ -90,6 +90,53 @@ gitguard.py refer to this list (how the project reviews itself: CLAUDE.md,
      shared file were not read. Explicit refusal.
 [34] `.lfsconfig` (git-lfs reads lfs.customtransfer.*.path, a program it runs)
      was not watched.
+[35] `exec<TAB>cmd` in a rebase todo: git accepts any blank after the command
+     word, check_rebase_todo only split on a space.
+[36] Rebase todo of a submodule (.git/modules/<x>/rebase-merge) or of a linked
+     worktree not read: `submodule foreach 'git rebase --continue'` runs an
+     unwrapped git that executes it.
+[37] Tree script reached through a sh expansion or operator in an alias
+     (`!$PWD/t.sh`, `${PWD}`, `$(git rev-parse --show-toplevel)/t.sh`,
+     `T=./t.sh`, `$HOME/bin/t.sh`, `&&`, `|`, `(…)`, `f() { …; }`): not
+     recognised as a path, rewritten without alert.
+[38] Script outside the tree with mode 0555 in a writable directory: ignored
+     because the file itself was not writable, yet unlink + recreate works.
+[39] .git/modules/<x>/config hashed but never parsed: the hooksPath and alias
+     scripts it names, in the submodule's tree, were not watched.
+[40] `git --config-env k=V -C <repo>`: unknown option taking an argument, the
+     argument was taken for the subcommand and the -C ignored (gitguard checked
+     the cwd, git ran in the trapped repository). Unknown options now refused.
+[41] `git --git-dir=.git -C <repo>`: the relative --git-dir was resolved before
+     the -C, git resolves it after (another trusted repository was checked).
+[42] Auto-trust after clone/init blessed hooks copied from a template given by
+     an included global config file, `-c init.templateDir`, GIT_CONFIG_COUNT
+     or GIT_TEMPLATE_DIR.
+[43] SGR sequences in displayed file content (`ESC[8m` conceal, fg = bg) hid
+     part of the config diff shown before [y/N]; only gitguard's own codes
+     are kept now.
+[44] OPEN — a tracked hook under core.hooksPath in the tree is rewritten by the
+     very command the user runs (checkout/merge/reset of a commit the
+     container created, refs and objects being volatile), then executed.
+[45] A local remote (remote.*.url = a repository in the volume): its hooks
+     run on push, its config is honoured; not fingerprinted. Fix: its config
+     and hooks/ (and what that config names), never the whole directory.
+[46] The config parser diverged from git's: a UTF-8 BOM, a `\` ending a
+     comment line, a `\` at EOF, internal whitespace collapsed, \v / \f /
+     NBSP stripped — each one made gitguard miss a core.hooksPath git
+     honoured. Fix: a character-level port of git's config.c.
+[47] core.worktree in .git/config: git takes that directory as the tree and
+     resolves a relative core.hooksPath there; gitguard kept the directory
+     containing .git, so those hooks were never watched.
+[48] Config from the environment or the command line (GIT_CONFIG_COUNT/KEY_n,
+     GIT_CONFIG_PARAMETERS, `-c`, `--config-env`) was not read: a
+     core.hooksPath set there, pointing into the volume, was never watched.
+[49] Discovery: a `.git` directory git does not recognise (invalid HEAD, no
+     objects/refs) stopped gitguard, which checked — and let the user trust —
+     a bogus gitdir while git walked up to the parent's; and gitdir variants
+     git accepts (HEAD symlink to refs/, `commondir` redirection) were not
+     recognised as planted gitdirs [23]. Fix: a port of is_git_directory.
+[50] `~user/` in a path value: git expands it (getpwnam), gitguard only
+     expanded `~/`, so `core.hooksPath = ~jb/vol/hooks` was never watched.
 """
 from __future__ import annotations
 

@@ -15,7 +15,7 @@ import pytest
 
 from tests import attacks
 from tests.conftest import GG, write_exec
-from tests.test_attacks import assert_blocked_now
+from tests.test_attacks import OPEN, assert_blocked_now
 
 ATTACKS = attacks.collect()
 
@@ -26,7 +26,9 @@ def gg_scan(gg: GG) -> GG:
     return gg
 
 
-@pytest.mark.parametrize("fn", [a[1] for a in ATTACKS], ids=[a[0] for a in ATTACKS])
+@pytest.mark.parametrize("fn", [
+    pytest.param(fn, marks=pytest.mark.xfail(strict=True, reason=OPEN[fn.__name__]))
+    if fn.__name__ in OPEN else fn for _, fn in ATTACKS], ids=[a[0] for a in ATTACKS])
 def test_attack_blocked_immediately_with_scan(gg_scan: GG, repo: Path, tmp_path: Path, fn) -> None:
     assert not gg_scan.check(repo).blocked, "the starting repository must be clean"
     fn(gg_scan, repo, tmp_path)
