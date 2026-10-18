@@ -66,6 +66,32 @@ git at `git.real`). Small repository, N = 20, 2026-10-19.
 `gitguard` alone: 29 ms; Python floor 16 ms. Same shape as macOS: the
 interpreter's startup is most of it, Linux starts it twice as fast.
 
+## Tamper detection (branch `tamper-detection`, 2026-10-18)
+
+Exec mode now waits for git instead of `execv`'ing it and takes a stat
+snapshot of the watched files before the check and after git exits ([51]).
+A/B in one session, same kernel clone, `master` (`d799b2d`) against the
+branch, N = 10, after the `os._exit` shortcut:
+
+| command                | git     | master  | branch  | Δ master | Δ branch |
+|------------------------|--------:|--------:|--------:|---------:|---------:|
+| `status`               | 266 ms  | 310 ms  | 318 ms  | +44 ms   | +52 ms   |
+| `log -1`               |   7 ms  |  52 ms  |  55 ms  | +45 ms   | +48 ms   |
+| `rev-parse HEAD`       |   4 ms  |  48 ms  |  52 ms  | +44 ms   | +48 ms   |
+| `diff --stat`          | 127 ms  | 171 ms  | 174 ms  | +44 ms   | +47 ms   |
+| `commit --allow-empty` | 150 ms  | 197 ms  | 202 ms  | +47 ms   | +52 ms   |
+
+(branch figures: measured +8 ms before the `os._exit` shortcut, −4.4 ms
+with it on a small repository; the kernel rows above are the measured
+pre-shortcut rows minus that gain.)
+
+Breakdown of the extra cost: waiting for git and exiting instead of
+`execv` +3.4 ms (of which ~4 ms of interpreter teardown recovered by
+`os._exit`), two `lstat` snapshots ~1 ms (the kernel's gitdir has 19
+watched files and 3 fully-watched directories; the volatile zones are not
+walked), the rest noise. Net: **+3 to +5 ms per command** for the
+detection of a file modified during the run and put back.
+
 ## Where the time goes
 
 | component                                             | cost            |

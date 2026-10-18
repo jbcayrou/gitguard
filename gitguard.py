@@ -2838,7 +2838,13 @@ def _starts_with_config(argv: list[str]) -> bool:
 
 if __name__ == "__main__":
     try:
-        sys.exit(main(sys.argv))
+        rc = main(sys.argv)
+        # Skip the interpreter's teardown (~4 ms): nothing is left to run, the
+        # streams are flushed by hand. Needed since exec mode waits for git
+        # instead of execv'ing it (tamper detection, [51]).
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(rc)
     except Refuse as e:
         fail(str(e))
         sys.exit(1)
