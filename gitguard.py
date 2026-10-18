@@ -1961,14 +1961,26 @@ def stat_snapshot(repo: Repo, refs: list[tuple[str, Path]]) -> tuple[Snap, Snap]
     return files, dirs
 
 
+# Subcommands that write config files by design — and rewrite them as is
+# when the value is already there (`push -u` out of habit, `branch -u`,
+# `remote set-url` with the same URL, `submodule sync`/`update`): for them a
+# config file put back as it was is git's own doing, not reported. Every
+# other watched file (hooks…) is still judged during these commands.
+CONFIG_WRITERS = {"config", "remote", "branch", "push", "fetch", "pull", "checkout", "switch",
+                  "submodule", "worktree", "maintenance", "sparse-checkout", "init", "clone", "lfs"}
+CONFIG_NAMES = {"config", "config.worktree"}
+
+
 def tampered_paths(repo: Repo, refs: list[tuple[str, Path]], before: tuple[Snap, Snap],
-                   after: tuple[Snap, Snap], trusted: dict[tuple[str, str], Entry]) -> list[str]:
+                   after: tuple[Snap, Snap], trusted: dict[tuple[str, str], Entry],
+                   config_writer: bool = False) -> list[str]:
     """Paths touched during git's run and left as they were: a file whose
     stat moved but whose content, mode and kind equal the trusted entry's, or
     a fully-watched directory whose stat moved while its watched entries did
     not. A file whose content differs is not reported here: git may have
     written it itself (`push -u`, `remote add`), the next command shows the
-    diff and asks, as for any change."""
+    diff and asks, as for any change. With `config_writer` (the subcommand
+    is one of CONFIG_WRITERS), config files are not reported either."""
     out: list[str] = []
     by_path = {scope_base(repo, s) / rel: e for (s, rel), e in trusted.items()}
     f0, d0 = before
@@ -1977,7 +1989,7 @@ def tampered_paths(repo: Repo, refs: list[tuple[str, Path]], before: tuple[Snap,
         if f0.get(p) == f1.get(p) or p not in f0 or p not in f1:
             continue                      # unchanged, or created/removed: a content change
         e = by_path.get(p)
-        if e is None:
+        if e is None or (config_writer and p.name in CONFIG_NAMES):
             continue
         if (e.kind, e.mode, e.sha) == (_hash_file(p) or (None, None, None)):
             out.append(f"{p} (modified, then put back)")
@@ -2006,14 +2018,15 @@ def check_tampered(key: Path, repo: Repo) -> None:
 
 
 def post_run_check(repo: Repo, key: Path, refs: list[tuple[str, Path]],
-                   before: tuple[Snap, Snap]) -> None:
+                   before: tuple[Snap, Snap], subcommand: str | None) -> None:
     after = stat_snapshot(repo, refs)
     if after == before:
         return
     man = load_manifest(key)
     if man is None or not man.current:
         return
-    found = tampered_paths(repo, refs, before, after, man.entries)
+    found = tampered_paths(repo, refs, before, after, man.entries,
+                           config_writer=subcommand in CONFIG_WRITERS)
     if not found:
         return
     STATE.mkdir(parents=True, exist_ok=True)
@@ -2753,9 +2766,8 @@ def main(argv: list[str]) -> int:
         if mode in ("check", "exec"):
             check_tampered(key, repo)
         # Taken before the fingerprint: what moves between here and git's exit
-        # is judged afterwards (post_run_check). `git config` writes config
-        # files by design: not judged.
-        if mode == "exec" and not _starts_with_config(argv):
+        # is judged afterwards (post_run_check).
+        if mode == "exec":
             before = stat_snapshot(repo, refs)
         new = manifest(repo, refs)
         old = load_manifest(key)
@@ -2823,17 +2835,42 @@ def main(argv: list[str]) -> int:
         rc = run_git(argv, orig, newrepo, git)
         if before is not None:
             os.chdir(repo.root)
-            post_run_check(repo, key, refs, before)
+            post_run_check(repo, key, refs, before, _subcommand(argv, repo))
         return rc
     return 0
 
 
-def _starts_with_config(argv: list[str]) -> bool:
-    """Is the subcommand `config`? (after git's global options)"""
+def _subcommand(argv: list[str], repo: Repo) -> str | None:
+    """The git subcommand after the global options, aliases resolved through
+    the config files git reads (our parser, never `git config`); None for a
+    `!` alias or when unknown — then nothing is exempted."""
     try:
-        return split_global_options(argv, Path.cwd()).rest[:1] == ["config"]
+        rest = split_global_options(argv, Path.cwd()).rest
     except Refuse:
-        return False
+        return None
+    if not rest:
+        return None
+    aliases: dict[str, str] = {}
+    for f in (*global_config_files(), repo.common / "config", repo.gitdir / "config",
+              repo.gitdir / "config.worktree"):
+        for section, key, value in parse_git_config(f):
+            if section == "alias":
+                aliases[key] = value
+    name = rest[0]
+    for _ in range(10):                   # git expands aliases recursively
+        v = aliases.get(name.lower())
+        if v is None:
+            return name
+        if v.startswith("!"):
+            return None
+        try:
+            words = shlex.split(v)
+        except ValueError:
+            return None
+        if not words:
+            return None
+        name = words[0]
+    return None
 
 
 if __name__ == "__main__":

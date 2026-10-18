@@ -337,8 +337,16 @@ content, mode and kind equal the trusted entry's; a fully-watched directory
 whose stat moved while its entries did not. **Not** reported: a file whose
 content differs — git may have written it itself (`push -u`, `remote
 add`), the next command shows the diff and asks, as for any change; the
-`config` subcommand is not judged at all (it rewrites config files by
-design, possibly with the same content). Directories with a volatile
+subcommands that write config files by design (`CONFIG_WRITERS`: config,
+remote, branch, push, fetch, pull, checkout, switch, submodule, worktree,
+maintenance, sparse-checkout, init, clone, lfs) have their config files
+exempted from the "put back" rule — git rewrites them as they are when the
+value is already there (`push -u` out of habit, `branch -u`, `remote
+set-url` with the same URL, `submodule sync`/`update`: all measured as
+false positives before this exemption); everything else (hooks…) stays
+judged during those commands. The subcommand is read after the global
+options with aliases resolved through our parser (`_subcommand`); a `!`
+alias exempts nothing. Directories with a volatile
 sibling (the gitdir root with `index.lock`, `objects/`, `info/` once
 `info/refs` exists) are left out: a file created and deleted there is not
 seen; nothing git executes lives there unless a trusted config names it,

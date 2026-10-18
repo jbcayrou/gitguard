@@ -126,14 +126,72 @@ def test_gits_own_config_write_is_not_tamper(gg: GG, repo: Path, tmp_path: Path)
     assert r.rc == 0 and "branch tracking" in r.err, r.text
 
 
-def test_git_config_same_value_is_not_tamper(gg: GG, repo: Path) -> None:
-    """`git config k v` with the value already there rewrites the file as is:
-    the `config` subcommand is not judged."""
-    gg.git("config", "core.pager", "cat", cwd=repo)
+def _with_remote(gg: GG, repo: Path, tmp_path: Path) -> None:
+    bare = tmp_path / "remote.git"
+    gg.git("init", "-q", "--bare", str(bare))
+    gg.git("remote", "add", "origin", str(bare), cwd=repo)
+    gg.git("push", "-q", "-u", "origin", "main", cwd=repo)
+    gg.git("config", "alias.pu", "push -u origin main", cwd=repo)
+    gg.git("config", "alias.pu2", "pu", cwd=repo)                  # nested alias
     gg.trust(repo)
-    r = gg.run("git", "config", "core.pager", "cat", cwd=repo)
+
+
+@pytest.mark.parametrize("args", [
+    ["config", "core.pager", "cat"],
+    ["push", "-q", "-u", "origin", "main"],          # already tracking: identical rewrite
+    ["branch", "-u", "origin/main"],
+    ["remote", "set-url", "origin", "SAME"],
+    ["pu"], ["pu2"],                                  # aliases of push -u
+], ids=lambda a: a[0])
+def test_identical_config_rewrite_by_git_is_not_tamper(gg: GG, repo: Path, tmp_path: Path,
+                                                       args: list[str]) -> None:
+    """git rewrites config files as they are when the value is already there
+    (`push -u` out of habit…): not reported for the subcommands that write
+    config by design, aliases resolved."""
+    gg.git("config", "core.pager", "cat", cwd=repo)
+    _with_remote(gg, repo, tmp_path)
+    args = [str(tmp_path / "remote.git") if a == "SAME" else a for a in args]
+    r = gg.run("git", *args, cwd=repo)
     assert r.rc == 0 and "put back" not in r.err, r.text
+    assert not gg.check(repo).blocked, gg.check(repo).text
+
+
+def test_submodule_sync_and_update_are_not_tamper(gg: GG, repo: Path, tmp_path: Path) -> None:
+    from tests.attacks._helpers import add_submodule
+    add_submodule(gg, repo, tmp_path)
+    gg.trust(repo)
+    for args in (["submodule", "sync", "-q"], ["submodule", "update", "--init", "-q"]):
+        r = gg.run("git", *args, cwd=repo)
+        assert r.rc == 0 and "put back" not in r.err, (args, r.text)
     assert not gg.check(repo).blocked
+
+
+def test_hook_touched_during_push_is_still_tamper(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """A config writer only exempts config files: a hook modified and put
+    back during a `push` (here by the pre-push hook playing the sandbox) is
+    reported."""
+    write_exec(repo / ".git/hooks/post-checkout", "#!/bin/sh\nexit 0\n")
+    victim = repo / ".git/hooks/post-checkout"
+    write_exec(repo / ".git/hooks/pre-push",
+               f"#!/bin/sh\ncp '{victim}' /tmp/gg-save.$$ && echo evil >> '{victim}' && "
+               f"cp /tmp/gg-save.$$ '{victim}' && rm /tmp/gg-save.$$\nexit 0\n")
+    _with_remote(gg, repo, tmp_path)
+    (repo / "g").write_text("g\n")
+    gg.git("add", "g", cwd=repo)
+    gg.git("commit", "-qm", "g", cwd=repo)
+    r = gg.run("git", "push", "-q", "-u", "origin", "main", cwd=repo)
+    assert r.rc == 0 and "put back" in r.err and "post-checkout" in r.err, r.text
+    assert gg.check(repo).blocked
+
+
+def test_shell_alias_exempts_nothing(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """`alias.x = !…` is opaque: a config file put back during it is reported."""
+    cfg = repo / ".git/config"
+    gg.git("config", "alias.touchcfg", f"!sh -c 'cp {cfg} /tmp/gg-c.$$ && echo x >> {cfg} && "
+                                       f"cp /tmp/gg-c.$$ {cfg} && rm /tmp/gg-c.$$'", cwd=repo)
+    gg.trust(repo)
+    r = gg.run("git", "touchcfg", cwd=repo)
+    assert r.rc == 0 and "put back" in r.err and ".git/config" in r.err, r.text
 
 
 def test_gc_and_commit_do_not_trip(gg: GG, repo: Path) -> None:
