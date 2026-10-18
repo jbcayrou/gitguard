@@ -376,3 +376,25 @@ def test_san_neutralizes_hiding_sgr(raw) -> None:
     """[43] an SGR sequence from a file (config diff shown before [y/N]) could
     hide the rest of the line; only gitguard's own codes are kept"""
     assert "\x1b" not in san(raw).replace("\x1b[0m", "")
+
+
+# ---------------------------------------------------------------- real_git
+def test_real_git_skips_itself(tmp_path: Path, monkeypatch) -> None:
+    import os
+    me = tmp_path / "me"
+    me.mkdir()
+    os.symlink(Path(gg_mod.__file__).resolve(), me / "git")
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "git").write_text("#!/bin/sh\n")
+    (other / "git").chmod(0o755)
+    (tmp_path / "notexec").mkdir()
+    (tmp_path / "notexec/git").write_text("")
+    monkeypatch.delenv("GITGUARD_REAL_GIT", raising=False)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(me), str(tmp_path / "notexec"), str(other)]))
+    assert gg_mod.real_git() == str(other / "git")
+    monkeypatch.setenv("PATH", str(me))
+    with pytest.raises(Refuse):
+        gg_mod.real_git()
+    monkeypatch.setenv("GITGUARD_REAL_GIT", "/x/git")
+    assert gg_mod.real_git() == "/x/git"

@@ -1,5 +1,4 @@
-"""Every attack pattern in tests/attacks/ must be refused by gitguard in its
-default configuration (no tree scan).
+"""Every attack pattern in tests/attacks/ must be refused by gitguard.
 
 Properties checked for each:
 1. ``gitguard`` alone refuses (exit != 0);
@@ -7,13 +6,12 @@ Properties checked for each:
 3. the repository was not already alerting before the attack (otherwise the
    test proves nothing) — guaranteed by the fixture, re-checked here.
 
-Without the tree scan, a nested repository that has no gitlink yet is not
-visible: git does not open it either. For those attacks (``DEFERRED``), we
-check that the next barrier holds — the user's ``git add -A`` goes through
-(and executes nothing: ``test_first_add_does_not_execute``), then the next
-command is refused; or, for a planted bare gitdir, that git is refused as
-soon as it is run from that directory. ``test_scan_tree.py`` checks that with
-``GITGUARD_SCAN_TREE=1`` these attacks are refused immediately.
+A nested repository that has no gitlink yet is not visible: git does not
+open it either. For those attacks (``DEFERRED``), we check that the next
+barrier holds — the user's ``git add -A`` goes through (and executes nothing:
+``test_nested.py::test_first_add_does_not_execute``), then the next command
+is refused; or, for a planted bare gitdir, that git is refused as soon as it
+is run from that directory.
 """
 from __future__ import annotations
 
@@ -26,8 +24,8 @@ from tests.conftest import GG
 
 ATTACKS = attacks.collect()
 
-# Attacks that only the tree scan reports BEFORE the gitlink: what the user
-# does next, and from where gitguard must then refuse.
+# Attacks not visible before the gitlink (no walk of the tree): what the
+# user does next, and from where gitguard must then refuse.
 DEFERRED = {
     "attack_nested_git_undeclared": ("add", None),
     "attack_bare_gitdir_planted_in_subdir": ("cd", "src"),

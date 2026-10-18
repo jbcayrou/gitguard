@@ -23,7 +23,7 @@ def test_untrusted_repo_is_blocked(gg: GG, tmp_path: Path) -> None:
 def test_diff_shows_change(gg: GG, repo: Path) -> None:
     gg.git("config", "core.pager", "cat", cwd=repo)
     r = gg.run("diff", cwd=repo)
-    assert r.rc == 0 and "config" in r.err and "pager" in r.err
+    assert r.rc == 0 and "config" in r.out and "pager" in r.out and not r.err
 
 
 def test_trust_revalidates(gg: GG, repo: Path) -> None:
@@ -37,7 +37,7 @@ def test_trust_mentions_worktree_refs(gg: GG, repo: Path) -> None:
     (repo / ".githooks").mkdir()
     gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
     r = gg.trust(repo)
-    assert ".githooks" in r.err
+    assert ".githooks" in r.out
 
 
 # ------------------------------------------------------------------ restore
@@ -59,7 +59,7 @@ def test_restore_repairs_gitdir(gg: GG, repo: Path) -> None:
 
 def test_restore_noop(gg: GG, repo: Path) -> None:
     r = gg.run("restore", "-y", cwd=repo)
-    assert r.rc == 0 and "nothing to restore" in r.err
+    assert r.rc == 0 and "nothing to restore" in r.out
 
 
 def test_restore_refuses_broken_structure(gg: GG, repo: Path, tmp_path: Path) -> None:
@@ -246,6 +246,22 @@ def test_symlink_named_git_runs_git(gg: GG, repo: Path, tmp_path: Path) -> None:
     assert r.stdout.strip() == "true"
 
 
+def test_symlink_named_git_ahead_in_path_finds_the_real_git(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """Deployment `~/bin/git → gitguard` ahead in the PATH, no GITGUARD_REAL_GIT:
+    the real git is the next one in the PATH, not gitguard again."""
+    import subprocess
+    link = _git_symlink(tmp_path)
+    env = dict(gg.env, PATH=f"{link.parent}{os.pathsep}{gg.env['PATH']}")
+    r = subprocess.run([str(link), "rev-parse", "--is-inside-work-tree"], cwd=repo, env=env,
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and r.stdout.strip() == "true", r.stderr
+    import sys
+    nogit = f"{link.parent}{os.pathsep}{Path(sys.executable).parent}"     # python3, no git
+    r = subprocess.run([str(link), "status"], cwd=repo, env=dict(env, PATH=nogit),
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "GITGUARD_REAL_GIT" in r.stderr, r.stderr   # no other git: refuse
+
+
 def test_symlink_named_git_blocks_trapped(gg: GG, repo: Path, tmp_path: Path) -> None:
     import subprocess
     link = _git_symlink(tmp_path)
@@ -268,7 +284,7 @@ def test_list_statuses(gg: GG, tmp_path: Path) -> None:
     m1, m2, m3 = (_mk(gg, tmp_path, n) for n in ("m1", "m2", "m3"))
     gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=m2)
     shutil.rmtree(m3)
-    out = gg.run("list").err
+    out = gg.run("list").out
     lines = {l.split()[0]: l for l in out.splitlines() if l.strip()}
     assert "ok" in lines and str(m1) in lines["ok"]
     assert "modified" in lines and str(m2) in lines["modified"]
@@ -280,14 +296,14 @@ def test_prune_and_forget(gg: GG, tmp_path: Path) -> None:
     m1, m2 = _mk(gg, tmp_path, "m1"), _mk(gg, tmp_path, "m2")
     shutil.rmtree(m2)
     gg.run("prune")
-    assert "m2" not in gg.run("list").err
+    assert "m2" not in gg.run("list").out
     idx = Path(str(gg.key_for(m1)) + ".idx")
     (m1 / "f").write_text("x\n")
     assert gg.git("add", "f", cwd=m1).rc == 0          # creates .git/index
     assert not gg.check(m1).blocked
     assert idx.is_file(), "gitlink cache written by the check"
     gg.run("forget", str(m1))
-    assert "m1" not in gg.run("list").err
+    assert "m1" not in gg.run("list").out
     assert not idx.exists(), "forget also removes the index cache"
     assert gg.check(m1).blocked, "forget → never trusted again"
     assert "not registered" in gg.run("forget", str(m1)).err
@@ -299,10 +315,10 @@ def test_retrust_skips_modified(gg: GG, tmp_path: Path) -> None:
     gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=m2)
     shutil.rmtree(gg.key_for(m1).with_suffix(".d"), ignore_errors=True)
     shutil.rmtree(str(gg.key_for(m1)) + ".d", ignore_errors=True)
-    assert "legacy" in gg.run("list").err
+    assert "legacy" in gg.run("list").out
     gg.run("retrust")
     assert (Path(str(gg.key_for(m1)) + ".d")).is_dir()
-    assert "modified" in gg.run("list").err, "m2 must not be re-trusted"
+    assert "modified" in gg.run("list").out, "m2 must not be re-trusted"
 
 
 def test_help(gg: GG) -> None:
@@ -533,7 +549,7 @@ def test_invalid_dotgit_dir_is_walked_past(gg: GG, repo: Path) -> None:
     (src / ".git/config").write_text("[core]\n\tfsmonitor = /tmp/evil\n")
     assert not gg.check(src).blocked                       # the parent is trusted and clean
     r = gg.run("trust", cwd=src)
-    assert r.rc == 0 and str(repo) in r.err and not gg.key_for(src).exists(), r.text
+    assert r.rc == 0 and str(repo) in r.out and not gg.key_for(src).exists(), r.text
     gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=repo)
     assert gg.check(src).blocked                           # the parent's trap is seen from src
 
@@ -550,4 +566,61 @@ def test_core_worktree_keeps_the_key(gg: GG, repo: Path, tmp_path: Path) -> None
     assert f"{repo}/.git has changed" in r.err, r.text   # named by its .git, not by the tree
     gg.trust(repo)
     assert gg.key_for(repo).exists() and not gg.key_for(other).exists()
-    assert gg.run("list").err.startswith("ok ")
+    assert gg.run("list").out.startswith("ok ")
+
+
+# ------------------------------------------------------------ safe.bareRepository
+NEEDLE = "safe.bareRepository"
+
+
+def test_safe_bare_warning_at_trust_retrust_list(gg: GG, repo: Path) -> None:
+    assert NEEDLE in gg.run("trust", cwd=repo).err
+    assert NEEDLE in gg.run("list").err
+    assert NEEDLE in gg.run("retrust").err
+    assert NEEDLE not in gg.check(repo).err, "not on every command"
+    assert NEEDLE not in gg.run("git", "status", cwd=repo).err
+    assert gg.git("config", "--global", "safe.bareRepository", "explicit").rc == 0
+    gg.trust(repo)                               # the global config changed
+    for r in (gg.run("trust", cwd=repo), gg.run("list"), gg.run("retrust")):
+        assert r.rc == 0 and NEEDLE not in r.err, r.text
+
+
+def test_safe_bare_parsed_without_git(gg: GG, repo: Path) -> None:
+    """Value read by our parser: key case, last value wins, any value other
+    than `explicit` → warning."""
+    import gitguard as m
+    home = Path(gg.env["HOME"])
+    cfg = home / ".gitconfig"
+    cfg.write_text(cfg.read_text() + "[Safe]\n\tBareRepository = Explicit\n")
+    assert NEEDLE not in gg.run("list").err
+    cfg.write_text(cfg.read_text() + "[safe]\n\tbareRepository = all\n")
+    assert NEEDLE in gg.run("list").err
+    assert m.safe_bare_explicit.__doc__        # public function, exercised above via list
+
+
+# ------------------------------------------------------------ command line
+@pytest.mark.parametrize("args", [["tust"], ["trust", "--dry-run"], ["diff", "x"], ["list", "x"],
+                                  ["retrust", "x"], ["prune", "--all"], ["restore", "-y", "x"]])
+def test_unknown_command_or_extra_argument_refused(gg: GG, repo: Path, args: list[str]) -> None:
+    """`gitguard tust` used to run a silent check and exit 0, which looked
+    like a successful `trust`."""
+    r = gg.run(*args, cwd=repo)
+    assert r.rc == 1 and ("unknown command" in r.err or "takes no argument" in r.err), r.text
+    assert gg.check(repo).blocked is False
+
+
+def test_management_output_on_stdout_warnings_on_stderr(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """`gitguard list | grep` must work: the result of a management command
+    goes to stdout; warnings (safe.bareRepository…) and refusals to stderr;
+    in exec mode and for the bare check, everything to stderr (stdout is git's)."""
+    r = gg.run("list")
+    assert r.out.startswith("ok ") and "safe.bareRepository" in r.err and "ok " not in r.err
+    gg.git("config", "core.pager", "cat", cwd=repo)
+    r = gg.run("diff", cwd=repo)
+    assert "pager" in r.out and r.err == ""
+    r = gg.check(repo)
+    assert r.blocked and r.out == "" and "has changed" in r.err
+    r = gg.run("git", "status", cwd=repo)
+    assert r.blocked and r.out == "" and "has changed" in r.err
+    r = gg.run("tust", cwd=repo)
+    assert r.blocked and r.out == "" and "unknown command" in r.err

@@ -72,7 +72,7 @@ def test_bisect_in_progress(gg: GG, repo: Path) -> None:
     gg.git("bisect", "start", "HEAD", "HEAD~2", cwd=repo)
     assert not gg.check(repo).blocked
     r = gg.run("diff", cwd=repo)
-    assert "no changes" in r.err
+    assert "no changes" in r.out
     gg.git("bisect", "reset", cwd=repo)
 
 
@@ -130,34 +130,6 @@ def test_include_chain_unchanged(gg: GG, repo: Path) -> None:
     (repo / "level2").write_text("[core]\n")
     gg.git("config", "include.path", "../level1", cwd=repo)
     gg.trust(repo)
-    assert not gg.check(repo).blocked
-
-
-def test_nested_repo_refused_with_prune_escape_hatch(gg: GG, repo: Path) -> None:
-    """With the tree scan, a nested repository is refused as soon as it appears
-    (RCE via gitlink, see tests/nested_git_is_a_threat.sh); GITGUARD_PRUNE is
-    the escape hatch."""
-    gg.env["GITGUARD_SCAN_TREE"] = "1"
-    (repo / "vendor").mkdir()
-    gg.git("init", "-q", cwd=repo / "vendor")
-    r = gg.check(repo)
-    assert r.blocked and "GITGUARD_PRUNE" in r.err
-    gg.env["GITGUARD_PRUNE"] = "vendor"
-    assert not gg.check(repo).blocked
-
-
-def test_vendored_repo_prune_still_works(gg: GG, repo: Path) -> None:
-    gg.env["GITGUARD_SCAN_TREE"] = "1"
-    (repo / "vendor").mkdir()
-    gg.git("init", "-q", cwd=repo / "vendor")
-    gg.env["GITGUARD_PRUNE"] = "vendor"
-    assert not gg.check(repo).blocked
-
-
-def test_node_modules_pruned(gg: GG, repo: Path) -> None:
-    gg.env["GITGUARD_SCAN_TREE"] = "1"
-    (repo / "node_modules").mkdir()
-    gg.git("init", "-q", cwd=repo / "node_modules")
     assert not gg.check(repo).blocked
 
 
@@ -221,7 +193,7 @@ def test_safe_directory_global_does_not_watch_siblings(gg: GG, repo: Path, tmp_p
     executed file, it must not enter the fingerprint."""
     gg.git("config", "--global", "safe.directory", str(tmp_path))
     r = gg.trust(repo)
-    assert "ext:" not in r.err, r.err
+    assert "ext:" not in r.out, r.out
     (tmp_path / "sibling").mkdir()
     (tmp_path / "sibling/new").write_text("x\n")
     assert not gg.check(repo).blocked
@@ -234,8 +206,8 @@ def test_local_remote_commits_do_not_alert(gg: GG, repo: Path, tmp_path: Path) -
     gg.git("remote", "add", "origin", str(other), cwd=repo)
     r = gg.trust(repo)
     o = other.resolve()
-    ext = {t[4:] for t in r.err.split() if t.startswith("ext:")}
-    assert ext == {f"{o}/.git/config", f"{o}/.git/hooks"}, r.err
+    ext = {t[4:] for t in r.out.split() if t.startswith("ext:")}
+    assert ext == {f"{o}/.git/config", f"{o}/.git/hooks"}, r.out
     (other / "b").write_text("b\n")
     gg.git("add", "b", cwd=other)
     gg.git("commit", "-qm", "b", cwd=other)
@@ -248,7 +220,7 @@ def test_alias_with_directory_argument(gg: GG, repo: Path) -> None:
     (repo / "src/a.c").write_text("")
     gg.git("config", "alias.b", "!make -C src", cwd=repo)
     r = gg.trust(repo)
-    assert "wt:" not in r.err, r.err
+    assert "wt:" not in r.out, r.out
     (repo / "src/b.c").write_text("")
     assert not gg.check(repo).blocked
 

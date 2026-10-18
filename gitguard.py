@@ -19,9 +19,8 @@ Usage:
   gitguard help
 
 Alias:    alias git='gitguard git'      Wrapper: ln -s ~/bin/gitguard ~/bin/git
-Env:      GITGUARD_STATE, GITGUARD_REAL_GIT, GITGUARD_PRUNE, GITGUARD_SCAN_TREE=1
-          (search the tree for nested .git, costly, off by default),
-          GITGUARD_ALLOW_REBASE_EXEC, GITGUARD_NO_PROMPT, GITGUARD_DEBUG, NO_COLOR
+Env:      GITGUARD_STATE, GITGUARD_REAL_GIT, GITGUARD_ALLOW_REBASE_EXEC,
+          GITGUARD_NO_PROMPT, GITGUARD_DEBUG, NO_COLOR
 
 Threat model, design choices and vulnerability history: see CLAUDE.md.
 """
@@ -44,27 +43,37 @@ from pathlib import Path
 from typing import Iterator
 
 FORMAT_VERSION = 4   # 4: symlink hashes include the target's content
-REAL_GIT = os.environ.get("GITGUARD_REAL_GIT", "/usr/bin/git")
+
+
+def real_git() -> str:
+    """The git to run: `GITGUARD_REAL_GIT`, else the first `git` of the PATH
+    that is not gitguard itself (the `~/bin/git` symlink deployment puts
+    gitguard ahead of it). The former default `/usr/bin/git` silently ran
+    another git than the user's (Apple's instead of Homebrew's on a Mac),
+    with another system config."""
+    if os.environ.get("GITGUARD_REAL_GIT"):
+        return os.environ["GITGUARD_REAL_GIT"]
+    me = Path(__file__).resolve()
+    for d in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        cand = Path(d or ".") / "git"
+        try:
+            if cand.is_dir() or not os.access(cand, os.X_OK) or cand.resolve() == me:
+                continue
+        except OSError:
+            continue
+        return str(cand)
+    raise Refuse("no git found in the PATH (other than gitguard itself): set GITGUARD_REAL_GIT")
 STATE = Path(os.environ.get("GITGUARD_STATE") or Path.home() / ".local/state/gitguard")
-PRUNE_DIRS = set(os.environ.get(
-    "GITGUARD_PRUNE", "node_modules .venv venv target build dist .cache").split())
 INCLUDE_DEPTH = 10      # git: MAX_INCLUDE_DEPTH = 10
-# GITGUARD_SCAN_TREE=1: walk the work tree looking for nested `.git`.
-# Off by default: ~90 % of the cost on a large repository (0.6 s for 20k
-# directories, 0.17 s on the Linux kernel), and the walk is only an early
-# warning: git opens a nested repository only once a gitlink references it in
-# the index (`index_gitlinks`, always read), and the first `git add -A` that
-# creates this gitlink executes nothing by itself
-# (tests/nested_git_is_a_threat.sh and test_first_add_does_not_execute).
-# Without the scan, the command that FOLLOWS the `add -A` is refused instead
-# of the `add` itself; only a hook or `!` alias of the trusted config that
-# re-invokes git during that `add` escapes the wrapper (see CLAUDE.md).
-# Still read without walking: `.gitmodules` and the gitlinks. A bare gitdir
-# planted in a subdirectory [23] is no longer reported from the root, but
-# `find_root` refuses it as soon as git is run from that directory, and
-# `safe.bareRepository=explicit` (checked by `check_safe_bare`) makes git
-# itself refuse.
-SCAN_TREE = os.environ.get("GITGUARD_SCAN_TREE", "0") in ("1", "yes", "true")
+# No walk of the work tree looking for nested `.git`: git opens a nested
+# repository only once a gitlink references it in the index, which is read
+# at every command (`index_gitlinks`), and the `git add -A` that creates the
+# gitlink executes nothing by itself (tests/nested_git_is_a_threat.sh,
+# test_first_add_does_not_execute). The command that FOLLOWS the `add` is
+# refused. A walk (`GITGUARD_SCAN_TREE`, removed 2026-10-18) only closed the
+# window between that `add` and the next wrapped command — a window only a
+# git outside the wrapper can exploit, which is out of scope by design — for
+# +0.2 s per command on the Linux kernel. See CLAUDE.md, "Nested repositories".
 
 # Volatile: what git rewrites during normal operation. Everything else in the
 # gitdir is watched (deny-by-default inversion, see CLAUDE.md).
@@ -124,6 +133,17 @@ class Style:
 
 
 STYLE = Style(sys.stderr.isatty() and not os.environ.get("NO_COLOR"))
+# Where gitguard's own output goes. stderr by default: in exec mode stdout
+# belongs to git, and a refusal is a diagnostic. The management commands
+# (trust, diff, restore, list, forget, prune, retrust) switch it to stdout,
+# so that `gitguard list | grep` works; warnings and errors stay on stderr.
+OUT = sys.stderr
+
+
+def set_output(stream) -> None:
+    global OUT
+    OUT = stream
+    STYLE.enabled = stream.isatty() and not os.environ.get("NO_COLOR")
 _CTRL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")   # everything but \n (handled separately)
 # Only the SGR codes Style emits (reset, bold, red/green/yellow/cyan). Any
 # other SGR is neutralized: conceal (8), fg = bg (30;40, 38;5;n;48;5;n)…
@@ -154,12 +174,13 @@ def san(s: object) -> str:
 
 
 def err(msg: str) -> None:
-    """Write an already composed message (sanitized data, colours included)."""
-    print(msg, file=sys.stderr)
+    """Write an already composed message (sanitized data, colours included)
+    to the current output (see OUT)."""
+    print(msg, file=OUT)
 
 
-def _tag(color, mark: str, msg: str) -> None:
-    err(f"{color(STYLE.bold(mark + ' gitguard:'))} {san(msg)}")
+def _tag(color, mark: str, msg: str, stream=None) -> None:
+    print(f"{color(STYLE.bold(mark + ' gitguard:'))} {san(msg)}", file=stream or OUT)
 
 
 def info(msg: str) -> None:
@@ -167,11 +188,11 @@ def info(msg: str) -> None:
 
 
 def warn(msg: str) -> None:
-    _tag(STYLE.yellow, "!", msg)
+    _tag(STYLE.yellow, "!", msg, sys.stderr)
 
 
 def fail(msg: str) -> None:
-    _tag(STYLE.red, "✗", msg)
+    _tag(STYLE.red, "✗", msg, sys.stderr)
 
 
 def hint(msg: str) -> None:
@@ -400,17 +421,11 @@ class Repo:
         return self.anchor or self.root
 
     @cached_property
-    def nested(self) -> list[Path]:
-        """Nested `.git` in the tree (a single walk per invocation)."""
-        return nested_gits(self.root)
-
-    @cached_property
     def gitfiles(self) -> list[Path]:
-        """Every nested `.git` to check: those found in the tree AND those
-        referenced by index gitlinks — a gitlink may point into a pruned
-        directory (`node_modules/pkg`) where a redirected gitfile was neither
-        checked nor hashed. [24]"""
-        out = set(self.nested)
+        """Every nested `.git` to check: those declared in `.gitmodules` and
+        those referenced by an index gitlink, wherever they are
+        (`node_modules/pkg` included). [6] [14] [24]"""
+        out = set(gitmodules_gits(self.root))
         for rel in index_gitlinks(self.gitdir, Path(str(self.key) + ".idx")):
             g = self.root / rel / ".git"
             if g.exists() or g.is_symlink():
@@ -554,36 +569,10 @@ def gitmodules_paths(root: Path) -> list[str]:
             if s.startswith("submodule.") and k == "path"]
 
 
-def nested_gits(root: Path) -> list[Path]:
-    """Every nested .git: found in the tree (outside pruned dirs) AND declared
-    in .gitmodules (even inside a pruned directory: git will descend there). A
-    directory that is itself a bare gitdir (HEAD + objects/ + refs/) counts
-    too: git uses it as soon as git is run from that directory. [23]
-
-    No `onerror`: an unreadable directory in the tree is ignored (git cannot
-    read it either); the dangerous case — a gitlink to that directory — is
-    covered by `index_gitlinks`, which does not depend on the walk.
-
-    The disk walk only happens with `GITGUARD_SCAN_TREE=1` (see SCAN_TREE);
-    the paths from `.gitmodules` are always checked."""
+def gitmodules_gits(root: Path) -> list[Path]:
+    """The `.git` of every path declared in `.gitmodules`: git will descend
+    there, wherever it is. Read without any walk of the tree. [6]"""
     found: set[Path] = set()
-    for dirpath, dirnames, filenames in (os.walk(root) if SCAN_TREE else ()):
-        d = Path(dirpath)
-        if d != root and "HEAD" in filenames and is_bare_gitdir(d):
-            found.add(d)
-            dirnames[:] = []
-            continue
-        keep = []
-        for name in dirnames:
-            if name in PRUNE_DIRS or (d == root and name == ".git"):
-                continue
-            if name == ".git":
-                found.add(d / name)
-                continue
-            keep.append(name)
-        dirnames[:] = keep
-        if ".git" in filenames and d != root:
-            found.add(d / ".git")
     for rel in gitmodules_paths(root):
         p = root / rel / ".git"
         if p.exists() or p.is_symlink():
@@ -596,8 +585,7 @@ def index_gitlinks(gitdir: Path, cache: Path | None = None) -> list[str]:
     parsing the file — never via `git`, which would read the config we judge.
 
     This is the criterion that matters: a nested repository is only dangerous
-    if a gitlink references it, and conversely a gitlink may point into a
-    directory pruned by GITGUARD_PRUNE, invisible to the disk scan.
+    once a gitlink references it, and the gitlink names it wherever it is.
 
     `cache` (`<key>.idx` in the state dir, out of the container's reach)
     memoizes the result keyed by the file's sha256: the Python parse costs
@@ -701,9 +689,13 @@ def check_split_index(repo: Repo) -> None:
 
 
 def nested_repo_hint(n: Path) -> str:
-    return (f"nested repository: {n} — git will execute its config as soon as a gitlink "
-            f"for this directory exists in the index (a plain `git add -A` creates one). "
-            f"If this is intended, add the directory to GITGUARD_PRUNE.")
+    d = n.parent
+    return (f"nested repository: {n} — a gitlink for this directory exists in the index "
+            f"(a plain `git add -A` creates one), git will execute its config. If it is "
+            f"your own vendored repository: inspect {n}/config and {n}/hooks, declare it "
+            f"in .gitmodules and run `git submodule absorbgitdirs` (its gitdir moves under "
+            f".git/modules/), then `gitguard trust`. Otherwise delete {n} first, then "
+            f"`git rm --cached {d.name}`.")
 
 
 def gitdir_roots(base: Path) -> Iterator[Path]:
@@ -753,18 +745,14 @@ def check_rebase_todo(repo: Repo) -> None:
 
 def check_structure(repo: Repo, refs: list[tuple[str, Path]]) -> None:
     check_split_index(repo)
-    # Every nested .git — found in the tree or referenced by an index gitlink
-    # (independent of GITGUARD_PRUNE: covers node_modules/, build/…) — must be
+    # Every nested .git — declared in .gitmodules or referenced by an index
+    # gitlink, wherever it is (node_modules/, build/…) — must be
     # a file pointing under .git/modules (submodule) or under .git/worktrees
     # (linked worktree stored inside the tree, e.g. `.worktrees/x`).
     for n in repo.gitfiles:
         if n.is_symlink():
             raise Refuse(f"nested .git is a symlink: {n}")
         if n.is_dir():
-            if n.name != ".git":
-                raise Refuse(f"bare gitdir in the tree: {n} (HEAD + objects/ + refs/) — git "
-                             f"would use it instead of the repository as soon as git is run "
-                             f"from that directory. If intended, add it to GITGUARD_PRUNE.")
             # Declared in .gitmodules or not: a nested .git directory is never
             # a real submodule (that one has a .git file pointing under
             # .git/modules), and git reads its config as soon as a gitlink
@@ -938,7 +926,19 @@ def global_config_files() -> list[Path]:
     """System and global config files git may read. Deliberately broad
     (GIT_CONFIG_GLOBAL *and* ~/.gitconfig *and* XDG): watching one file too
     many costs nothing, missing one is a bypass [16]."""
-    out = [Path(os.environ.get("GIT_CONFIG_SYSTEM") or "/etc/gitconfig"), Path.home() / ".gitconfig"]
+    out = [Path(os.environ.get("GIT_CONFIG_SYSTEM") or "/etc/gitconfig")]
+    # A git built with another sysconfdir (Homebrew: /opt/homebrew/etc/gitconfig)
+    # keeps its system config next to its prefix: <prefix>/bin/git → <prefix>/etc.
+    # Derived from the path, never asked to git; one file too many costs nothing.
+    if not os.environ.get("GIT_CONFIG_SYSTEM"):
+        try:
+            g = Path(real_git())
+            for p in {g, g.resolve()}:
+                if p.parent.name == "bin":
+                    out.append(p.parent.parent / "etc/gitconfig")
+        except Refuse:
+            pass
+    out.append(Path.home() / ".gitconfig")
     if os.environ.get("GIT_CONFIG_GLOBAL"):
         out.append(Path(os.environ["GIT_CONFIG_GLOBAL"]))
     out.append(xdg_config_home() / "git/config")
@@ -1361,8 +1361,8 @@ def scope_base(repo: Repo, scope: str) -> Path:
 
 @dataclass
 class Manifest:
-    """Recorded trust state. `current` false = written by an earlier version
-    (or the bash format): to be re-validated, never compared."""
+    """Recorded trust state. `current` false = written by an earlier version:
+    to be re-validated (`retrust`), never compared."""
     version: int
     root: str | None
     refs: list[tuple[str, Path]]            # roots designated by the trusted config
@@ -1387,7 +1387,7 @@ def load_manifest(key: Path) -> Manifest | None:
         refs = [(sc, Path(p)) for sc, p in data.get("refs", [])]
         return Manifest(version, data.get("root"), refs, entries)
     except (json.JSONDecodeError, TypeError, KeyError, ValueError, AttributeError):
-        return Manifest(1, None, [], {})     # legacy bash format
+        return Manifest(1, None, [], {})     # unreadable: treated as an older format
 
 
 def save_trust(repo: Repo, refs: list[tuple[str, Path]] | None = None,
@@ -1585,8 +1585,7 @@ def cmd_list() -> None:
 
 
 def forget_key(key: Path) -> None:
-    # <key>.config: leftover of states written by the old bash script.
-    for suffix in ("", ".config", ".tmp", ".idx", ".idx.tmp"):
+    for suffix in ("", ".tmp", ".idx", ".idx.tmp"):
         p = Path(str(key) + suffix)
         if p.exists():
             p.unlink()
@@ -1808,13 +1807,13 @@ def parse_new_repo(args: list[str]) -> tuple[str, Path] | None:
     return sub, (cwd / d)
 
 
-def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None) -> int:
+def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None, git: str) -> int:
     os.chdir(orig)
     if newrepo is None:
-        os.execv(REAL_GIT, [REAL_GIT, *args])
+        os.execv(git, [git, *args])
     sub, d = newrepo
     preexisting = (d / ".git").exists() or (d / ".git").is_symlink()
-    rc = subprocess.call([REAL_GIT, *args])
+    rc = subprocess.call([git, *args])
     if rc == 0:
         d = d.resolve()
         if preexisting:
@@ -1943,6 +1942,8 @@ def main(argv: list[str]) -> int:
     else:
         argv = argv[1:]
         cmd = argv[0] if argv else ""
+        if cmd and cmd not in ("help", "-h", "--help", "git"):
+            set_output(sys.stdout)       # a management command: its output is the result
         if cmd in ("trust", "diff"):
             mode, argv = cmd, argv[1:]
         elif cmd == "restore":
@@ -1952,26 +1953,35 @@ def main(argv: list[str]) -> int:
         elif cmd == "git":
             mode, argv = "exec", argv[1:]
         elif cmd == "list":
-            cmd_list(); return 0
+            cmd_list(); argv = argv[1:]
         elif cmd == "forget":
             cmd_forget(argv[1:]); return 0
         elif cmd == "prune":
-            cmd_forget(["--missing"]); return 0
+            cmd_forget(["--missing"]); argv = argv[1:]
         elif cmd == "retrust":
-            cmd_retrust(); return 0
+            cmd_retrust(); argv = argv[1:]
         elif cmd in ("help", "-h", "--help"):
             print(__doc__); return 0
+        elif cmd:
+            # A typo (`gitguard tust`) used to fall through to a silent check
+            # whose exit 0 looked like a success of the intended command.
+            raise Refuse(f"unknown command {cmd!r} (see gitguard help)")
+        if mode != "exec" and argv:
+            raise Refuse(f"{cmd or 'check'} takes no argument: {' '.join(argv)!r}")
+        if cmd in ("list", "prune", "retrust"):
+            return 0
 
     orig = Path.cwd()
-    newrepo = None
+    newrepo, git = None, ""
     if mode == "exec":
+        git = real_git()                 # resolved first: no git at all is its own error
         newrepo = parse_new_repo(argv)
         orig = apply_global_options(argv)
 
     root = find_root(Path.cwd())
     if root is None:
         if mode == "exec":
-            return run_git(argv, orig, newrepo)
+            return run_git(argv, orig, newrepo, git)
         if mode != "check":
             raise Refuse(f"no git repository here: {Path.cwd()}")      # [30]
         return 0
@@ -2003,7 +2013,7 @@ def main(argv: list[str]) -> int:
         if old.entries == new:
             info(f"no changes in {repo.label}")
         else:
-            warn(f"changes in {repo.label}/.git:")
+            err(STYLE.yellow(STYLE.bold(f"changes in {san(repo.label)}/.git:")))
             show_changes(repo, old.entries, new, key)
         return 0
     if mode == "restore":
@@ -2014,7 +2024,7 @@ def main(argv: list[str]) -> int:
 
     check_or_die(repo, key, old, new, refs, interactive=(mode == "exec"))
     if mode == "exec":
-        return run_git(argv, orig, newrepo)
+        return run_git(argv, orig, newrepo, git)
     return 0
 
 

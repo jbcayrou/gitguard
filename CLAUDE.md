@@ -3,8 +3,8 @@
 **`gitguard.py`** — Python 3 standard library only, a single file, the only
 implementation. JSON manifest (version, root, date, typed entries), a complete
 git config parser, paths handled as objects. Runs on Linux and macOS
-(Python ≥ 3.9, tested on 3.12 and 3.14). A state written by the original bash prototype (`<key>.config`,
-text manifest) is reported as "legacy": run `retrust`.
+(Python ≥ 3.9, tested on 3.12 and 3.14). A state written by an earlier
+format version is reported as "legacy": run `retrust`.
 
 A guard that refuses to run `git` on a repository whose "trusted" files
 (`.git/config`, hooks, attributes, alternates…) have changed since the user
@@ -72,12 +72,14 @@ earlier version) is shown as "unknown" and can only be `prune`d.
 
 Intended deployment: `alias git='gitguard git'` (interactive shell) or a
 symlink `~/bin/git → gitguard` ahead of `/usr/bin` in the PATH (the script
-detects it is called `git` and switches to exec mode). Variables:
-`GITGUARD_STATE`, `GITGUARD_REAL_GIT`, `GITGUARD_PRUNE` (directories ignored
-when searching for nested `.git`), `GITGUARD_SCAN_TREE=1` (enables the search
-for nested `.git` in the tree, **off by default**, see "Tree scan"),
-`GITGUARD_ALLOW_REBASE_EXEC`, `GITGUARD_NO_PROMPT` (never ask on the terminal,
-refuse directly), `GITGUARD_DEBUG` (full traceback of an internal error,
+detects it is called `git` and switches to exec mode). The git it runs is
+`GITGUARD_REAL_GIT`, else the first `git` of the PATH that is not gitguard
+itself (`real_git`; the former default `/usr/bin/git` ran Apple's git
+instead of Homebrew's, with another system config). That git's system
+config (`<prefix>/etc/gitconfig`, derived from the binary's path) is read
+along with `/etc/gitconfig`. Variables: `GITGUARD_STATE`,
+`GITGUARD_REAL_GIT`, `GITGUARD_ALLOW_REBASE_EXEC`, `GITGUARD_NO_PROMPT`
+(never ask on the terminal, refuse directly), `GITGUARD_DEBUG` (full traceback of an internal error,
 otherwise a neutralized message and exit 1), `NO_COLOR`.
 After an upgrade that changes what the fingerprint contains: `gitguard retrust`.
 
@@ -110,19 +112,21 @@ After an upgrade that changes what the fingerprint contains: `gitguard retrust`.
 3. **`check_structure`** (refuses before anything else):
    - `core.splitIndex` (`sharedindex.*` present): explicit refusal, the
      gitlinks live in a file `index_gitlinks` does not read ([31]).
-   - **`Repo.gitfiles`** = nested `.git` declared in `.gitmodules` ∪ targeted
-     by an **index gitlink** (`index_gitlinks`, a DIRC v2/3/4 parser, never
-     calling git; independent of `GITGUARD_PRUNE`, a gitlink may target
-     `node_modules/pkg`) ∪, only with `GITGUARD_SCAN_TREE=1`, those found by
-     walking the tree (outside `GITGUARD_PRUNE`, `nested_gits`). Same rule for
-     all ([24]): a `gitdir:` **file** must point under `.git/modules/`
-     (submodule) or `.git/worktrees/` (linked worktree stored in the tree,
-     [27]); a **directory** is refused, declared or not — git reads its config
-     as soon as a gitlink exists, and an ordinary `git add -A` creates that
-     gitlink if the nested repository has a commit (proof:
-     `tests/nested_git_is_a_threat.sh`). A directory that is a **bare gitdir**
-     (`HEAD` + `objects/` + `refs/`, not named `.git`) is refused the same way
-     ([23]). Escape hatch for a deliberately vendored repository: `GITGUARD_PRUNE`.
+   - **`Repo.gitfiles`** = nested `.git` declared in `.gitmodules`
+     (`gitmodules_gits`) ∪ targeted by an **index gitlink** (`index_gitlinks`,
+     a DIRC v2/3/4 parser, never calling git; a gitlink names its directory
+     wherever it is, `node_modules/pkg` included). **No walk of the tree**
+     (see "Nested repositories"). Same rule for all ([24]): a `gitdir:`
+     **file** must point under `.git/modules/` (submodule) or
+     `.git/worktrees/` (linked worktree stored in the tree, [27]); a
+     **directory** is refused, declared or not — git reads its config as soon
+     as a gitlink exists, and an ordinary `git add -A` creates that gitlink if
+     the nested repository has a commit (proof:
+     `tests/nested_git_is_a_threat.sh`). The refusal names the way out: for a
+     deliberately vendored repository, inspect its `config` and `hooks`,
+     declare it in `.gitmodules`, `git submodule absorbgitdirs` (gitfile under
+     `.git/modules/`), `trust`; otherwise delete `<dir>/.git` **before** `git
+     rm --cached <dir>`.
    - `check_rebase_todo`: no `exec`/`x` line in `rebase-merge/git-rebase-todo`,
      `rebase-apply/git-rebase-todo` or `sequencer/todo` — these files live in
      volatile directories (git rewrites them at every step, they cannot be
@@ -250,6 +254,13 @@ relative `include.path` from there is ignored, as git refuses it.
 
 ## Display and sanitization
 
+**Streams.** gitguard's own output goes to stderr by default (`OUT`): in
+exec mode stdout belongs to git, and a refusal is a diagnostic. The
+management commands (`trust`, `diff`, `restore`, `list`, `forget`, `prune`,
+`retrust`) switch `OUT` to stdout (`set_output`) so that `gitguard list |
+grep` works; `warn` and `fail` always go to stderr. Colours follow the
+current output stream's tty-ness.
+
 `san()` neutralizes the control characters of a text about to be displayed,
 **except the SGR sequences gitguard itself emits** (`ESC[0m`, `ESC[m`,
 `ESC[1m`, `ESC[31/32/33/36m`), which can neither clear the screen, nor move
@@ -295,7 +306,8 @@ guess whether it takes an argument [40]; resolves a relative `--git-dir` /
 Invoked through a symlink named `git`, `main` strips `argv[0]` (forgotten in
 one version: the symlink path went to git, exec mode unusable — tested
 since). Every user error is a `Refuse` exception caught in `__main__`
-(exit 1). The scopes: `local` (gitdir), `common` (commondir of a worktree),
+(exit 1); an unknown subcommand or a stray argument is one too (a typo used
+to fall through to a silent check, exit 0). The scopes: `local` (gitdir), `common` (commondir of a worktree),
 `wt` (tree), `ext` (outside the tree, writable), `global` (global config,
 never restored).
 
@@ -306,7 +318,6 @@ sha256 of the root's absolute path:
 
 ```
 <key>           reference manifest
-<key>.config    leftover of the bash prototype, only removed at forget
 <key>.d/        backup of the watched files (.root, local/…, common/…, wt/…, ext/…)
 <key>.idx       cache of the index gitlinks (sha256 of the file + list), rewritten
                 by any check when the index changes; never a source of trust
@@ -377,63 +388,53 @@ counter-measure is shortcut 1, which reserves the question for rare changes
 Implementation trap: `open("/dev/tty", "r+")` in text mode fails ("not
 seekable"); two opens, one for reading, one for writing.
 
-## Tree scan (`GITGUARD_SCAN_TREE`), off by default
+## Nested repositories: the gitlink is the barrier, no walk of the tree
 
-Searching the tree for nested `.git` is **off by default**;
-`GITGUARD_SCAN_TREE=1` re-enables it. To revisit if a way to make it free
-appears.
-
-Why it is acceptable: the walk is only an **early warning**. git opens a
+gitguard never walks the work tree looking for nested `.git`. git opens a
 nested repository only when a gitlink references it in the index, which
 gitguard always reads (`index_gitlinks`), and the `git add -A` that creates
 this gitlink executes nothing by itself — verified for `add -A`, `add .`,
 `add <dir>`, `stash -u/-a`, `commit -i`, `status`, `diff`, `clean`, `grep`,
 `ls-files -o` (git 2.50). This assumption is **tested**:
-`test_first_add_does_not_execute` (pytest, with a positive control) and
-`tests/nested_git_is_a_threat.sh`; if a git version breaks it, make the scan
-the default again. Without the scan, it is the command that **follows** the
-`add` that is refused. Repair: delete `<dir>/.git` **before** `git rm
---cached <dir>` (otherwise `git rm` opens the nested repository). Still read
-without walking: `.gitmodules` ([6]) and the gitlinks ([14], [24]).
+`tests/test_nested.py::test_first_add_does_not_execute` (with a positive
+control) and `tests/nested_git_is_a_threat.sh`; if a git version breaks it,
+a walk before the `add` becomes necessary again. It is the command that
+**follows** the `add` that is refused. Still read without walking:
+`.gitmodules` ([6]) and the gitlinks ([14], [24]). A bare gitdir planted in
+a subdirectory ([23]) is not seen from the root: `find_root` refuses it as
+soon as git is run from that directory, and **`safe.bareRepository=explicit`**
+makes git itself refuse, wrapped or not — `check_safe_bare` (reading the
+system/global files with `parse_git_config`, never `git config`) warns at
+`trust`, `retrust` and `list` if that setting is missing, not on every
+command (a repeated warning ends up ignored).
 
-What is lost, precisely (and only covered by `GITGUARD_SCAN_TREE=1`):
+History: a walk existed (`GITGUARD_SCAN_TREE`, opt-in, with `GITGUARD_PRUNE`
+to skip `node_modules` and the like) and was removed on 2026-10-18. What it
+bought was only the **window between the user's `add -A` and the next
+wrapped command**: a git running there sees the gitlink — a `!` alias
+chaining `add -A && commit` in one git process, a `post-index-change` hook,
+or an unwrapped client (VS Code, lazygit, a Makefile). All of these are git
+invocations outside the wrapper, out of scope by design (first known
+limitation), and the walk only helped if a wrapped command happened to run
+between the planting and the unwrapped one. For that partial cover it cost
++0.2 s per command on the Linux kernel (6.3k directories; `readdir` is
+serialised by APFS, a C `find` was slower, 8 threads 3× slower). A
+directory-mtime cache was ruled out (the sandbox forges mtimes); a
+**ctime** cache would work (no syscall sets ctime; `utime` bumps it) and
+brought the walk to ~7 ms of `lstat` on a synthetic kernel-sized tree, but
+was not worth the extra code for a cover that stays partial. The escape
+hatch `GITGUARD_PRUNE` was also misleading: the gitlink detection never
+depended on it, so a vendored repository stayed refused after adding it —
+the real way out is a submodule (`absorbgitdirs`), now named by the message.
 
-- **A hook or `!` alias of the trusted config that re-invokes git during the
-  `add -A`** (`post-index-change` running `git status`, `alias.ac = !git add
-  -A && git commit`). git puts `libexec/git-core` at the head of the PATH of
-  its subprocesses: the `git` called from a hook or an alias is **always the
-  real git**, even with the `~/bin/git` symlink (verified). The gitlink
-  already exists at that moment → execution of the nested config.
-- **Any git client that is not wrapped** (VS Code re-runs `git status` on
-  every file change, lazygit, a Makefile…) between the `add -A` and the next
-  wrapped command. With the scan, the `add` was refused and the dangerous
-  state never existed.
-- A bare gitdir planted in a subdirectory ([23]) is no longer reported from
-  the root; `find_root` refuses it as soon as git is run from that
-  directory, and **`safe.bareRepository=explicit`** makes git itself refuse,
-  wrapped or not. `check_safe_bare` (reading the system/global files with
-  `parse_git_config`, never `git config`) warns at `trust`, `retrust` and
-  `list` if that setting is missing — not on every command, a repeated
-  warning ends up ignored.
-
-`tests/test_attacks.py` replays the corpus in the default configuration and
-requires, for each attack, an immediate refusal or — list `DEFERRED`, to keep
-up to date — a refusal at the next command; `tests/test_scan_tree.py`
-requires that with `GITGUARD_SCAN_TREE=1` everything is refused immediately.
-
-Performance (M4 Pro): ~40 ms floor per command (Python startup 15 ms, stdlib
-imports 20 ms), ~65 ms on a 30k-file tree. On a large tree (200k files / 20k
-directories, and the Linux kernel — 96k files, 6.3k directories, 10 MB
-index) the tree walk by `nested_gits` was ~90 % of the cost (0.6 s for 20k
-directories, 0.17 s on the kernel; a C `find` is slower still on APFS, and a
-threaded walk gains nothing: APFS serialises `readdir`, 8 threads = 3×
-slower). Hence off by default. The second cost was the Python parse of the
+Performance (M4 Pro, see PERF.md for the full tables): ~45 ms overhead per
+command, constant whatever the tree (Python startup + stdlib imports 32 ms,
+gitguard ~13 ms). The one size-dependent cost was the Python parse of the
 index (40 ms for 96k entries): it is cached in `<key>.idx` keyed by the
 file's sha256 (4 ms for 10 MB; a byte-pattern shortcut "no 0160000 mode
 present" was tried and dropped: in 10 MB of SHAs it appears ~800 times).
-Result on the kernel: `git status` 0.28 s → 0.33 s, `git log -1` 6 ms →
-48 ms, i.e. the Python floor. With `GITGUARD_SCAN_TREE=1`: +0.21 s. A
-directory-mtime cache was ruled out: the sandbox can forge mtimes.
+Result on the kernel: `git status` 247 → 293 ms, `git log -1` 6 → 52 ms;
+80–90 ms once after a command that rewrote the index.
 
 The name scan used to walk the whole gitdir, `objects/` included and twice
 (commondir == gitdir): +250 ms on 30k loose objects, and a wrongful refusal
@@ -465,10 +466,10 @@ to run before any change:
 - `tests/test_commands.py` — trust/diff/restore (including the symlink and
   injection guards), auto-trust clone/init, global options,
   list/forget/prune/retrust, sanitized output.
-- `tests/test_scan_tree.py` — `GITGUARD_SCAN_TREE=1`: the whole attack corpus
-  refused immediately; proof that the first `git add -A` does not execute the
-  nested config (positive control); repair; `.gitmodules` read without a
-  scan; `safe.bareRepository` warning.
+- `tests/test_nested.py` — nested repositories: proof that the first `git
+  add -A` does not execute the nested config (positive control); repair;
+  the submodule way out (`absorbgitdirs`); `.gitmodules` read without a
+  walk; an undeclared nested repository without gitlink is invisible.
 - `tests/test_prompt.py` — auto-accept (real `push -u`, linked worktree,
   refusal as soon as anything else changes) and prompt through a
   pseudo-terminal (`run_with_tty`: setsid + TIOCSCTTY; answers y/n/default,
@@ -588,12 +589,13 @@ content; fail closed on anything the parser cannot make sense of.
   and `.lfsconfig` are watched but tracked: a legitimate change requires a
   `trust`.
 - Bare repositories: not handled, refused (`find_root`). A bare gitdir in a
-  subdirectory is not seen from the root (except with `GITGUARD_SCAN_TREE=1`,
-  and never in a pruned directory); it is refused as soon as git is run from
-  that directory, and by git itself with `safe.bareRepository=explicit`.
-- Tree scan off by default: a nested repository is only seen at the gitlink,
-  see "Tree scan" for the two residual cases (hook/alias re-invoking git
-  during the `add`, unwrapped git client).
+  subdirectory is not seen from the root; it is refused as soon as git is
+  run from that directory, and by git itself with
+  `safe.bareRepository=explicit`.
+- No walk of the tree: a nested repository is only seen at the gitlink, see
+  "Nested repositories" for what runs in the window between the user's
+  `add` and the next wrapped command (a `!` alias chaining git commands, a
+  `post-index-change` hook, an unwrapped client) — all outside the wrapper.
 - `core.splitIndex`: refused (gitlinks in `sharedindex.*`, not read).
 - Parity gaps with git are tracked in `tests/test_git_parity.py` as
   `xfail(strict=True)`; none is open at the moment (the former ones, [46] to

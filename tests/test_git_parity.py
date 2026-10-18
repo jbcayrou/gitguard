@@ -463,19 +463,22 @@ def test_global_config_files_cover_git(gg: GG, tmp_path: Path, monkeypatch, vari
     assert want <= got, f"git reads {want - got}, which gitguard does not parse"
 
 
-def test_default_system_config_is_real_gits(tmp_path: Path) -> None:
-    """gitguard's /etc/gitconfig must be REAL_GIT's (Debian: /etc/gitconfig;
-    Homebrew: /opt/homebrew/etc/gitconfig, different)."""
-    real = gg_mod.REAL_GIT
-    if not Path(real).exists():
-        pytest.skip(f"{real} missing")
+def test_system_config_of_real_git_is_read(tmp_path: Path, monkeypatch) -> None:
+    """The system config git actually uses must be among the files gitguard
+    parses (Debian: /etc/gitconfig; Homebrew: /opt/homebrew/etc/gitconfig,
+    derived from the git binary's prefix without asking git)."""
+    monkeypatch.delenv("GIT_CONFIG_SYSTEM", raising=False)
+    monkeypatch.delenv("GITGUARD_REAL_GIT", raising=False)
+    real = gg_mod.real_git()
     env = {k: v for k, v in os.environ.items()
            if k not in ("GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM")}
     env["GIT_EDITOR"] = "echo"
     r = subprocess.run([real, "config", "--system", "--edit"], cwd=tmp_path, env=env,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert Path(r.stdout.strip()).resolve() == Path("/etc/gitconfig").resolve()
+    want = Path(r.stdout.strip()).resolve()
+    got = {p.resolve() for p in global_config_files()}
+    assert want in got, f"git uses {want}, gitguard reads {sorted(map(str, got))}"
 
 
 @pytest.mark.parametrize("how", ["count", "parameters", "parameters_old", "dash_c"])

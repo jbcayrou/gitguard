@@ -96,9 +96,7 @@ automatically.
 | Variable | Effect |
 |---|---|
 | `GITGUARD_STATE` | State directory (default `~/.local/state/gitguard`). |
-| `GITGUARD_REAL_GIT` | Path to the real git (default `/usr/bin/git`). |
-| `GITGUARD_PRUNE` | Directories ignored when looking for nested `.git` (default `node_modules .venv venv target build dist .cache`). |
-| `GITGUARD_SCAN_TREE=1` | Also walk the work tree for nested repositories (early warning, off by default: costly on big trees). |
+| `GITGUARD_REAL_GIT` | Path to the real git (default: the first `git` in the PATH that is not gitguard itself). |
 | `GITGUARD_ALLOW_REBASE_EXEC=1` | Allow `exec` lines in rebase todo files. |
 | `GITGUARD_NO_PROMPT=1` | Never ask on the terminal; refuse directly. |
 | `GITGUARD_DEBUG=1` | Full traceback on internal errors. |
