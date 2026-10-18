@@ -137,6 +137,12 @@ gitguard.py refer to this list (how the project reviews itself: CLAUDE.md,
      recognised as planted gitdirs [23]. Fix: a port of is_git_directory.
 [50] `~user/` in a path value: git expands it (getpwnam), gitguard only
      expanded `~/`, so `core.hooksPath = ~user/vol/hooks` was never watched.
+[51] Modified during git's run, then put back: a sandbox still running
+     edits a watched file after the check (a hook while the editor is open,
+     during a rebase…) and restores it — every check saw the trusted state.
+     Not in the corpus (git runs by design). Detection: a stat snapshot
+     before the fingerprint, compared after git exits; ctime cannot be set
+     from user space. `.tampered` marker, refusal until trust/restore.
 """
 from __future__ import annotations
 

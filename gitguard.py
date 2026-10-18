@@ -904,11 +904,13 @@ def check_structure(repo: Repo, refs: list[tuple[str, Path]]) -> None:
             raise Refuse(f"suspicious owner/permissions: {p}")
 
 
-def walk_all(base: Path) -> Iterator[Path]:
+def walk_all(base: Path, dirs: list[Path] | None = None) -> Iterator[Path]:
     if base.is_symlink() or base.is_file():
         yield base
         return
     for dirpath, dirnames, filenames in os.walk(base, onerror=_walk_error):
+        if dirs is not None:
+            dirs.append(Path(dirpath))
         for name in dirnames:
             if (Path(dirpath) / name).is_symlink():
                 yield Path(dirpath) / name
@@ -1367,12 +1369,15 @@ def _volatile_file(name: str, rel: str, at_root: bool, is_symlink: bool) -> bool
             or rel in VOLATILE_RELPATHS)      # rel: relative to the closest root [26]
 
 
-def gitdir_paths(base: Path) -> Iterator[tuple[str, Path]]:
+def gitdir_paths(base: Path, dirs: list[tuple[Path, bool]] | None = None) -> Iterator[tuple[str, Path]]:
     """(relative path, path) of everything the gitdir contains outside the
     volatile zones: files and symlinks (a symlink to a directory is an entry,
     never followed). The only walk of the gitdir — fingerprint and name scan
     both use it. The rules live in _volatile_dir/_volatile_file, shared with
-    gitdir_excluded: two copies of the same rule had drifted apart ([22])."""
+    gitdir_excluded: two copies of the same rule had drifted apart ([22]).
+    `dirs`, if given, receives every directory visited with a flag: True when
+    none of its entries was dropped as volatile (its ctime then only moves
+    when a watched entry is added, removed or replaced — see stat_snapshot)."""
     roots: dict[Path, Path] = {base: base}     # directory → closest gitdir root
     for dirpath, dirnames, filenames in os.walk(base, onerror=_walk_error):
         d = Path(dirpath)
@@ -1381,16 +1386,22 @@ def gitdir_paths(base: Path) -> Iterator[tuple[str, Path]]:
         zone = _zone(d, root)
         prefix = "" if d == base else str(d.relative_to(base)) + "/"
         rprefix = "" if d == root else str(d.relative_to(root)) + "/"
-        keep = []
+        keep, dropped = [], False
         for name in dirnames:
             if (d / name).is_symlink():
                 filenames.append(name)        # a symlink is an entry
             elif not _volatile_dir(name, *zone):
                 keep.append(name)
+            else:
+                dropped = True
         dirnames[:] = keep
         for name in filenames:
             if not _volatile_file(name, rprefix + name, zone[0], (d / name).is_symlink()):
                 yield prefix + name, d / name
+            else:
+                dropped = True
+        if dirs is not None:
+            dirs.append((d, not dropped))
 
 
 def walk_gitdir(base: Path, scope: str) -> Iterator[Entry]:
@@ -1509,6 +1520,7 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]] | None = None,
     STATE.mkdir(parents=True, exist_ok=True)
     STATE.chmod(0o700)
     key = repo.key
+    tamper_marker(key).unlink(missing_ok=True)
     tmp = Path(str(key) + ".tmp")
     tmp.write_text(json.dumps({
         "version": FORMAT_VERSION, "root": str(repo.label),
@@ -1853,6 +1865,7 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
     if not plan:
         if kept:
             raise Refuse("nothing else to restore")
+        tamper_marker(key).unlink(missing_ok=True)   # the user chose restore: the flag is lifted
         info(f"nothing to restore, {repo.label} is in the trusted state")
         return
     err(STYLE.bold(f"Actions on {san(repo.root)}:"))
@@ -1886,9 +1899,132 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
         if action == "restore":
             _copy_entry(bak / scope / path.lstrip("/"), dst)
     if manifest(repo, config_refs(repo)) == old:
+        tamper_marker(key).unlink(missing_ok=True)
         info(f"{len(plan)} file(s) restored, {repo.label} matches the trusted state again")
     else:
         warn("restore done, but the fingerprint still differs — check with 'gitguard diff'")
+
+
+# ------------------------------------------------------ tamper detection
+# The race the check cannot close: the sandbox, still running, modifies a
+# watched file after the check and before (or while) git reads it, then puts
+# it back so that the next command sees the trusted state. ctime is the
+# witness: no system call sets it (utimes moves it to "now"), the host kernel
+# bumps it on every write, rename, chmod — also when the writer is a
+# container or a VM going through the host's file system. Content can be
+# restored, ctime cannot. Detection only: git has already run; but the host
+# owner learns it, and the `.tampered` marker refuses every command until a
+# `trust` or `restore`. [51]
+Snap = dict[Path, tuple]
+
+
+def stat_snapshot(repo: Repo, refs: list[tuple[str, Path]]) -> tuple[Snap, Snap]:
+    """(files, directories): `(inode, ctime_ns, size, mode)` of every watched
+    file (the fingerprint's entries), and of every directory whose entries
+    are all watched — `hooks/`, a hooksPath in the tree… A directory with a
+    volatile sibling inside (the gitdir root with `index.lock`, `objects/`)
+    moves on git's own writes and is left out: a file created there and
+    deleted again is not seen (none of them is executed by git unless a
+    trusted config names it, which makes it a watched file)."""
+    files: Snap = {}
+    dirs: Snap = {}
+
+    def st(p: Path) -> tuple | None:
+        try:
+            s = p.lstat()
+        except OSError:
+            return None
+        return (s.st_ino, s.st_ctime_ns, s.st_size, s.st_mode)
+
+    def add_file(p: Path) -> None:
+        t = st(p)
+        if t is not None:
+            files[p] = t
+
+    for base in {repo.gitdir, repo.common}:
+        seen: list[tuple[Path, bool]] = []
+        for _, p in gitdir_paths(base, seen):
+            add_file(p)
+        for d, fully in seen:
+            if fully and (t := st(d)) is not None:
+                dirs[d] = t
+    for _, start in refs:
+        seen_dirs: list[Path] = []
+        for p in walk_all(start, seen_dirs):
+            add_file(p)
+        for d in seen_dirs:
+            if (t := st(d)) is not None:
+                dirs[d] = t
+    for f in [*global_config_files(), xdg_config_home() / "git/attributes"]:
+        if f.is_file():
+            add_file(f)
+    return files, dirs
+
+
+def tampered_paths(repo: Repo, refs: list[tuple[str, Path]], before: tuple[Snap, Snap],
+                   after: tuple[Snap, Snap], trusted: dict[tuple[str, str], Entry]) -> list[str]:
+    """Paths touched during git's run and left as they were: a file whose
+    stat moved but whose content, mode and kind equal the trusted entry's, or
+    a fully-watched directory whose stat moved while its watched entries did
+    not. A file whose content differs is not reported here: git may have
+    written it itself (`push -u`, `remote add`), the next command shows the
+    diff and asks, as for any change."""
+    out: list[str] = []
+    by_path = {scope_base(repo, s) / rel: e for (s, rel), e in trusted.items()}
+    f0, d0 = before
+    f1, d1 = after
+    for p in sorted(set(f0) | set(f1)):
+        if f0.get(p) == f1.get(p) or p not in f0 or p not in f1:
+            continue                      # unchanged, or created/removed: a content change
+        e = by_path.get(p)
+        if e is None:
+            continue
+        if (e.kind, e.mode, e.sha) == (_hash_file(p) or (None, None, None)):
+            out.append(f"{p} (modified, then put back)")
+    for d in sorted(set(d0) & set(d1)):   # a directory counts only if fully watched on both sides
+        if d0[d] == d1[d]:
+            continue
+        children = {p for p in set(f0) | set(f1) if p.parent == d}
+        if all(f0.get(p) == f1.get(p) for p in children):
+            out.append(f"{d}/ (an entry added, then removed)")
+    return out
+
+
+def tamper_marker(key: Path) -> Path:
+    return Path(str(key) + ".tampered")
+
+
+def check_tampered(key: Path, repo: Repo) -> None:
+    m = tamper_marker(key)
+    if m.is_file():
+        rule()
+        raise Refuse(f"{repo.label}: watched files were modified during a previous git run, "
+                     f"then put back (see {m}):\n  "
+                     + san(m.read_text(errors="replace")).rstrip().replace("\n", "\n  ")
+                     + "\n  Code may have run. Inspect, then `gitguard trust` or `gitguard restore` "
+                       "to clear this.")
+
+
+def post_run_check(repo: Repo, key: Path, refs: list[tuple[str, Path]],
+                   before: tuple[Snap, Snap]) -> None:
+    after = stat_snapshot(repo, refs)
+    if after == before:
+        return
+    man = load_manifest(key)
+    if man is None or not man.current:
+        return
+    found = tampered_paths(repo, refs, before, after, man.entries)
+    if not found:
+        return
+    STATE.mkdir(parents=True, exist_ok=True)
+    tamper_marker(key).write_text(time.strftime("%Y-%m-%dT%H:%M:%S") + "\n"
+                                  + "\n".join(found) + "\n")
+    rule()
+    fail(f"{repo.label}: modified DURING the git run, then put back — code may have run:")
+    for f in found:
+        err("  " + STYLE.red(san(f)))
+    hint("Every command on this repository is refused until `gitguard trust` or `gitguard restore`.")
+    rule()
 
 
 # --------------------------------------------------------- state management
@@ -1916,7 +2052,9 @@ def entries() -> Iterator[tuple[Path, Path | None, str]]:
         except Refuse:
             yield key, root, "structure"
             continue
-        if data is None or not data.current:
+        if tamper_marker(key).is_file():
+            yield key, root, "tampered"
+        elif data is None or not data.current:
             yield key, root, "legacy"
         elif manifest(repo, refs) != data.entries:
             yield key, root, "modified"
@@ -1927,7 +2065,7 @@ def entries() -> Iterator[tuple[Path, Path | None, str]]:
 
 
 def cmd_list() -> None:
-    colors = {"ok": STYLE.green, "modified": STYLE.red, "structure": STYLE.red,
+    colors = {"ok": STYLE.green, "modified": STYLE.red, "structure": STYLE.red, "tampered": STYLE.red,
               "missing": STYLE.yellow, "legacy": STYLE.yellow, "unknown": STYLE.yellow}
     n = 0
     for key, root, st in sorted(entries(), key=lambda t: str(t[1])):
@@ -1941,7 +2079,8 @@ def cmd_list() -> None:
 
 
 def forget_key(key: Path) -> None:
-    for suffix in ("", ".tmp", ".idx", ".idx.tmp", ".pending", ".pending.tmp", ".pending.lock"):
+    for suffix in ("", ".tmp", ".idx", ".idx.tmp", ".pending", ".pending.tmp", ".pending.lock",
+                   ".tampered"):
         p = Path(str(key) + suffix)
         if p.exists():
             p.unlink()
@@ -2329,12 +2468,21 @@ def parse_new_repo(args: list[str]) -> tuple[str, Path] | None:
 
 
 def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None, git: str) -> int:
+    """Run the real git and wait for it (no execv: the post-run tamper check
+    needs to look again afterwards). A git killed by a signal reports as the
+    shell would (128 + signal)."""
     os.chdir(orig)
+    if newrepo is not None:
+        sub, d = newrepo
+        preexisting = (d / ".git").exists() or (d / ".git").is_symlink()
+    try:
+        rc = subprocess.call([git, *args])
+    except KeyboardInterrupt:
+        rc = 130
+    if rc < 0:
+        rc = 128 - rc
     if newrepo is None:
-        os.execv(git, [git, *args])
-    sub, d = newrepo
-    preexisting = (d / ".git").exists() or (d / ".git").is_symlink()
-    rc = subprocess.call([git, *args])
+        return rc
     if rc == 0:
         d = d.resolve()
         if preexisting:
@@ -2587,6 +2735,7 @@ def main(argv: list[str]) -> int:
     key: Path | None = None
     old: Manifest | None = None
     fingerprinted = False
+    before = None
     try:
         if mode == "exec":
             git = real_git()             # resolved first: no git at all is its own error
@@ -2601,6 +2750,13 @@ def main(argv: list[str]) -> int:
         label, key = repo.label, repo.key
         refs = config_refs(repo)
         check_structure(repo, refs)
+        if mode in ("check", "exec"):
+            check_tampered(key, repo)
+        # Taken before the fingerprint: what moves between here and git's exit
+        # is judged afterwards (post_run_check). `git config` writes config
+        # files by design: not judged.
+        if mode == "exec" and not _starts_with_config(argv):
+            before = stat_snapshot(repo, refs)
         new = manifest(repo, refs)
         old = load_manifest(key)
         fingerprinted = True
@@ -2664,8 +2820,21 @@ def main(argv: list[str]) -> int:
             e.recorded = True
         raise
     if mode == "exec":
-        return run_git(argv, orig, newrepo, git)
+        rc = run_git(argv, orig, newrepo, git)
+        if before is not None:
+            os.chdir(repo.root)
+            post_run_check(repo, key, refs, before)
+        return rc
     return 0
+
+
+def _starts_with_config(argv: list[str]) -> bool:
+    """Is the subcommand `config`? (after git's global options)"""
+    try:
+        return split_global_options(argv, Path.cwd()).rest[:1] == ["config"]
+    except Refuse:
+        return False
+
 
 if __name__ == "__main__":
     try:

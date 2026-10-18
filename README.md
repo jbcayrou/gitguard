@@ -87,6 +87,15 @@ The fingerprint lives in `~/.local/state/gitguard/`, outside any mounted
 volume, with a backup of the watched files so `gitguard restore` can put
 them back.
 
+A sandbox that keeps running during your `git commit` or `git rebase` can
+edit a hook while the editor is open and put it back afterwards. In exec
+mode gitguard also compares the watched files' inode and ctime before the
+check and after git exits: content can be restored, ctime cannot (no system
+call sets it, and the host kernel bumps it for writers in a container or a
+VM too). A file modified then put back is reported, and the repository is
+refused until `gitguard trust` or `restore`. Detection, not prevention: git
+has already run, but you know.
+
 It is a fingerprint, not a blocklist of "dangerous" config keys: there is
 nothing to keep up to date with git's CVEs, and no key it can miss. The
 price is an explicit `gitguard trust` when *you* change your hooks, remotes

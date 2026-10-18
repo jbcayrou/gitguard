@@ -60,7 +60,7 @@ gitguard restore [-y]  put the watched files back into the reference state
 gitguard git <args>    check, then run /usr/bin/git; honours -C/--git-dir/--work-tree;
                        successful clone/init → auto trust; pure branch tracking → accepted
                        on its own; any other change → diff, then a [y/N] question on the terminal
-gitguard list          all registered repositories: status (ok/modified/structure/missing/legacy/unknown), date, path
+gitguard list          all registered repositories: status (ok/modified/structure/tampered/missing/legacy/unknown), date, path
 gitguard pending [<repo>... | -a | -c <repo>...]   decisions waiting for a git blocked by a program:
                        list; review (diff + calling process) and allow/refuse; clear
 gitguard forget <repo>... | --missing   remove entries (the repository becomes "never trusted" again)
@@ -313,6 +313,50 @@ both of git's quoting syntaxes, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
 cannot write it, but a value may name a path in the volume ([48]). A
 relative `include.path` from there is ignored, as git refuses it.
 
+## Tamper detection: modified during the run, then put back ([51])
+
+The check cannot close the race with a sandbox that keeps running and
+cannot be frozen (podman, a VM, anything). The cheapest evasion of the
+fingerprint was to modify a watched file after the check — long commands
+leave minutes-wide windows with a signal visible from the sandbox:
+`COMMIT_EDITMSG` while the editor is open, `rebase-merge/` during a
+rebase — and to put it back before the next command. **ctime** is the
+witness: no system call sets it (`utimes` moves it to "now"), the host
+kernel bumps it on every write, rename or chmod, also when the writer is a
+container or a VM going through the host's file system; content can be
+restored, ctime cannot. mtime is forgeable (`touch -r`) and useless here.
+
+In exec mode `main` takes `stat_snapshot` **before** the fingerprint
+(`(inode, ctime_ns, size, mode)` of every watched file, and of every
+directory whose entries are all watched — `hooks/`, a hooksPath in the
+tree — so that an entry added then removed moves the directory), runs git
+and waits for it (`run_git` no longer `execv`s; a signal death is reported
+as 128 + signal), takes it again and compares (`post_run_check`,
+`tampered_paths`). Reported as tampering: a file whose stat moved but whose
+content, mode and kind equal the trusted entry's; a fully-watched directory
+whose stat moved while its entries did not. **Not** reported: a file whose
+content differs — git may have written it itself (`push -u`, `remote
+add`), the next command shows the diff and asks, as for any change; the
+`config` subcommand is not judged at all (it rewrites config files by
+design, possibly with the same content). Directories with a volatile
+sibling (the gitdir root with `index.lock`, `objects/`, `info/` once
+`info/refs` exists) are left out: a file created and deleted there is not
+seen; nothing git executes lives there unless a trusted config names it,
+which makes it a watched file. The rebase/sequencer todo files are volatile
+and out of reach: that window remains.
+
+On detection: red block, `<key>.tampered` written (date + paths) and every
+`check`/`git` on the repository refused (`check_tampered`) until `trust` or
+`restore` (also a no-op restore: the user chose to lift the flag), `list`
+shows `tampered`, `forget` removes it. Detection, not prevention — but the
+host owner learns that code may have run, which is the whole point of the
+tool. Cost: two `lstat` walks, a few ms, and a resident Python process
+during git. Tests: `tests/test_tamper.py` (sandbox played by `GIT_EDITOR`
+during a `commit`: config modified and restored with mtime forged back,
+transient hook in `.git/hooks/` that deletes itself after running — positive
+control —, hooksPath in the tree; controls: untouched commit, `push -u`,
+`git config` same value, gc/maintenance; marker lifecycle; signal exit code).
+
 ## Display and sanitization
 
 **Streams.** gitguard's own output goes to stderr by default (`OUT`): in
@@ -391,6 +435,8 @@ sha256 of the root's absolute path:
                 the waiting pids and their calling processes; read by `pending`
 <key>.pending.lock   flock for the read-modify-write of the record (never removed
                 except by forget: unlinking it under a holder would allow two locks)
+<key>.tampered  written by the post-run check ([51]): date + paths modified during
+                a git run and put back; refuses every command until trust/restore
 <key>.tmp, <key>.d.tmp, <key>.idx.tmp, <key>.pending.tmp   being written (swapped in by rename)
 ```
 
@@ -624,6 +670,8 @@ to run before any change:
 - `tests/test_commands.py` — trust/diff/restore (including the symlink and
   injection guards), auto-trust clone/init, global options,
   list/forget/prune/retrust, sanitized output.
+- `tests/test_tamper.py` — modified during git's run then put back ([51]),
+  see "Tamper detection".
 - `tests/test_nested.py` — nested repositories: proof that the first `git
   add -A` does not execute the nested config (positive control); repair;
   the submodule way out (`absorbgitdirs`); `.gitmodules` read without a
@@ -762,10 +810,15 @@ content; fail closed on anything the parser cannot make sense of.
 
 - Only covers invocations that go through the wrapper/alias.
 - Race window if the sandbox is still running: it can modify `.git` between
-  the check and git's execution. No detection: an earlier `podman ps`
-  warning was removed, it cost up to ~600 ms per command and probably missed
-  the common case of a mounted parent directory. Stop the sandbox before
-  running git on the host.
+  the check and git's execution, or while git runs (a hook dropped while
+  the editor is open, an `exec` line in a rebase todo). No prevention: an
+  earlier `podman ps` warning was removed (~600 ms per command, missed a
+  mounted parent directory), and freezing the writer is not possible when
+  it may be a VM. Detection after the fact only, see "Tamper detection":
+  a watched file modified then put back is reported and the repository
+  refused until `trust`/`restore`; a change left in place is seen at the
+  next command as any change; the rebase todo (volatile) is not covered.
+  Stop the sandbox before running git on the host when you can.
 - `restore` only cleans the pivot vector; objects, commits and tree files
   dropped by the sandbox remain, to be inspected by hand. It never deletes
   outside the gitdir and the roots the **trusted** config designates (an
