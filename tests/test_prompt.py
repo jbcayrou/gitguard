@@ -146,6 +146,7 @@ def run_with_tty(gg: GG, args: list[str], cwd: Path, answer: str | None,
         # data waits in the pipe for the git that gitguard execs.
         p.stdin.write(stdin_data)
         p.stdin.close()
+        p.stdin = None      # Python 3.13's communicate() flushes a non-None stdin: closed → ValueError
     tty_out = b""
     deadline = time.monotonic() + 30
     asked = False

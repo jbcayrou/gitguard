@@ -226,6 +226,19 @@ def test_dash_C_without_argument_fails_closed(gg: GG, repo: Path) -> None:
 
 
 # -------------------------------------------------- symlink named git (wrapper)
+def _python_only_dir(tmp_path: Path) -> Path:
+    """A PATH directory holding `python3` (gitguard's shebang) and nothing else:
+    `sys.executable`'s own directory is `/usr/bin` on a system Python, where git
+    lives too."""
+    import sys
+    d = tmp_path / "pyonly"
+    d.mkdir(exist_ok=True)
+    link = d / "python3"
+    if not link.is_symlink():
+        os.symlink(sys.executable, link)
+    return d
+
+
 def _git_symlink(tmp_path: Path) -> Path:
     from tests.conftest import GITGUARD
     b = tmp_path / "bin"
@@ -256,7 +269,7 @@ def test_symlink_named_git_ahead_in_path_finds_the_real_git(gg: GG, repo: Path, 
                        capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout.strip() == "true", r.stderr
     import sys
-    nogit = f"{link.parent}{os.pathsep}{Path(sys.executable).parent}"     # python3, no git
+    nogit = f"{link.parent}{os.pathsep}{_python_only_dir(tmp_path)}"     # python3, no git
     r = subprocess.run([str(link), "status"], cwd=repo, env=dict(env, PATH=nogit),
                        capture_output=True, text=True)
     assert r.returncode != 0 and "GITGUARD_REAL_GIT" in r.stderr, r.stderr   # no other git: refuse
@@ -286,7 +299,7 @@ def test_sibling_git_real_wins_over_path(gg: GG, repo: Path, tmp_path: Path) -> 
     assert r.returncode == 0 and r.stdout.strip() == "true", r.stderr
     assert "GIT_REAL_SHIM" in r.stderr, r.stderr
     shim.unlink()
-    nogit = f"{link.parent}{os.pathsep}{Path(sys.executable).parent}"     # python3, no git
+    nogit = f"{link.parent}{os.pathsep}{_python_only_dir(tmp_path)}"     # python3, no git
     r = subprocess.run([str(link), "status"], cwd=repo, env=dict(gg.env, PATH=nogit),
                        capture_output=True, text=True)
     assert r.returncode != 0, r.stdout
