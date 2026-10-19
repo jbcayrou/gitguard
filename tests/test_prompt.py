@@ -116,13 +116,14 @@ def test_branch_tracking_plus_hook_refused(gg: GG, repo: Path, subsrc: Path) -> 
 
 def run_with_tty(gg: GG, args: list[str], cwd: Path, answer: str | None,
                  stdin_data: bytes | None = None, env: dict | None = None,
-                 stdout_pipe: bool = False):
+                 stdout_pipe: bool = False, pretype: bytes | None = None):
     """Run gitguard with a pseudo-terminal as controlling terminal (so /dev/tty
     can be opened), stderr and stdout on that terminal (as when the user types
     the command); `stdout_pipe` captures stdout instead, as a `$(git …)` in a
     shell prompt does; stdin = pipe if `stdin_data`, else the terminal.
-    Answers `answer` on the terminal when the question appears. Returns
-    (rc, captured stdout or "", tty output)."""
+    Answers `answer` on the terminal when the question appears; `pretype` is
+    typed on the terminal right at start, before anything is displayed.
+    Returns (rc, captured stdout or "", tty output)."""
     import pty
     import fcntl
     import termios
@@ -138,6 +139,8 @@ def run_with_tty(gg: GG, args: list[str], cwd: Path, answer: str | None,
         stdout=subprocess.PIPE if stdout_pipe else slave, stderr=slave,
         preexec_fn=preexec, close_fds=True)
     os.close(slave)
+    if pretype is not None:
+        os.write(master, pretype)
     if stdin_data is not None:
         # gitguard never reads stdin (the question goes through /dev/tty): the
         # data waits in the pipe for the git that gitguard execs.
@@ -204,10 +207,26 @@ def test_prompt_does_not_eat_git_stdin(gg: GG, repo: Path) -> None:
     assert "ce013625030ba8dba906f756967f9e9ca394464a" in tty, tty
 
 
+def test_pretyped_input_does_not_answer(gg: GG, repo: Path) -> None:
+    """A `y` typed before the diff was on screen is discarded (input queue
+    flushed before the question): the answer is the Enter typed afterwards,
+    i.e. the default N. Without the flush, readline would return the early
+    `y` and git would run."""
+    modify(gg, repo)
+    rc, out, tty = run_with_tty(gg, ["git", "status"], repo, "", pretype=b"y\n")
+    assert "[y/N]" in tty, tty
+    assert rc != 0 and "On branch" not in tty, (rc, tty)
+    assert gg.check(repo).blocked, "reference unchanged"
+
+
 def test_no_prompt_without_tty(gg: GG, repo: Path) -> None:
     modify(gg, repo)
     r = gg.run("git", "status", cwd=repo)            # neither tty nor interactive stdin
-    assert r.blocked and "On branch" not in r.out and "gitguard trust" in r.err
+    assert r.blocked and "On branch" not in r.out
+    # From a terminal (developer's shell) the refusal names `gitguard trust`;
+    # without a controlling terminal (CI, editor) it records a pending
+    # decision and names `gitguard pending` (GITGUARD_WAIT=0 in the suite).
+    assert "gitguard trust" in r.err or "gitguard pending" in r.err, r.err
     assert "[y/N]" not in r.err
 
 

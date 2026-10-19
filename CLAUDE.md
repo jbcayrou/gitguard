@@ -60,6 +60,8 @@ gitguard git <args>    check, then run /usr/bin/git; honours -C/--git-dir/--work
                        successful clone/init → auto trust; pure branch tracking → accepted
                        on its own; any other change → diff, then a [y/N] question on the terminal
 gitguard list          all registered repositories: status (ok/modified/structure/missing/legacy/unknown), date, path
+gitguard pending [<repo>... | -a | -c <repo>...]   decisions waiting for a git blocked by a program:
+                       list; review (diff + calling process) and allow/refuse; clear
 gitguard forget <repo>... | --missing   remove entries (the repository becomes "never trusted" again)
 gitguard prune         = forget --missing
 gitguard retrust       re-validate in bulk the "ok" or "legacy" repositories (no backup); skips modified ones
@@ -98,7 +100,10 @@ each, by hand — no automatic migration, no trust-on-first-use (ruled out:
 it blesses an unknown first state for the sole benefit of a one-time
 migration). Variables: `GITGUARD_STATE`,
 `GITGUARD_REAL_GIT`, `GITGUARD_ALLOW_REBASE_EXEC`, `GITGUARD_NO_PROMPT`
-(never ask on the terminal, refuse directly), `GITGUARD_DEBUG` (full traceback of an internal error,
+(never ask on the terminal, refuse directly), `GITGUARD_WAIT` (seconds a
+git without a controlling terminal waits for `gitguard pending`, default
+60, 0 = never), `GITGUARD_NO_NOTIFY` (no desktop notification),
+`GITGUARD_DEBUG` (full traceback of an internal error,
 otherwise a neutralized message and exit 1), `NO_COLOR`.
 After an upgrade that changes what the fingerprint contains: `gitguard retrust`.
 
@@ -316,8 +321,10 @@ gitdir (volatile pruned): the fingerprint and the control-character scan of
 `_child_root` / `_zone` / `_volatile_dir` / `_volatile_file`, shared by
 `walk_gitdir` and `gitdir_excluded` (two copies had drifted apart: flaw [22]).
 `Manifest` (version/root/refs/entries, `current`) ← `load_manifest`;
-`changes` / `show_changes` / `restore`; `entries` / `cmd_list` / `cmd_forget` /
-`cmd_retrust`; exec mode: `split_global_options` (pure, tested; knows every
+`load_pending` / `update_pending` (flock) / `record_pending` / `caller_chain` /
+`notify_pending` / `wait_for_decision`; `changes` / `show_changes` / `restore`;
+`entries` / `cmd_list` / `cmd_forget` / `cmd_retrust`; `review` / `review_pending` /
+`cmd_pending`; exec mode: `split_global_options` (pure, tested; knows every
 option of git.c `handle_options`, **refuses an unknown one** rather than
 guess whether it takes an argument [40]; resolves a relative `--git-dir` /
 `--work-tree` from the cwd *after all* `-C`, as git does [41]) →
@@ -340,7 +347,12 @@ sha256 of the root's absolute path:
 <key>.d/        backup of the watched files (.root, local/…, common/…, wt/…, ext/…)
 <key>.idx       cache of the index gitlinks (sha256 of the file + list), rewritten
                 by any check when the index changes; never a source of trust
-<key>.tmp, <key>.d.tmp, <key>.idx.tmp   being written (swapped in by rename)
+<key>.pending   a refusal nobody read (exec mode, no controlling terminal): kind
+                (changed/never/structural), message, the state seen (changed),
+                the waiting pids and their calling processes; read by `pending`
+<key>.pending.lock   flock for the read-modify-write of the record (never removed
+                except by forget: unlinking it under a holder would allow two locks)
+<key>.tmp, <key>.d.tmp, <key>.idx.tmp, <key>.pending.tmp   being written (swapped in by rename)
 ```
 
 The root is canonicalised (`readlink -f`): accessing the repository through
@@ -401,12 +413,58 @@ before refusing (`check_or_die`, `interactive=True` only in exec mode;
    structural refusal (raised earlier by `check_structure`, and `trust` would
    refuse it too).
 
-In both cases `save_trust(repo, refs, new)` receives **the state already
+3. **Pending decision** (`wait_for_decision`, `cmd_pending`): when the
+   process has **no controlling terminal** (`has_tty`: an editor's polling,
+   a build tool, cron — nobody reads its stderr), it records the state it
+   saw in `<key>.pending` (`record_pending`: kind, message, manifest, refs,
+   its pid and the calling processes from `caller_chain`, `/proc` or
+   `/bin/ps`), sends one desktop notification (`notify_pending`:
+   `/usr/bin/notify-send` or `/usr/bin/osascript` by absolute path, text as
+   arguments, `san()`, 3 s timeout, every failure ignored, one per
+   `NOTIFY_COOLDOWN`), and **polls the reference** every `WAIT_POLL` for up
+   to `GITGUARD_WAIT` seconds. The decision channel is the reference
+   itself: `gitguard pending <repo>` recomputes the *live* state, shows the
+   diff against the reference (`review`), says so if it moved since the
+   block, asks on the tty and saves exactly what it showed; a waiter whose
+   own state equals the new reference runs git, any other refuses (fail
+   closed). Refusing removes the record: waiters see it gone and refuse.
+   After the timeout the record stays and the decision applies to the next
+   invocation. Never-trusted and structural refusals are recorded too (kind
+   `never`/`structural`, hooked in `main`'s `except Refuse`, `Refuse.recorded`
+   avoids a double record) but never waited for nor allowable from
+   `pending`. A process that *has* a terminal (shell prompt, script run from
+   a terminal) is refused immediately as before: blocking it would freeze
+   the shell. `has_tty` does **not** open `/dev/tty`: on macOS, opening and
+   closing it in a session leader whose pty master is not read leaves the
+   process stuck in its exit (seen in the pty tests); it reads
+   `/proc/self/stat` or `ps -o tty=`. A passing check removes a stale
+   record; `trust`, `retrust`, `forget` remove it too.
+
+   Ruled out, with the facts: **polkit** (authorises privileged actions and
+   authenticates with a password; no privilege here, one-line message, no
+   diff, Linux desktop only) and any **GUI question showing the diff**
+   (zenity/kdialog/osascript dialog, a spawned terminal, tkinter): on X11
+   any client of the display synthesises the click or the `y` (XTEST), so a
+   sandbox given the X socket forges the answer; a popping window steals
+   focus and in-flight keystrokes; a question outside the moment the user
+   asked git for something is what dialog fatigue feeds on. The decision
+   stays in a terminal the user opened.
+
+In all cases `save_trust(repo, refs, new)` receives **the state already
 computed and shown**: recomputing the fingerprint at the moment of the `y`
 would validate what a still-active sandbox could have written between the
-diff and the answer. The accepted risk of the prompt is the reflex `y`; the
-counter-measure is shortcut 1, which reserves the question for rare changes
-(`remote add`, a hook, `include.path`) that the user will read.
+diff and the answer. `save_trust` also **verifies each backup copy** against
+that manifest (hash of the copy, in STATE; a symlink's copy by its target
+string): the manifest would refuse a file rewritten in that window at the
+next check, but the backup would have held the attacker's version for
+`restore`. With `pending`, that window lasts minutes. `ask_on_tty` flushes
+the tty input queue (`tcflush`) before writing the question: a `y` typed
+before the diff was on screen cannot answer it. `trust` on a changed
+repository shows the diff first (`review`) and asks on a terminal; in a
+script it prints the diff and records. The accepted risk of the prompt is
+the reflex `y`; the counter-measure is shortcut 1, which reserves the
+question for rare changes (`remote add`, a hook, `include.path`) that the
+user will read.
 
 Implementation trap: `open("/dev/tty", "r+")` in text mode fails ("not
 seekable"); two opens, one for reading, one for writing.
@@ -495,10 +553,19 @@ to run before any change:
   walk; an undeclared nested repository without gitlink is invisible.
 - `tests/test_prompt.py` — auto-accept (real `push -u`, linked worktree,
   refusal as soon as anything else changes) and prompt through a
-  pseudo-terminal (`run_with_tty`: setsid + TIOCSCTTY; answers y/n/default,
-  trusted state = shown state, git's stdin preserved, no question without a
-  tty / with stderr redirected / `GITGUARD_NO_PROMPT` / never trusted /
-  structural refusal).
+  pseudo-terminal (`run_with_tty`: setsid + TIOCSCTTY, stdout and stderr on
+  the pty, `stdout_pipe` for a prompt's `$(git …)`, `pretype` for input
+  typed before the question; answers y/n/default, trusted state = shown
+  state, git's stdin preserved, pre-typed `y` discarded, no question without
+  a tty / with stderr or stdout redirected / `GITGUARD_NO_PROMPT` / never
+  trusted / structural refusal).
+- `tests/test_pending.py` — a git without a controlling terminal
+  (`start_new_session=True`) records and waits; allow / refuse / timeout /
+  state moved / two waiters; no wait and no record with a terminal; never
+  trusted and structural recorded, not waited; record cleared when the state
+  comes back, by `forget`, by `-c`; `pending` without a terminal shows but
+  cannot decide. The whole suite runs with `GITGUARD_WAIT=0` and
+  `GITGUARD_NO_NOTIFY=1` (conftest).
 - `tests/test_unit.py` — pure functions: config parser (checked against
   `git config -f` for the ambiguous cases), `parse_new_repo`, `changes`,
   `san`, `Style`, `walk_gitdir` filter, `index_gitlinks` and its cache,
@@ -641,7 +708,10 @@ content; fail closed on anything the parser cannot make sense of.
   environment are read ([48]).
 - gitguard.py has no dependency outside the stdlib (diff via `difflib`); the
   tests need `pytest` and `git`.
-- A context without a terminal (cron, CI, script) gets no question: a
-  never-trusted or changed repository is refused there. The script runs
-  `gitguard trust` after its `remote add`/`worktree add`, or uses the real
-  git if the repository is not exposed to a sandbox.
+- A context without a terminal and without a desktop session (ssh, cron,
+  systemd) gets no notification: the record is written, the wait times out,
+  `gitguard pending` shows it later. A script runs `gitguard trust` after
+  its `remote add`/`worktree add`, or uses the real git if the repository is
+  not exposed to a sandbox.
+- `caller_chain` is informational: it says which program to look at, never
+  decides anything.

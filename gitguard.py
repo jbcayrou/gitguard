@@ -13,6 +13,10 @@ Usage:
                          own; any other change is shown, then asked on the
                          terminal [y/N]
   gitguard list          registered repositories and their status
+  gitguard pending [<repo>... | -a | -c <repo>...]
+                         decisions waiting: a git run by a program with no
+                         terminal (editor, build, cron) blocks until you allow
+                         the shown state here, refuse it, or GITGUARD_WAIT ends
   gitguard forget <repo>... | --missing
   gitguard prune         = forget --missing
   gitguard retrust       re-validate unchanged repositories (after an upgrade)
@@ -22,13 +26,16 @@ Alias:    alias git='gitguard git'      Wrapper: ln -s ~/bin/gitguard ~/bin/git
 System:   /usr/bin/git → gitguard, the real git diverted to /usr/bin/git.real
           (dpkg-divert); a `git.real` next to gitguard is used before the PATH
 Env:      GITGUARD_STATE, GITGUARD_REAL_GIT, GITGUARD_ALLOW_REBASE_EXEC,
-          GITGUARD_NO_PROMPT, GITGUARD_DEBUG, NO_COLOR
+          GITGUARD_NO_PROMPT, GITGUARD_WAIT (seconds a terminal-less git waits
+          for `gitguard pending`, 0 = never, default 60), GITGUARD_NO_NOTIFY,
+          GITGUARD_DEBUG, NO_COLOR
 
 Threat model, design choices and vulnerability history: see CLAUDE.md.
 """
 from __future__ import annotations
 
 import difflib
+import fcntl
 import hashlib
 import json
 import os
@@ -38,6 +45,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import termios
 import time
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -84,6 +92,11 @@ def real_git() -> str:
     raise Refuse("no git found: none in the PATH other than gitguard itself, no `git.real` "
                  "next to gitguard — set GITGUARD_REAL_GIT")
 STATE = Path(os.environ.get("GITGUARD_STATE") or Path.home() / ".local/state/gitguard")
+WAIT_DEFAULT = 60.0      # seconds a git without a controlling terminal waits for `gitguard pending`
+WAIT_POLL = 0.5
+NOTIFY_COOLDOWN = 600    # one desktop notification per repository per 10 minutes
+NOTIFY_SEND = "/usr/bin/notify-send"     # absolute: a PATH entry may live in the volume
+OSASCRIPT = "/usr/bin/osascript"
 INCLUDE_DEPTH = 10      # git: MAX_INCLUDE_DEPTH = 10
 # No walk of the work tree looking for nested `.git`: git opens a nested
 # repository only once a gitlink references it in the index, which is read
@@ -129,6 +142,7 @@ class Refuse(Exception):
 
     def __init__(self, msg: str):
         super().__init__(san(msg))
+        self.recorded = False      # a pending record was already written for it
 
 
 class Style:
@@ -1447,6 +1461,23 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]] | None = None,
         dst = new / scope / rel.lstrip("/")
         dst.parent.mkdir(parents=True, exist_ok=True)
         _copy_entry(src, dst)
+        # The copy must be the file the blessed manifest describes: between
+        # the diff and the answer (seconds on the tty, minutes through
+        # `gitguard pending`) a still-active sandbox may have rewritten it.
+        # The manifest would refuse that file at the next check, but
+        # `restore` would have put the attacker's copy back. Verified on the
+        # copy, in STATE, out of the sandbox's reach. A symlink's copy only
+        # carries its target string, so that is what is compared.
+        try:
+            same = (os.readlink(dst) == os.readlink(src) if e.kind == "l"
+                    else _hash_file(dst) == (e.kind, e.mode, e.sha))
+        except OSError:
+            same = False
+        if not same:
+            shutil.rmtree(new, ignore_errors=True)
+            tmp.unlink(missing_ok=True)
+            raise Refuse(f"{repo.label} changed while the question was pending "
+                         f"({_label(scope, rel)}): not trusted, run the command again")
     shutil.rmtree(bak, ignore_errors=True)
     os.rename(new, bak)
     os.replace(tmp, key)
@@ -1463,6 +1494,216 @@ def _copy_entry(src: Path, dst: Path) -> None:
         os.symlink(os.readlink(src), dst)
     else:
         shutil.copy2(src, dst, follow_symlinks=False)
+
+
+# ------------------------------------------------------------------ pending
+# A git run by a program without a controlling terminal (editor, build tool,
+# cron) cannot be asked and its stderr is swallowed. It records what it saw in
+# `<key>.pending` and waits for the user to decide from `gitguard pending`.
+# The decision channel is the reference itself: allowing = saving the reviewed
+# state, which the waiter recognises as equal to its own; refusing = removing
+# the record. A waiter whose state differs from what was blessed refuses.
+def pending_path(key: Path) -> Path:
+    return Path(str(key) + ".pending")
+
+
+def load_pending(key: Path) -> dict | None:
+    p = pending_path(key)
+    if not p.is_file():
+        return None
+    try:
+        d = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) and "root" in d else None
+
+
+def update_pending(key: Path, fn) -> dict | None:
+    """Read-modify-write of `<key>.pending` under a lock (several waiters at
+    once). `fn(current or None)` returns the record to write, or None to
+    remove it."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    STATE.chmod(0o700)
+    with open(str(key) + ".pending.lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        new = fn(load_pending(key))
+        p = pending_path(key)
+        if new is None:
+            p.unlink(missing_ok=True)
+        else:
+            tmp = Path(str(p) + ".tmp")
+            tmp.write_text(json.dumps(new, indent=1, ensure_ascii=False))
+            os.replace(tmp, p)
+        return new
+
+
+def clear_pending(key: Path) -> None:
+    # The lock file stays: unlinking it under a holder would let a third
+    # process take a second "exclusive" lock on a fresh inode.
+    update_pending(key, lambda _cur: None)
+    Path(str(key) + ".pending.tmp").unlink(missing_ok=True)
+
+
+def _alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, TypeError, ValueError, OverflowError):
+        return True
+    return True
+
+
+def _proc_info(pid: int) -> tuple[int, str, str] | None:
+    """(ppid, name, args) of a process: /proc on Linux, /bin/ps elsewhere."""
+    proc = Path(f"/proc/{pid}")
+    try:
+        if proc.is_dir():
+            st = (proc / "stat").read_text()
+            name = st[st.index("(") + 1:st.rindex(")")]        # comm may hold spaces
+            ppid = int(st[st.rindex(")") + 2:].split()[1])
+            args = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            return ppid, name, args.strip()
+        if not Path("/bin/ps").is_file():
+            return None
+        r = subprocess.run(["/bin/ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=3)
+        line = r.stdout.strip()
+        if not line:
+            return None
+        ppid_s, comm = line.split(None, 1)
+        r = subprocess.run(["/bin/ps", "-o", "args=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=3)
+        return int(ppid_s), Path(comm.strip()).name, r.stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def caller_chain(limit: int = 5) -> list[dict]:
+    """The program that ran git, and its ancestors: [{pid, name, args}] from
+    gitguard's parent upwards. Informational, sanitized; never trusted for a
+    decision (it only says who to look at)."""
+    out: list[dict] = []
+    pid = os.getppid()
+    while pid > 1 and len(out) < limit:
+        info_ = _proc_info(pid)
+        if info_ is None:
+            break
+        ppid, name, args = info_
+        out.append({"pid": pid, "name": san(name)[:80], "args": san(args)[:200]})
+        if ppid == pid:
+            break
+        pid = ppid
+    return out
+
+
+def notify_pending(label, text: str) -> None:
+    """One desktop notification: Linux `notify-send`, macOS `osascript`. Text
+    passed as arguments, never interpolated; absolute binaries; any failure
+    is ignored — a notification must never change the outcome or hang git."""
+    if os.environ.get("GITGUARD_NO_NOTIFY"):
+        return
+    title = "gitguard: decision pending"
+    body = san(f"{label}: {text}")[:200]
+    if Path(NOTIFY_SEND).is_file():
+        cmd = [NOTIFY_SEND, "--app-name", "gitguard", "--urgency", "critical", title, body]
+    elif Path(OSASCRIPT).is_file():
+        cmd = [OSASCRIPT, "-e", "on run argv",
+               "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+               "-e", "end run", title, body]
+    else:
+        return
+    try:
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=3)
+    except Exception:                    # noqa: BLE001 — best effort by design
+        pass
+
+
+def record_pending(key: Path, kind: str, label, message: str,
+                   new: dict | None = None, refs: list[tuple[str, Path]] | None = None,
+                   waiter: dict | None = None) -> None:
+    """Create or refresh `<key>.pending` (kind: changed | never | structural)
+    and notify once per NOTIFY_COOLDOWN. `new`/`refs` (changed only) describe
+    the latest state seen; `waiter` registers the blocked process."""
+    now = time.time()
+    notify = []
+
+    def fn(cur: dict | None) -> dict:
+        d = cur if cur and cur.get("root") == str(label) else {"created": now, "notified": 0.0,
+                                                               "waiters": []}
+        d.update(kind=kind, root=str(label), message=san(message), seen=now)
+        if new is not None and refs is not None:
+            d["entries"] = [e.__dict__ for e in sorted(new.values(), key=lambda e: (e.scope, e.path))]
+            d["refs"] = [[sc, str(p)] for sc, p in refs]
+        else:
+            d.pop("entries", None)
+            d.pop("refs", None)
+        d["waiters"] = [w for w in d.get("waiters", []) if _alive(w.get("pid"))]
+        if waiter is not None:
+            d["waiters"].append(waiter)
+        if now - float(d.get("notified") or 0) >= NOTIFY_COOLDOWN:
+            d["notified"] = now
+            notify.append(True)
+        return d
+
+    update_pending(key, fn)
+    if notify:
+        notify_pending(label, "git is waiting for your decision. In a terminal: gitguard pending"
+                       if kind == "changed" else f"{message} — in a terminal: gitguard pending")
+
+
+def _drop_waiter(key: Path, pid: int) -> None:
+    def fn(cur: dict | None) -> dict | None:
+        if cur is None:
+            return None
+        cur["waiters"] = [w for w in cur.get("waiters", []) if w.get("pid") != pid]
+        return cur
+    update_pending(key, fn)
+
+
+def wait_seconds() -> float:
+    v = os.environ.get("GITGUARD_WAIT")
+    if v is None or v == "":
+        return WAIT_DEFAULT
+    try:
+        f = float(v)
+        if f < 0:
+            raise ValueError
+    except ValueError:
+        raise Refuse(f"GITGUARD_WAIT must be a number of seconds: {v!r}") from None
+    return f
+
+
+def wait_for_decision(repo: Repo, key: Path, new: dict, refs: list[tuple[str, Path]]) -> str:
+    """Record the pending state, then block until the reference equals `new`
+    ("allowed"), the record disappears ("refused") or GITGUARD_WAIT elapses
+    ("timeout", the record stays for `gitguard pending`)."""
+    timeout = wait_seconds()
+    me = {"pid": os.getpid(), "since": time.time(), "caller": caller_chain()} if timeout else None
+    record_pending(key, "changed", repo.label, "has changed since the last trust", new, refs, me)
+    if not timeout:
+        return "timeout"
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            old = load_manifest(key)
+            if old is not None and old.current and old.entries == new:
+                return "allowed"
+            if load_pending(key) is None:
+                return "refused"
+            if time.monotonic() >= deadline:
+                return "timeout"
+            time.sleep(WAIT_POLL)
+    finally:
+        _drop_waiter(key, os.getpid())
+
+
+def pending_entries(d: dict) -> dict[tuple[str, str], Entry] | None:
+    try:
+        return {(e["scope"], e["path"]): Entry(**e) for e in d["entries"]}
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def changes(old: dict, new: dict) -> list[tuple[str, tuple[str, str]]]:
@@ -1605,7 +1846,7 @@ def cmd_list() -> None:
 
 
 def forget_key(key: Path) -> None:
-    for suffix in ("", ".tmp", ".idx", ".idx.tmp"):
+    for suffix in ("", ".tmp", ".idx", ".idx.tmp", ".pending", ".pending.tmp", ".pending.lock"):
         p = Path(str(key) + suffix)
         if p.exists():
             p.unlink()
@@ -1629,7 +1870,7 @@ def cmd_forget(args: list[str]) -> None:
     for a in args:
         root = Path(a).resolve()
         key = key_for(root)
-        if not key.is_file():
+        if not key.is_file() and not pending_path(key).is_file():
             warn(f"not registered: {root}")
             continue
         forget_key(key)
@@ -1641,6 +1882,7 @@ def cmd_retrust() -> None:
     for key, root, st in entries():
         if st in ("ok", "legacy") and root:
             save_trust(open_repo(root))
+            clear_pending(key)
             n += 1
             info(f"re-trusted: {root}")
         else:
@@ -1648,6 +1890,128 @@ def cmd_retrust() -> None:
             warn(f"skipped ({st}): {root or key.name}")
     info(f"{n} repository(ies) re-trusted, {skipped} skipped")
     check_safe_bare()
+
+
+def review(repo: Repo, key: Path, old: dict, new: dict, refs: list[tuple[str, Path]],
+           question: str) -> bool:
+    """Show what differs from the reference, ask on the terminal, and record
+    exactly the state that was shown. True when recorded."""
+    rule()
+    warn(STYLE.bold(f"{repo.label}/.git has changed since the last trust"))
+    show_changes(repo, old, new, key)
+    err("")
+    rule()
+    if not ask_on_tty(STYLE.yellow(question)):
+        return False
+    save_trust(repo, refs, new)
+    clear_pending(key)
+    info(f"trust state recorded for {repo.label}")
+    return True
+
+
+def _pending_records() -> list[tuple[Path, dict]]:
+    out = []
+    for p in sorted(STATE.glob("????????????????.pending")):
+        key = Path(str(p)[:-len(".pending")])
+        d = load_pending(key)
+        if d is not None:
+            out.append((key, d))
+    return out
+
+
+def _age(ts) -> str:
+    try:
+        s = int(time.time() - float(ts))
+    except (TypeError, ValueError):
+        return "?"
+    return f"{s}s" if s < 60 else f"{s // 60}min" if s < 3600 else f"{s // 3600}h{(s % 3600) // 60:02d}"
+
+
+def _show_waiters(d: dict) -> list[dict]:
+    alive = [w for w in d.get("waiters", []) if _alive(w.get("pid"))]
+    for w in alive:
+        chain = " ← ".join(f"{san(str(c.get('name', '?')))}[{c.get('pid', '?')}]" for c in w.get("caller", []))
+        err(f"    git waiting (pid {w.get('pid')}, {_age(w.get('since'))}): {chain or 'unknown caller'}")
+        if w.get("caller"):
+            err(f"      {san(str(w['caller'][0].get('args', '')))}")
+    return alive
+
+
+def review_pending(key: Path, d: dict) -> None:
+    label = Path(str(d["root"]))
+    kind = str(d.get("kind", "?"))
+    err(STYLE.bold(f"{san(label)}") + f"  [{san(kind)}, since {_age(d.get('created'))}]")
+    _show_waiters(d)
+    if kind != "changed":
+        err(f"  {san(str(d.get('message', '')))}")
+        hint("Inspect, then:  gitguard trust  (clears this record)   or:  gitguard pending -c <repo>")
+        return
+    repo = open_repo(label)
+    refs = config_refs(repo)
+    check_structure(repo, refs)
+    live = manifest(repo, refs)
+    old = load_manifest(key)
+    if old is None or not old.current:
+        raise Refuse(f"repository never trusted: {label} (gitguard trust after inspection)")
+    if old.entries == live:
+        clear_pending(key)
+        info(f"back to the reference, nothing to decide: {label}")
+        return
+    recorded = pending_entries(d)
+    if recorded is not None and recorded != live:
+        warn("the state moved since git was blocked: this is the current one")
+    if not can_ask():
+        rule()
+        show_changes(repo, old.entries, live, key)
+        rule()
+        raise Refuse("run `gitguard pending` from a terminal to decide")
+    if review(repo, key, old.entries, live, refs,
+              "Allow: record this state and let the waiting git run? [y/N] "):
+        return
+    clear_pending(key)
+    warn(f"refused: the waiting git is not run; the record is cleared. If malicious:  gitguard restore")
+
+
+def cmd_pending(args: list[str]) -> None:
+    """`pending`: list. `pending <repo>…` / `-a`: review and decide.
+    `pending -c <repo>…`: clear without deciding."""
+    if args and args[0] == "-c":
+        if len(args) < 2:
+            raise Refuse("usage: gitguard pending -c <repo>...")
+        for a in args[1:]:
+            key = key_for(Path(a).resolve())
+            if pending_path(key).is_file():
+                clear_pending(key)
+                info(f"cleared: {Path(a).resolve()}")
+            else:
+                warn(f"nothing pending: {Path(a).resolve()}")
+        return
+    records = _pending_records()
+    if not args:
+        if not records:
+            info("nothing pending")
+            return
+        for key, d in records:
+            n = sum(_alive(w.get("pid")) for w in d.get("waiters", []))
+            colors = {"changed": STYLE.yellow, "never": STYLE.red, "structural": STYLE.red}
+            kind = str(d.get("kind", "?"))
+            err(f"{colors.get(kind, str)(f'{kind:<11}')} {_age(d.get('created')):>6}  "
+                f"{n} waiting  {san(str(d['root']))}")
+        hint("gitguard pending <repo>   to see the diff and decide     -a: all")
+        return
+    if args == ["-a"]:
+        targets = records
+    else:
+        targets = []
+        for a in args:
+            key = key_for(Path(a).resolve())
+            d = load_pending(key)
+            if d is None:
+                warn(f"nothing pending: {Path(a).resolve()}")
+            else:
+                targets.append((key, d))
+    for key, d in targets:
+        review_pending(key, d)
 
 
 # -------------------------------------------------------- exec mode (git …)
@@ -1909,18 +2273,47 @@ def ask_on_tty(question: str) -> bool:
     a pipe: asking there would block every prompt redraw on a modified
     repository; the price is that `git log | head` is refused instead of
     asked) or when GITGUARD_NO_PROMPT is set."""
-    if (os.environ.get("GITGUARD_NO_PROMPT") or not sys.stderr.isatty()
-            or not sys.stdout.isatty()):
+    if not can_ask():
         return False
     try:
         # Two opens: "r+" in text mode requires a seekable stream.
         with open("/dev/tty", "w") as out, open("/dev/tty") as inp:
+            # Keystrokes typed before the diff was on screen must not answer
+            # it: flush them before the question is written.
+            termios.tcflush(inp.fileno(), termios.TCIFLUSH)
             out.write(san(question))
             out.flush()
             ans = inp.readline()
     except OSError:
         return False
     return ans.strip().lower() in ("y", "yes")
+
+
+def has_tty() -> bool:
+    """A controlling terminal exists (the process was started from a shell,
+    not by an editor, a build daemon or cron). Probed without opening
+    /dev/tty: on macOS, opening and closing it in a session leader whose pty
+    master is not being read leaves the process stuck in its exit (tty output
+    drain at revoke) — seen in the pty tests. Linux: tty_nr of /proc/self/stat;
+    elsewhere `ps -o tty=`. Unknown → True: the immediate refusal is the
+    conservative answer (nobody is left waiting)."""
+    try:
+        st = Path("/proc/self/stat").read_text()
+        return int(st[st.rindex(")") + 2:].split()[4]) != 0        # tty_nr
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        r = subprocess.run(["/bin/ps", "-o", "tty=", "-p", str(os.getpid())],
+                           capture_output=True, text=True, timeout=3)
+        tty = r.stdout.strip()
+        return bool(tty) and tty not in ("??", "?", "-")
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
+def can_ask() -> bool:
+    return (not os.environ.get("GITGUARD_NO_PROMPT") and sys.stderr.isatty()
+            and sys.stdout.isatty() and has_tty())
 
 
 # --------------------------------------------------------------------- main
@@ -1938,6 +2331,8 @@ def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
         raise Refuse(f"repository {why}: {repo.label}\n  Inspect .git/config and .git/hooks, then:  "
                      + STYLE.cyan("gitguard trust"))
     if old.entries == new:
+        if pending_path(key).is_file():
+            clear_pending(key)           # the state came back on its own
         return
     if interactive:
         branches = auto_accept(repo, key, old, new)
@@ -1954,8 +2349,21 @@ def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
     if interactive and ask_on_tty(STYLE.yellow(
             "Trust this state and run git? [y/N] ")):
         save_trust(repo, refs, new)
+        clear_pending(key)
         info(f"trust state recorded for {repo.label}")
         return
+    if interactive and not has_tty():
+        # Run by a program (editor, build, cron): nobody reads this. Record
+        # the state and wait for `gitguard pending`; shortcut 3.
+        outcome = wait_for_decision(repo, key, new, refs)
+        if outcome == "allowed":
+            info(f"allowed through gitguard pending: {repo.label}")
+            return
+        e = Refuse("refused through gitguard pending." if outcome == "refused" else
+                   f"no decision within {wait_seconds():g} s: refusing to run git. "
+                   f"In a terminal:  gitguard pending")
+        e.recorded = True
+        raise e
     hint("If legitimate:  gitguard trust      Otherwise:  gitguard restore")
     raise Refuse("refusing to run git.")
 
@@ -1981,6 +2389,8 @@ def main(argv: list[str]) -> int:
             cmd_list(); argv = argv[1:]
         elif cmd == "forget":
             cmd_forget(argv[1:]); return 0
+        elif cmd == "pending":
+            cmd_pending(argv[1:]); return 0
         elif cmd == "prune":
             cmd_forget(["--missing"]); argv = argv[1:]
         elif cmd == "retrust":
@@ -1999,26 +2409,55 @@ def main(argv: list[str]) -> int:
     orig = Path.cwd()
     newrepo, git = None, ""
     if mode == "exec":
-        git = real_git()                 # resolved first: no git at all is its own error
         newrepo = parse_new_repo(argv)
         orig = apply_global_options(argv)
-
-    root = find_root(Path.cwd())
-    if root is None:
+    # A refusal that nobody will read (exec mode, no controlling terminal) is
+    # recorded for `gitguard pending`. The "changed" case records itself
+    # (and waits); here the never-trusted and structural ones.
+    label: Path = Path.cwd()
+    key: Path | None = None
+    old: Manifest | None = None
+    fingerprinted = False
+    try:
         if mode == "exec":
-            return run_git(argv, orig, newrepo, git)
-        if mode != "check":
-            raise Refuse(f"no git repository here: {Path.cwd()}")      # [30]
-        return 0
-    repo = open_repo(root)
-    refs = config_refs(repo)
-    check_structure(repo, refs)
-    key = repo.key
-    new = manifest(repo, refs)
-    old = load_manifest(key)
+            git = real_git()             # resolved first: no git at all is its own error
+        root = find_root(Path.cwd())
+        if root is None:
+            if mode == "exec":
+                return run_git(argv, orig, newrepo, git)
+            if mode != "check":
+                raise Refuse(f"no git repository here: {Path.cwd()}")      # [30]
+            return 0
+        repo = open_repo(root)
+        label, key = repo.label, repo.key
+        refs = config_refs(repo)
+        check_structure(repo, refs)
+        new = manifest(repo, refs)
+        old = load_manifest(key)
+        fingerprinted = True
+    except Refuse as e:
+        if mode == "exec" and not e.recorded and not has_tty():
+            kind = "never" if fingerprinted and (old is None or not old.current) else "structural"
+            record_pending(key or key_for(Path.cwd().resolve()), kind, label, str(e))
+            e.recorded = True
+        raise
 
     if mode == "trust":
+        if old is not None and old.current and old.entries != new:
+            # A changed repository: the diff first, so that `trust` is never
+            # typed blind; on a terminal, a question; in a script, recorded.
+            if can_ask():
+                if not review(repo, key, old.entries, new, refs,
+                              "Record this state as the reference? [y/N] "):
+                    raise Refuse("not trusted.")
+                check_safe_bare()
+                return 0
+            rule()
+            warn(STYLE.bold(f"{repo.label}/.git has changed since the last trust"))
+            show_changes(repo, old.entries, new, key)
+            rule()
         save_trust(repo, refs, new)
+        clear_pending(key)
         info(f"trust state recorded for {repo.label}")
         wt = [f"{s}:{p}" for s, p in refs]
         if wt:
@@ -2047,11 +2486,17 @@ def main(argv: list[str]) -> int:
         restore(repo, key, old.entries, new, yes, old.refs)
         return 0
 
-    check_or_die(repo, key, old, new, refs, interactive=(mode == "exec"))
+    try:
+        check_or_die(repo, key, old, new, refs, interactive=(mode == "exec"))
+    except Refuse as e:
+        if mode == "exec" and not e.recorded and not has_tty():
+            kind = "never" if old is None or not old.current else "structural"
+            record_pending(key, kind, label, str(e))
+            e.recorded = True
+        raise
     if mode == "exec":
         return run_git(argv, orig, newrepo, git)
     return 0
-
 
 if __name__ == "__main__":
     try:

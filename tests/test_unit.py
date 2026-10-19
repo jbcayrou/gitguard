@@ -398,3 +398,82 @@ def test_real_git_skips_itself(tmp_path: Path, monkeypatch) -> None:
         gg_mod.real_git()
     monkeypatch.setenv("GITGUARD_REAL_GIT", "/x/git")
     assert gg_mod.real_git() == "/x/git"
+
+
+# ------------------------------------------------------------------ pending
+def test_notify_pending_calls_once_with_sanitized_text(monkeypatch, tmp_path: Path) -> None:
+    import sys
+    calls = []
+    monkeypatch.setattr(gg_mod.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+    monkeypatch.setattr(gg_mod, "NOTIFY_SEND", sys.executable)        # "exists": that branch is taken
+    monkeypatch.delenv("GITGUARD_NO_NOTIFY", raising=False)
+    gg_mod.notify_pending(Path("/r/\x1b[2Kevil"), "x" * 500)
+    assert len(calls) == 1 and calls[0][0] == sys.executable
+    body = calls[0][-1]
+    assert "\x1b" not in body and len(body) <= 200
+    monkeypatch.setenv("GITGUARD_NO_NOTIFY", "1")
+    gg_mod.notify_pending(Path("/r"), "y")
+    assert len(calls) == 1
+
+
+def test_notify_pending_swallows_failures(monkeypatch) -> None:
+    import sys
+
+    def boom(*a, **k):
+        raise OSError("no bus")
+    monkeypatch.setattr(gg_mod.subprocess, "run", boom)
+    monkeypatch.setattr(gg_mod, "NOTIFY_SEND", sys.executable)
+    monkeypatch.delenv("GITGUARD_NO_NOTIFY", raising=False)
+    gg_mod.notify_pending(Path("/r"), "y")          # no exception
+
+
+def test_record_pending_notifies_once_per_cooldown(monkeypatch, tmp_path: Path) -> None:
+    sent = []
+    monkeypatch.setattr(gg_mod, "STATE", tmp_path / "state")
+    monkeypatch.setattr(gg_mod, "notify_pending", lambda label, text: sent.append(text))
+    key = gg_mod.key_for(Path("/some/repo"))
+    gg_mod.record_pending(key, "never", Path("/some/repo"), "never trusted")
+    gg_mod.record_pending(key, "never", Path("/some/repo"), "never trusted")
+    assert len(sent) == 1
+    d = gg_mod.load_pending(key)
+    d["notified"] -= gg_mod.NOTIFY_COOLDOWN + 1
+    gg_mod.update_pending(key, lambda cur: d)
+    gg_mod.record_pending(key, "never", Path("/some/repo"), "never trusted")
+    assert len(sent) == 2
+    assert (tmp_path / "state").stat().st_mode & 0o777 == 0o700
+
+
+def test_update_pending_is_atomic_under_concurrency(monkeypatch, tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(gg_mod, "STATE", tmp_path / "state")
+    key = gg_mod.key_for(Path("/some/repo"))
+    gg_mod.update_pending(key, lambda cur: {"root": "/some/repo", "kind": "changed", "waiters": []})
+
+    def add(i: int) -> None:
+        def fn(cur):
+            cur["waiters"].append({"pid": i})
+            return cur
+        gg_mod.update_pending(key, fn)
+    with ThreadPoolExecutor(8) as ex:
+        list(ex.map(add, range(200)))
+    assert len(gg_mod.load_pending(key)["waiters"]) == 200
+
+
+def test_caller_chain_starts_with_our_parent() -> None:
+    import os
+    chain = gg_mod.caller_chain()
+    assert chain and chain[0]["pid"] == os.getppid()
+    assert all(set(c) == {"pid", "name", "args"} for c in chain)
+
+
+def test_wait_seconds(monkeypatch) -> None:
+    monkeypatch.delenv("GITGUARD_WAIT", raising=False)
+    assert gg_mod.wait_seconds() == gg_mod.WAIT_DEFAULT
+    monkeypatch.setenv("GITGUARD_WAIT", "2.5")
+    assert gg_mod.wait_seconds() == 2.5
+    monkeypatch.setenv("GITGUARD_WAIT", "-1")
+    with pytest.raises(Refuse):
+        gg_mod.wait_seconds()
+    monkeypatch.setenv("GITGUARD_WAIT", "soon")
+    with pytest.raises(Refuse):
+        gg_mod.wait_seconds()

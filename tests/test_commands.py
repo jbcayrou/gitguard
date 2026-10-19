@@ -667,3 +667,48 @@ def test_management_output_on_stdout_warnings_on_stderr(gg: GG, repo: Path, tmp_
     assert r.blocked and r.out == "" and "has changed" in r.err
     r = gg.run("tust", cwd=repo)
     assert r.blocked and r.out == "" and "unknown command" in r.err
+
+
+# ------------------------------------------------- the backup matches what was blessed
+def test_save_trust_refuses_when_a_file_moved_after_the_diff(gg: GG, repo: Path, monkeypatch) -> None:
+    """Between the diff and the answer, the sandbox rewrites a watched file:
+    the blessed manifest would refuse it later, but the backup would hold the
+    attacker's copy for `restore`. The copy is verified against the manifest."""
+    import gitguard as gg_mod
+    monkeypatch.setattr(gg_mod, "STATE", gg.state)
+    r = gg_mod.open_repo(repo)
+    refs = gg_mod.config_refs(r)
+    new = gg_mod.manifest(r, refs)                      # the state "shown"
+    before = gg.key_for(repo).read_bytes()
+    gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=repo)   # moved after the diff
+    with pytest.raises(gg_mod.Refuse, match="changed while the question was pending"):
+        gg_mod.save_trust(r, refs, new)
+    assert gg.key_for(repo).read_bytes() == before, "reference untouched"
+    assert not Path(str(gg.key_for(repo)) + ".d.tmp").exists()
+    assert not Path(str(gg.key_for(repo)) + ".tmp").exists()
+    assert gg.check(repo).blocked
+
+
+# ---------------------------------------------------------- trust shows the diff
+def test_trust_shows_the_diff_without_a_terminal(gg: GG, repo: Path) -> None:
+    gg.git("config", "core.pager", "cat", cwd=repo)
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0 and "pager = cat" in r.out and "has changed" in r.err, r.text
+    assert not gg.check(repo).blocked
+
+
+def test_trust_asks_on_a_terminal(gg: GG, repo: Path) -> None:
+    from tests.test_prompt import run_with_tty
+    gg.git("config", "core.pager", "cat", cwd=repo)
+    rc, _, tty = run_with_tty(gg, ["trust"], repo, "n")
+    assert rc != 0 and "[y/N]" in tty and "pager = cat" in tty, tty
+    assert gg.check(repo).blocked, "not trusted"
+    rc, _, tty = run_with_tty(gg, ["trust"], repo, "y")
+    assert rc == 0, tty
+    assert not gg.check(repo).blocked
+
+
+def test_trust_of_an_unchanged_repo_asks_nothing(gg: GG, repo: Path) -> None:
+    from tests.test_prompt import run_with_tty
+    rc, _, tty = run_with_tty(gg, ["trust"], repo, None)
+    assert rc == 0 and "[y/N]" not in tty, tty

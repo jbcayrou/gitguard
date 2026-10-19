@@ -206,7 +206,8 @@ def test_local_remote_commits_do_not_alert(gg: GG, repo: Path, tmp_path: Path) -
     gg.git("remote", "add", "origin", str(other), cwd=repo)
     r = gg.trust(repo)
     o = other.resolve()
-    ext = {t[4:] for t in r.out.split() if t.startswith("ext:")}
+    refs = [l for l in r.out.splitlines() if "references outside the gitdir" in l]   # not the diff
+    ext = {t[4:] for t in refs[0].split() if t.startswith("ext:")}
     assert ext == {f"{o}/.git/config", f"{o}/.git/hooks"}, r.out
     (other / "b").write_text("b\n")
     gg.git("add", "b", cwd=other)

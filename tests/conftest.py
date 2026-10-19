@@ -75,6 +75,8 @@ def gg(tmp_path: Path) -> GG:
         "GIT_CONFIG_NOSYSTEM": "1",
         "NO_COLOR": "1",
         "LC_ALL": "C.UTF-8",
+        "GITGUARD_NO_NOTIFY": "1",   # the suite never notifies a developer's desktop
+        "GITGUARD_WAIT": "0",        # nor blocks: the waiting tests set their own value
     }
     g = GG(env, state)
     for k, v in [("user.email", "t@t"), ("user.name", "t"), ("init.defaultBranch", "main"),

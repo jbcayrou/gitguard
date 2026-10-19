@@ -127,10 +127,33 @@ On macOS `/usr/bin/git` is protected by SIP and renaming Homebrew's git is
 undone by `brew upgrade`: keep the `PATH` symlink (it covers everything
 started from a login shell, VS Code included) and set `git.path` in VS Code.
 
-Contexts without a terminal (cron, CI, scripts) get no `[y/N]` question: a
-never-trusted or changed repository is refused there. Have the script run
-`gitguard trust` after its `remote add` / `worktree add`, or call the real
-git if the repository is not exposed to a sandbox.
+### When a program runs git for you
+
+A git started by a program with no controlling terminal (an editor's
+polling, a build tool, cron) cannot be asked and nobody reads its stderr. On
+a changed repository it records what it saw, sends one desktop notification
+(Linux `notify-send`, macOS `osascript`; at most one per repository per 10
+minutes) and **waits** up to `GITGUARD_WAIT` seconds (default 60; 0 = never
+wait) for your decision. In a terminal:
+
+```
+gitguard pending            # what waits: repository, since when, which program ran git
+gitguard pending <repo>     # the diff, the calling process, then allow or refuse
+```
+
+Allowing records the state you were shown as the reference and the waiting
+git runs; refusing makes it fail, and `gitguard restore` puts the files
+back. If you decide after the timeout, the decision applies to the next
+invocation (editors poll again by themselves). A never-trusted repository
+or a structural anomaly is recorded and refused at once: nothing can be
+allowed there without inspection.
+
+A git that *has* a terminal (a shell prompt's `$(git …)`, a script you run
+in a terminal) is refused immediately as before: blocking it would freeze
+your shell, and the refusal is printed where you are.
+
+`gitguard trust` now shows the diff before recording, and asks on a
+terminal; in a script it prints the diff and records.
 
 Recommended companion setting, independent of gitguard:
 
@@ -157,6 +180,7 @@ automatically.
 | `gitguard restore [-y]` | Put the watched files back into the reference state. |
 | `gitguard git <args>` | Check, then run the real git. Honours `-C`, `--git-dir`, `--work-tree`. |
 | `gitguard list` | Registered repositories and their status. |
+| `gitguard pending [<repo>… \| -a \| -c <repo>…]` | Decisions waiting (a git blocked by a program): list, review and allow/refuse, or clear. |
 | `gitguard forget <repo>…` / `--missing` | Remove entries. |
 | `gitguard prune` | Same as `forget --missing`. |
 | `gitguard retrust` | Re-validate unchanged repositories after an upgrade. |
@@ -169,6 +193,8 @@ automatically.
 | `GITGUARD_REAL_GIT` | Path to the real git (default: a `git.real` next to gitguard, else the first `git` in the PATH that is not gitguard itself). |
 | `GITGUARD_ALLOW_REBASE_EXEC=1` | Allow `exec` lines in rebase todo files. |
 | `GITGUARD_NO_PROMPT=1` | Never ask on the terminal; refuse directly. |
+| `GITGUARD_WAIT` | Seconds a git without a terminal waits for `gitguard pending` (default 60, 0 = never). |
+| `GITGUARD_NO_NOTIFY=1` | No desktop notification. |
 | `GITGUARD_DEBUG=1` | Full traceback on internal errors. |
 | `NO_COLOR` | Disable colours. |
 
@@ -181,6 +207,9 @@ automatically.
 - The `[y/N]` question needs stdout and stderr on a terminal. A shell
   prompt's `$(git …)` or a `git log | head` on a changed repository is
   refused, not asked: rerun without the pipe, or `gitguard trust`.
+- No desktop notification without a session (ssh, cron, systemd): the
+  pending record is still written and the wait still times out; check
+  `gitguard pending` by hand.
 - It cannot close the race between its check and git's execution if the
   sandbox is still writing. Stop the sandbox before running git on the host.
 - `restore` only cleans the pivot vector: objects, commits and tree files
