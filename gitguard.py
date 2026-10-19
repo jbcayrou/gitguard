@@ -542,8 +542,9 @@ def find_root(cwd: Path) -> Path | None:
             return d                  # neither file nor directory: refused later
         if is_bare_gitdir(d):
             raise Refuse(f"bare gitdir found before any .git: {d} — bare repository (not "
-                         f"handled by gitguard) or booby-trapped directory. Run /usr/bin/git "
-                         f"explicitly if intended; {SAFE_BARE_HINT}.")
+                         f"handled by gitguard) or booby-trapped directory. Run the real git "
+                         f"directly (`git.real`, or the one GITGUARD_REAL_GIT names) if "
+                         f"intended; {SAFE_BARE_HINT}.")
         if d.parent == d:
             return None
         d = d.parent

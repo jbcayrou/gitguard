@@ -1,4 +1,4 @@
-"""Attack corpus against gitguard.
+r"""Attack corpus against gitguard.
 
 Each module in this package exposes ``attack_*(gg, repo, tmp_path)`` functions.
 Contract: ``repo`` is a clean repository, with one commit, already trusted by
