@@ -21,6 +21,43 @@ Sandboxing layers (AppArmor/seccomp profiles, `core.hooksPath` set globally,
 `safe.bareRepository=explicit`, rootless uid mapping) prevent some of it.
 gitguard **detects** the rest: it refuses to run git until you have looked.
 
+## You are not the only one running git
+
+An alias protects the `git` you type. It does not protect the git that runs
+because you merely *looked* at the repository:
+
+- **Shell prompts.** oh-my-zsh, powerlevel10k, Starship, `git-prompt.sh` run
+  `git status`, `git rev-parse`, `git symbolic-ref` at every prompt, and
+  oh-my-zsh does it with `command git`, which skips aliases by design. A
+  `core.fsmonitor` planted in `.git/config` fires the moment you `cd` into
+  the directory, before you have typed a single git command.
+- **Editors.** VS Code's git extension runs `git status` every few seconds
+  and `git fetch` periodically (`git.autofetch`); JetBrains, magit, lazygit,
+  tig, fugitive do the same on their own schedule. Opening the folder is
+  enough.
+- **Build tooling.** Makefiles, `setuptools_scm`, `go build` with VCS
+  stamping, npm `prepare` scripts, pre-commit, husky, git-lfs call `git` by
+  name and never see your alias.
+
+Which git each of these finds depends on the `PATH` it was started with, not
+on your shell's aliases. That is why the install below puts gitguard **as
+`git`** in a directory ahead of the real one: everything that resolves `git`
+through the `PATH` is then wrapped — prompts, `command git`, scripts, and
+editors started from a shell (VS Code resolves your login shell's
+environment at startup, even when launched from the Dock).
+
+Still outside: a tool with a hardcoded `/usr/bin/git`, a GUI started by a
+launcher with a minimal `PATH`, and the git that hooks or `rebase --exec`
+run (the real git puts its own exec path first). For VS Code, set `git.path`
+to the gitguard symlink to remove the doubt. Tools built on libgit2 rather
+than the git binary do not run hooks or config commands and are outside this
+picture.
+
+Cost: one check per invocation, ~45 ms; a prompt that calls git three times
+pays ~150 ms. In a repository you have not trusted, or whose trusted files
+changed, those calls are refused: the prompt shows no git information until
+you run `gitguard trust`. That silence is the signal.
+
 ## How it works
 
 - `gitguard trust` records a **fingerprint** of everything in `.git/` except
@@ -49,18 +86,51 @@ anything else shows a diff and asks on the terminal.
 install -m 755 gitguard.py ~/bin/gitguard
 ```
 
-Then either wrap git in your shell:
+Then put a symlink named `git` in a directory ahead of the real git in your
+`PATH` (gitguard detects it is called `git` and switches to exec mode). This
+also covers the tools that run git for you, see above:
+
+```sh
+ln -s ~/bin/gitguard ~/bin/git
+```
+
+If you only want the `git` you type wrapped, an alias is enough:
 
 ```sh
 alias git='gitguard git'
 ```
 
-or put a symlink named `git` ahead of `/usr/bin` in your `PATH` (gitguard
-detects it is called `git` and switches to exec mode):
+### System-wide (Debian/Ubuntu)
+
+To wrap every git on the machine, cron and GUIs included, install gitguard
+*as* `/usr/bin/git` and divert the real one. `dpkg-divert` keeps the
+diversion across `apt upgrade git`:
 
 ```sh
-ln -s ~/bin/gitguard ~/bin/git
+sudo install -m 755 gitguard.py /usr/bin/gitguard
+sudo dpkg-divert --package gitguard --add --rename --divert /usr/bin/git.real /usr/bin/git
+sudo ln -s gitguard /usr/bin/git
 ```
+
+gitguard finds a `git.real` next to itself without any environment variable.
+Hooks and `rebase --exec` run by the real git use `/usr/lib/git-core/git`,
+unwrapped by design. Repositories that already exist get one `gitguard
+trust` each, after you have looked at them; new ones are trusted at `clone`
+/ `init`. To undo:
+
+```sh
+sudo rm /usr/bin/git
+sudo dpkg-divert --package gitguard --rename --remove /usr/bin/git
+```
+
+On macOS `/usr/bin/git` is protected by SIP and renaming Homebrew's git is
+undone by `brew upgrade`: keep the `PATH` symlink (it covers everything
+started from a login shell, VS Code included) and set `git.path` in VS Code.
+
+Contexts without a terminal (cron, CI, scripts) get no `[y/N]` question: a
+never-trusted or changed repository is refused there. Have the script run
+`gitguard trust` after its `remote add` / `worktree add`, or call the real
+git if the repository is not exposed to a sandbox.
 
 Recommended companion setting, independent of gitguard:
 
@@ -96,7 +166,7 @@ automatically.
 | Variable | Effect |
 |---|---|
 | `GITGUARD_STATE` | State directory (default `~/.local/state/gitguard`). |
-| `GITGUARD_REAL_GIT` | Path to the real git (default: the first `git` in the PATH that is not gitguard itself). |
+| `GITGUARD_REAL_GIT` | Path to the real git (default: a `git.real` next to gitguard, else the first `git` in the PATH that is not gitguard itself). |
 | `GITGUARD_ALLOW_REBASE_EXEC=1` | Allow `exec` lines in rebase todo files. |
 | `GITGUARD_NO_PROMPT=1` | Never ask on the terminal; refuse directly. |
 | `GITGUARD_DEBUG=1` | Full traceback on internal errors. |
@@ -104,16 +174,22 @@ automatically.
 
 ## What it does not do
 
-- It only covers git invocations that go through the wrapper or alias. An
-  IDE or another tool calling git directly is not checked.
+- It only covers git invocations that resolve to the wrapper. A tool with a
+  hardcoded path to the real git, or started with a `PATH` that does not
+  contain the symlink, is not checked (see "You are not the only one running
+  git").
+- The `[y/N]` question needs stdout and stderr on a terminal. A shell
+  prompt's `$(git …)` or a `git log | head` on a changed repository is
+  refused, not asked: rerun without the pipe, or `gitguard trust`.
 - It cannot close the race between its check and git's execution if the
   sandbox is still writing. Stop the sandbox before running git on the host.
 - `restore` only cleans the pivot vector: objects, commits and tree files
   dropped by the sandbox stay there for you to inspect.
 - Bare repositories are refused, not managed.
-- Known parity gaps with git (config set through the environment,
-  `core.worktree`, `~user/` expansion, shell operators inside `!` aliases)
-  are documented as expected failures in `tests/test_git_parity.py`.
+- Parity with git is checked against git itself in `tests/test_git_parity.py`;
+  a gap found there is marked as an expected failure until fixed (none open
+  at the moment). Deliberate, fail-closed divergences: a NUL byte or a line
+  git dies on in a config file is refused.
 
 See `CLAUDE.md` for the full design notes, the review method and the
 catalogue of bypasses found so far (`tests/attacks/`).

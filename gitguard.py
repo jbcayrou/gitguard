@@ -19,6 +19,8 @@ Usage:
   gitguard help
 
 Alias:    alias git='gitguard git'      Wrapper: ln -s ~/bin/gitguard ~/bin/git
+System:   /usr/bin/git → gitguard, the real git diverted to /usr/bin/git.real
+          (dpkg-divert); a `git.real` next to gitguard is used before the PATH
 Env:      GITGUARD_STATE, GITGUARD_REAL_GIT, GITGUARD_ALLOW_REBASE_EXEC,
           GITGUARD_NO_PROMPT, GITGUARD_DEBUG, NO_COLOR
 
@@ -46,23 +48,41 @@ FORMAT_VERSION = 4   # 4: symlink hashes include the target's content
 
 
 def real_git() -> str:
-    """The git to run: `GITGUARD_REAL_GIT`, else the first `git` of the PATH
+    """The git to run: `GITGUARD_REAL_GIT`; else a `git.real` next to the path
+    gitguard was invoked by (system-wide install: `/usr/bin/git` → gitguard,
+    the real git diverted to `/usr/bin/git.real`; an environment variable
+    would not reach cron, systemd or a GUI); else the first `git` of the PATH
     that is not gitguard itself (the `~/bin/git` symlink deployment puts
-    gitguard ahead of it). The former default `/usr/bin/git` silently ran
-    another git than the user's (Apple's instead of Homebrew's on a Mac),
-    with another system config."""
+    gitguard ahead of it). The sibling wins over the PATH on purpose: when
+    `/usr/bin/git` was diverted, the git the user would have run is
+    `/usr/bin/git.real`, not another one elsewhere in the PATH. The former
+    default `/usr/bin/git` silently ran another git than the user's (Apple's
+    instead of Homebrew's on a Mac), with another system config."""
     if os.environ.get("GITGUARD_REAL_GIT"):
         return os.environ["GITGUARD_REAL_GIT"]
     me = Path(__file__).resolve()
+
+    def usable(cand: Path) -> bool:
+        try:
+            return cand.is_file() and os.access(cand, os.X_OK) and cand.resolve() != me
+        except OSError:
+            return False
+
+    # With a shebang script the kernel passes the path it found in the PATH
+    # (`/usr/bin/git`), so argv[0] names the invoked link; __file__ resolved
+    # names the real file (`/usr/bin/gitguard`). A bare argv[0] (`python3
+    # gitguard.py`) has no directory: never the cwd, which may be the volume.
+    invoked = Path(sys.argv[0]).parent
+    for d in dict.fromkeys([invoked, me.parent] if invoked != Path() else [me.parent]):
+        cand = d / "git.real"
+        if usable(cand):
+            return str(cand)
     for d in os.environ.get("PATH", os.defpath).split(os.pathsep):
         cand = Path(d or ".") / "git"
-        try:
-            if cand.is_dir() or not os.access(cand, os.X_OK) or cand.resolve() == me:
-                continue
-        except OSError:
-            continue
-        return str(cand)
-    raise Refuse("no git found in the PATH (other than gitguard itself): set GITGUARD_REAL_GIT")
+        if usable(cand):
+            return str(cand)
+    raise Refuse("no git found: none in the PATH other than gitguard itself, no `git.real` "
+                 "next to gitguard — set GITGUARD_REAL_GIT")
 STATE = Path(os.environ.get("GITGUARD_STATE") or Path.home() / ".local/state/gitguard")
 INCLUDE_DEPTH = 10      # git: MAX_INCLUDE_DEPTH = 10
 # No walk of the work tree looking for nested `.git`: git opens a nested
@@ -1884,8 +1904,13 @@ def ask_on_tty(question: str) -> bool:
     """Ask the question on /dev/tty — never on stdin, which git will consume
     (`git apply < patch`, `commit -F -`, `update-index --stdin`). False when
     there is no terminal (script, IDE, cron), when stderr is not a terminal
-    (the diff just shown was not seen) or when GITGUARD_NO_PROMPT is set."""
-    if os.environ.get("GITGUARD_NO_PROMPT") or not sys.stderr.isatty():
+    (the diff just shown was not seen), when stdout is not a terminal (a
+    `$(git …)` run by a shell prompt has stderr on the terminal and stdout on
+    a pipe: asking there would block every prompt redraw on a modified
+    repository; the price is that `git log | head` is refused instead of
+    asked) or when GITGUARD_NO_PROMPT is set."""
+    if (os.environ.get("GITGUARD_NO_PROMPT") or not sys.stderr.isatty()
+            or not sys.stdout.isatty()):
         return False
     try:
         # Two opens: "r+" in text mode requires a seekable stream.

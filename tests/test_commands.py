@@ -262,6 +262,49 @@ def test_symlink_named_git_ahead_in_path_finds_the_real_git(gg: GG, repo: Path, 
     assert r.returncode != 0 and "GITGUARD_REAL_GIT" in r.stderr, r.stderr   # no other git: refuse
 
 
+def test_sibling_git_real_wins_over_path(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """System-wide layout: `/usr/bin/git → gitguard`, the real git diverted to
+    `/usr/bin/git.real`. Found without GITGUARD_REAL_GIT (cron, systemd and
+    GUIs get no environment variable), and ahead of any other git in the PATH:
+    that is the git the user would have run."""
+    import shutil
+    import subprocess
+    link = _git_symlink(tmp_path)
+    real = shutil.which("git", path=gg.env["PATH"])
+    shim = link.parent / "git.real"
+    shim.write_text(f'#!/bin/sh\necho GIT_REAL_SHIM >&2\nexec "{real}" "$@"\n')
+    shim.chmod(0o755)
+    # The fingerprint includes the system config of the git in use (derived
+    # from its path): re-trust with that git so the comparison is like for like.
+    import sys
+    from tests.conftest import GITGUARD
+    t = subprocess.run([sys.executable, str(GITGUARD), "trust"], cwd=repo,
+                       env=dict(gg.env, GITGUARD_REAL_GIT=str(shim)), capture_output=True, text=True)
+    assert t.returncode == 0, t.stderr
+    r = subprocess.run([str(link), "rev-parse", "--is-inside-work-tree"], cwd=repo, env=gg.env,
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and r.stdout.strip() == "true", r.stderr
+    assert "GIT_REAL_SHIM" in r.stderr, r.stderr
+    shim.unlink()
+    nogit = f"{link.parent}{os.pathsep}{Path(sys.executable).parent}"     # python3, no git
+    r = subprocess.run([str(link), "status"], cwd=repo, env=dict(gg.env, PATH=nogit),
+                       capture_output=True, text=True)
+    assert r.returncode != 0, r.stdout
+    assert "git.real" in r.stderr and "GITGUARD_REAL_GIT" in r.stderr, r.stderr
+
+
+def test_sibling_git_real_must_not_be_gitguard(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """A `git.real` that resolves to gitguard itself is skipped (no exec loop);
+    the PATH scan then finds the real git."""
+    import subprocess
+    from tests.conftest import GITGUARD
+    link = _git_symlink(tmp_path)
+    os.symlink(GITGUARD, link.parent / "git.real")
+    r = subprocess.run([str(link), "rev-parse", "--is-inside-work-tree"], cwd=repo, env=gg.env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and r.stdout.strip() == "true", r.stderr
+
+
 def test_symlink_named_git_blocks_trapped(gg: GG, repo: Path, tmp_path: Path) -> None:
     import subprocess
     link = _git_symlink(tmp_path)

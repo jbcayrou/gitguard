@@ -4,7 +4,7 @@
    (`branch.<x>.remote` / `.merge`, what `push -u`, `branch -u`,
    `checkout -b` write) — no prompt, reference updated;
 2. otherwise, diff shown then a question on /dev/tty, default answer N;
-   never without a terminal, never when stderr is not a terminal, never with
+   never without a terminal, never when stderr or stdout is not a terminal, never with
    GITGUARD_NO_PROMPT, never for "never trusted" nor for a structural
    refusal; the answer is not read from stdin (git would consume it).
 """
@@ -115,11 +115,14 @@ def test_branch_tracking_plus_hook_refused(gg: GG, repo: Path, subsrc: Path) -> 
 # ----------------------------------------------------------------------- prompt
 
 def run_with_tty(gg: GG, args: list[str], cwd: Path, answer: str | None,
-                 stdin_data: bytes | None = None, env: dict | None = None):
+                 stdin_data: bytes | None = None, env: dict | None = None,
+                 stdout_pipe: bool = False):
     """Run gitguard with a pseudo-terminal as controlling terminal (so /dev/tty
-    can be opened) and stderr on that terminal; stdout captured; stdin = pipe
-    if `stdin_data`, else the terminal. Answers `answer` on the terminal when
-    the question appears. Returns (rc, stdout, tty output)."""
+    can be opened), stderr and stdout on that terminal (as when the user types
+    the command); `stdout_pipe` captures stdout instead, as a `$(git …)` in a
+    shell prompt does; stdin = pipe if `stdin_data`, else the terminal.
+    Answers `answer` on the terminal when the question appears. Returns
+    (rc, captured stdout or "", tty output)."""
     import pty
     import fcntl
     import termios
@@ -132,8 +135,14 @@ def run_with_tty(gg: GG, args: list[str], cwd: Path, answer: str | None,
     p = subprocess.Popen(
         [sys.executable, str(GITGUARD), *args], cwd=cwd, env={**gg.env, **(env or {})},
         stdin=subprocess.PIPE if stdin_data is not None else slave,
-        stdout=subprocess.PIPE, stderr=slave, preexec_fn=preexec, close_fds=True)
+        stdout=subprocess.PIPE if stdout_pipe else slave, stderr=slave,
+        preexec_fn=preexec, close_fds=True)
     os.close(slave)
+    if stdin_data is not None:
+        # gitguard never reads stdin (the question goes through /dev/tty): the
+        # data waits in the pipe for the git that gitguard execs.
+        p.stdin.write(stdin_data)
+        p.stdin.close()
     tty_out = b""
     deadline = time.monotonic() + 30
     asked = False
@@ -152,9 +161,9 @@ def run_with_tty(gg: GG, args: list[str], cwd: Path, answer: str | None,
             asked = True
         if p.poll() is not None and not r:
             break
-    out, _ = p.communicate(input=stdin_data, timeout=30)
+    out, _ = p.communicate(timeout=30)
     os.close(master)
-    return p.returncode, out.decode(errors="replace"), tty_out.decode(errors="replace")
+    return p.returncode, (out or b"").decode(errors="replace"), tty_out.decode(errors="replace")
 
 
 def modify(gg: GG, repo: Path) -> None:
@@ -168,10 +177,10 @@ def test_prompt_answers(gg: GG, repo: Path, answer: str, accepted: bool) -> None
     rc, out, tty = run_with_tty(gg, ["git", "status"], repo, answer)
     assert "[y/N]" in tty and "pager = cat" in tty, tty      # diff shown before the question
     if accepted:
-        assert rc == 0 and "On branch" in out, (rc, out, tty)
+        assert rc == 0 and "On branch" in tty, (rc, tty)
         assert not gg.check(repo).blocked, "reference updated"
     else:
-        assert rc != 0 and "On branch" not in out, (rc, out, tty)
+        assert rc != 0 and "On branch" not in tty, (rc, tty)
         assert gg.check(repo).blocked, "reference unchanged"
 
 
@@ -192,7 +201,7 @@ def test_prompt_does_not_eat_git_stdin(gg: GG, repo: Path) -> None:
     rc, out, tty = run_with_tty(gg, ["git", "hash-object", "--stdin"], repo, "y",
                                 stdin_data=b"hello\n")
     assert rc == 0, tty
-    assert out.strip() == "ce013625030ba8dba906f756967f9e9ca394464a"
+    assert "ce013625030ba8dba906f756967f9e9ca394464a" in tty, tty
 
 
 def test_no_prompt_without_tty(gg: GG, repo: Path) -> None:
@@ -205,7 +214,7 @@ def test_no_prompt_without_tty(gg: GG, repo: Path) -> None:
 def test_no_prompt_when_disabled(gg: GG, repo: Path) -> None:
     modify(gg, repo)
     rc, out, tty = run_with_tty(gg, ["git", "status"], repo, "y", env={"GITGUARD_NO_PROMPT": "1"})
-    assert rc != 0 and "[y/N]" not in tty and "On branch" not in out
+    assert rc != 0 and "[y/N]" not in tty and "On branch" not in tty
 
 
 def test_no_prompt_when_stderr_not_tty(gg: GG, repo: Path) -> None:
@@ -225,6 +234,17 @@ def test_no_prompt_when_stderr_not_tty(gg: GG, repo: Path) -> None:
     out, errb = p.communicate(timeout=30)
     os.close(master)
     assert p.returncode != 0 and b"On branch" not in out and b"[y/N]" not in errb
+
+
+def test_no_prompt_when_stdout_not_tty(gg: GG, repo: Path) -> None:
+    """stdout on a pipe, stderr on the terminal: what a shell prompt's `$(git
+    status)` looks like. A question there would block every prompt redraw on
+    a modified repository: the diff is shown, git is refused, nothing asked."""
+    modify(gg, repo)
+    rc, out, tty = run_with_tty(gg, ["git", "status"], repo, "y", stdout_pipe=True)
+    assert rc != 0 and "[y/N]" not in tty and "On branch" not in out, (rc, out, tty)
+    assert "pager = cat" in tty and "gitguard trust" in tty, tty
+    assert gg.check(repo).blocked, "reference unchanged"
 
 
 def test_no_prompt_for_never_trusted(gg: GG, tmp_path: Path) -> None:

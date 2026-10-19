@@ -70,14 +70,33 @@ The management commands (`list`/`forget`/`prune`/`retrust`) read
 `<key>.d/.root` to find the path; an entry without `.root` (trusted by an
 earlier version) is shown as "unknown" and can only be `prune`d.
 
-Intended deployment: `alias git='gitguard git'` (interactive shell) or a
-symlink `~/bin/git → gitguard` ahead of `/usr/bin` in the PATH (the script
-detects it is called `git` and switches to exec mode). The git it runs is
-`GITGUARD_REAL_GIT`, else the first `git` of the PATH that is not gitguard
-itself (`real_git`; the former default `/usr/bin/git` ran Apple's git
-instead of Homebrew's, with another system config). That git's system
-config (`<prefix>/etc/gitconfig`, derived from the binary's path) is read
-along with `/etc/gitconfig`. Variables: `GITGUARD_STATE`,
+Intended deployment: a symlink `~/bin/git → gitguard` ahead of the real git
+in the PATH (the script detects it is called `git` and switches to exec
+mode) — it also wraps the tools that run git by name: shell prompts
+(oh-my-zsh uses `command git`, which skips aliases), editors, build tools,
+which fire a planted `core.fsmonitor` at `cd` time; `alias git='gitguard
+git'` only wraps what the user types. System-wide (Debian): `dpkg-divert`
+the real git to `/usr/bin/git.real` and symlink `/usr/bin/git → gitguard`;
+macOS keeps the PATH symlink (`/usr/bin/git` is under SIP, renaming
+Homebrew's git is undone by `brew upgrade`) plus VS Code's `git.path`. The
+git it runs is `GITGUARD_REAL_GIT`, else a **`git.real` next to the invoked
+path or next to the script** (the divert layout; an environment variable
+reaches neither cron, systemd nor a GUI — the sibling wins over the PATH
+because it *is* the git the user would have run; a bare `argv[0]` has no
+directory, the cwd is never searched), else the first `git` of the PATH that
+is not gitguard itself (`real_git`; the former default `/usr/bin/git` ran
+Apple's git instead of Homebrew's, with another system config). That git's
+system config (`<prefix>/etc/gitconfig`, derived from the binary's path) is
+read along with `/etc/gitconfig`: changing the real git changes the
+fingerprint (one `trust`). Hooks and `rebase --exec` run by the real git
+call `<exec-path>/git`, unwrapped by design (no recursion; their todo files
+are read, [36]). Never-trusted repositories are not a problem of the
+system-wide install: clone/init through the wrapper auto-trust, and a
+repository cloned by an unwrapped git is mostly the sandbox's own clone,
+which must be refused; pre-existing repositories get one explicit `trust`
+each, by hand — no automatic migration, no trust-on-first-use (ruled out:
+it blesses an unknown first state for the sole benefit of a one-time
+migration). Variables: `GITGUARD_STATE`,
 `GITGUARD_REAL_GIT`, `GITGUARD_ALLOW_REBASE_EXEC`, `GITGUARD_NO_PROMPT`
 (never ask on the terminal, refuse directly), `GITGUARD_DEBUG` (full traceback of an internal error,
 otherwise a neutralized message and exit 1), `NO_COLOR`.
@@ -372,7 +391,11 @@ before refusing (`check_or_die`, `interactive=True` only in exec mode;
    **`/dev/tty`**, never on stdin: git will consume stdin (`apply < patch`,
    `commit -F -`, `update-index --stdin`; tested with `hash-object --stdin`).
    No question — refusal as before — if `/dev/tty` cannot be opened (script,
-   IDE, cron), if **stderr is not a terminal** (the diff was not seen), or
+   IDE, cron), if **stderr is not a terminal** (the diff was not seen), if
+   **stdout is not a terminal** (a `$(git …)` run by a shell prompt has
+   stderr on the terminal and stdout on a pipe: a question there would block
+   every prompt redraw on a modified repository; the price is that `git log
+   | head` is refused instead of asked — rerun without the pipe), or
    with `GITGUARD_NO_PROMPT`. Never for "never trusted" (nothing to show:
    that would bless an unknown state, explicit `gitguard trust`) nor for a
    structural refusal (raised earlier by `check_structure`, and `trust` would
@@ -618,8 +641,7 @@ content; fail closed on anything the parser cannot make sense of.
   environment are read ([48]).
 - gitguard.py has no dependency outside the stdlib (diff via `difflib`); the
   tests need `pytest` and `git`.
-
-## Ideas not done
-
-TOFU mode (trust on first use) outside the exposed paths, through a
-`GITGUARD_STRICT` variable listing the directories mounted into sandboxes.
+- A context without a terminal (cron, CI, script) gets no question: a
+  never-trusted or changed repository is refused there. The script runs
+  `gitguard trust` after its `remote add`/`worktree add`, or uses the real
+  git if the repository is not exposed to a sandbox.
