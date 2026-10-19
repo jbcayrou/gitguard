@@ -1,0 +1,127 @@
+/* Layout: one left-aligned reading column of ~62ch on cool paper; terminals are the only objects with edges.
+   Section dividers reuse the 56-char rule gitguard prints. Logo palette (navy to teal) sets ink and accent;
+   red, amber, green are gitguard's own status colours, never decoration. */
+:root{
+  --paper:#F3F5F4; --ink:#15222E; --muted:#5B6974; --rule:#C9D1D0;
+  --navy:#1C3B5D; --teal:#227F7D; --term:#FBFCFB;
+  --red:#B4231A; --amber:#8F6200; --green:#2E7A3D; --dim:#99A4AA;
+  --pwn:rgba(180,35,26,.10);
+  --serif:"Literata",Georgia,"Times New Roman",serif;
+  --mono:"Red Hat Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --paper:#0F161C; --ink:#E3E8E9; --muted:#93A0A9; --rule:#28363F;
+  --navy:#9DBBDC; --teal:#4FC1BC; --term:#141E26;
+  --red:#F07D71; --amber:#E2B454; --green:#74C486; --dim:#56646D;
+  --pwn:rgba(240,125,113,.14); color-scheme:dark}}
+:root[data-theme="dark"]{
+  --paper:#0F161C; --ink:#E3E8E9; --muted:#93A0A9; --rule:#28363F;
+  --navy:#9DBBDC; --teal:#4FC1BC; --term:#141E26;
+  --red:#F07D71; --amber:#E2B454; --green:#74C486; --dim:#56646D;
+  --pwn:rgba(240,125,113,.14); color-scheme:dark}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--serif);font-size:1.0625rem;line-height:1.6;font-variation-settings:"opsz" 14}
+a{color:var(--teal);text-decoration-thickness:1px;text-underline-offset:.15em}
+a:hover{color:var(--navy)}
+:focus-visible{outline:2px solid var(--teal);outline-offset:3px}
+code,kbd,pre{font-family:var(--mono)}
+p code,li code,td code,h1 code,h2 code,dd code{font-size:.88em;background:color-mix(in srgb,var(--ink) 7%,transparent);padding:.05em .3em;border-radius:2px}
+h1 code{background:none;padding:0;font-weight:500}
+img{max-width:100%}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+.wrap{max-width:74rem;margin:0 auto;padding-inline:clamp(16px,4vw,40px)}
+.prose{max-width:62ch}
+.prose p,.prose li{margin:0 0 1em}
+.prose ul{padding-left:1.2em}
+h1,h2,h3{font-weight:500;line-height:1.15;text-wrap:balance;margin:0;font-variation-settings:"opsz" 48}
+h2{font-size:1.7rem;margin-bottom:1.1rem;max-width:30ch}
+h3{font-size:1.15rem;margin:1.6rem 0 .6rem}
+.cap{font-style:italic;color:var(--muted);font-size:.92rem;margin:0 0 .45rem}
+
+.top{display:flex;align-items:center;justify-content:space-between;gap:1.5rem;flex-wrap:wrap;padding-block:1.4rem 0}
+.brand{display:flex;align-items:center;gap:.7rem;color:var(--ink);text-decoration:none;font-weight:500;font-size:1.2rem}
+.brand img{width:40px;height:40px;display:block}
+.top nav{display:flex;gap:1.4rem;flex-wrap:wrap;font-size:.95rem}
+.top nav a{color:var(--muted);text-decoration:none}
+.top nav a:hover{color:var(--teal);text-decoration:underline}
+
+section{padding-block:3.5rem 1rem}
+section+section::before{content:"────────────────────────────────────────────────────────";display:block;font-family:var(--mono);color:var(--rule);font-size:.8rem;line-height:1;margin:0 0 3rem;overflow:hidden;white-space:nowrap;max-width:100%}
+.hero{padding-block:4.5rem 2rem;display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);gap:2.5rem 4rem;align-items:start}
+.hero h1{font-size:clamp(2rem,4.2vw,3.1rem);font-weight:400;max-width:20ch;letter-spacing:-.01em}
+.hero .lede{font-size:1.15rem;margin:1.4rem 0 0;max-width:40ch;color:var(--ink)}
+.hero .meta{margin:1.6rem 0 0;color:var(--muted);font-size:.95rem}
+@media (max-width:900px){.hero{grid-template-columns:minmax(0,1fr)}}
+
+/* Terminal windows: a title bar and a dark body whatever the page theme, so they read as terminals on paper. */
+:root{--tbg:#111A21;--tbar:#19242D;--tframe:#2B3943;--tmuted:#8C9AA4;--tdot:#3E4D58}
+.win{border:1px solid var(--tframe);border-radius:8px;overflow:hidden;background:var(--tbg);min-width:0;
+     box-shadow:0 1px 2px rgba(10,18,24,.18),0 10px 28px -14px rgba(10,18,24,.45)}
+.bar{display:flex;align-items:center;gap:.65rem;padding:.5rem .85rem;background:var(--tbar);border-bottom:1px solid var(--tframe);font-family:var(--mono);font-size:.72rem;color:var(--tmuted);letter-spacing:.02em}
+.dots{display:inline-flex;gap:.36rem;flex:none}
+.dots i{display:block;width:.6rem;height:.6rem;border-radius:50%;background:var(--tdot)}
+.bar .title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.win.sb{border-color:color-mix(in srgb,var(--tframe) 55%,#E2B454 45%)}
+.win.sb .bar{color:#E2B454}
+.win.sb .bar .dots i{background:color-mix(in srgb,var(--tdot) 60%,#E2B454 40%)}
+.term{margin:0;background:var(--tbg);border:0;padding:1rem 1.15rem 1.1rem;font-family:var(--mono);font-size:.84rem;line-height:1.55;overflow-x:auto;white-space:pre;min-width:0;tab-size:4;
+      --ink:#E3E8E9;--muted:#8C9AA4;--teal:#5BC9C3;--amber:#E6BA5C;--red:#F28A7E;--green:#7CCB8E;--pwn:rgba(242,138,126,.16);color:var(--ink)}
+.term .p{color:var(--teal);font-weight:600}
+.term .w{color:var(--amber)}
+.term .x{color:var(--red)}
+.term .ok{color:var(--green)}
+.term .add{color:var(--green)}
+.term .mod{color:var(--amber)}
+.term .hr{color:var(--red)}
+.term .hint{color:var(--teal)}
+.term .dim{color:var(--muted)}
+.term .b{font-weight:600}
+.term .pwn{background:var(--pwn);color:var(--red);display:inline-block;width:100%;padding-inline:.3rem;margin-inline:-.3rem}
+.term .big{font-size:1.3em;font-weight:600;display:inline-block;margin-top:.25em}
+.hero .term{font-size:.88rem}
+
+.tabs{display:flex;gap:.2rem .9rem;flex-wrap:wrap;border-bottom:1px solid var(--rule);margin:1.6rem 0 1.4rem;padding:0}
+.tabs button{appearance:none;background:none;border:0;border-bottom:2px solid transparent;margin-bottom:-1px;padding:.5rem .2rem;font-family:var(--mono);font-size:.86rem;color:var(--muted);cursor:pointer}
+.tabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--teal)}
+.tabs button:hover{color:var(--ink)}
+.story{max-width:62ch;margin:0 0 1.2rem}
+.panes{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:1.4rem 1.6rem;margin-top:1.4rem}
+.panes>div{min-width:0}
+.panes .term{min-height:15rem}
+@media (max-width:820px){.panes{grid-template-columns:minmax(0,1fr)}.panes .term{min-height:0}}
+.note{color:var(--muted);font-size:.92rem;font-style:italic;margin:1rem 0 0}
+
+.watch{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:2rem 3rem;align-items:start;margin-top:1.8rem}
+@media (max-width:820px){.watch{grid-template-columns:minmax(0,1fr)}}
+.tree{font-family:var(--mono);font-size:.82rem;line-height:1.6;margin:0;padding:1rem 1.15rem;background:var(--term);border:1px solid var(--rule);overflow-x:auto}
+.tree .r{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:1.5rem;white-space:pre}
+.tree .v,.tree .v .t{color:var(--dim)}
+.tree .t{font-family:var(--serif);font-style:italic;font-size:.9rem;color:var(--muted);white-space:nowrap}
+.tree .k{color:var(--ink)}
+.also dl{margin:0}
+.also dt{font-family:var(--mono);font-size:.85rem;margin-top:.9rem;color:var(--teal)}
+.also dd{margin:.15rem 0 0;color:var(--ink);max-width:48ch}
+
+.steps{counter-reset:s;list-style:none;padding:0;margin:1.6rem 0 0;max-width:62ch}
+.steps li{counter-increment:s;display:grid;grid-template-columns:2.2rem minmax(0,1fr);gap:.4rem 0;margin-bottom:1.6rem}
+.steps li::before{content:counter(s);font-variation-settings:"opsz" 48;font-size:1.5rem;font-weight:300;line-height:1.1;color:var(--navy)}
+.steps li>*{grid-column:2}
+.steps p{margin:0 0 .5rem}
+
+table{border-collapse:collapse;width:100%;max-width:62rem;font-size:.97rem;margin-top:1.4rem}
+th,td{text-align:left;vertical-align:top;padding:.6rem .9rem .6rem 0;border-top:1px solid var(--rule)}
+thead th{border-top:0;font-weight:500;font-style:italic;color:var(--muted);font-size:.92rem;padding-top:0}
+td:first-child{font-family:var(--mono);font-size:.85rem;white-space:nowrap}
+td:first-child code{background:none;padding:0;font-size:1em}
+.tablewrap{overflow-x:auto}
+@media (max-width:640px){td:first-child{white-space:normal}}
+
+.two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:2rem 3rem;margin-top:1.4rem;align-items:start}
+@media (max-width:820px){.two{grid-template-columns:minmax(0,1fr)}}
+
+footer{padding-block:3rem 2.5rem;color:var(--muted);font-size:.92rem;display:flex;gap:.6rem 2rem;flex-wrap:wrap;align-items:center}
+footer::before{content:"────────────────────────────────────────────────────────";display:block;width:100%;font-family:var(--mono);color:var(--rule);font-size:.8rem;overflow:hidden;white-space:nowrap;margin-bottom:1.6rem}
+footer img{width:28px;height:28px;opacity:.9}

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="{{ site.lang | default: "en" }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+{% seo %}
+<link rel="icon" type="image/png" href="{{ '/assets/logo.png' | relative_url }}">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Literata:ital,opsz,wght@0,7..72,300;0,7..72,400;0,7..72,500;0,7..72,600;1,7..72,400&family=Red+Hat+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+</head>
+<body>
+<div class="wrap">
+<header class="top">
+  <a class="brand" href="{{ '/' | relative_url }}"><img src="{{ '/assets/logo.png' | relative_url }}" alt="" width="40" height="40">gitguard</a>
+  <nav aria-label="Page">
+    <a href="#pivot">The pivot</a>
+    <a href="#attacks">Five attacks</a>
+    <a href="#fingerprint">What it watches</a>
+    <a href="#install">Install</a>
+    <a href="#commands">Commands</a>
+    <a href="{{ site.github_url }}">Source</a>
+  </nav>
+</header>
+<main>
+{{ content }}
+</main>
+<footer>
+  <img src="{{ '/assets/logo.png' | relative_url }}" alt="" width="28" height="28">
+  <span>gitguard, MIT licence.</span>
+  <a href="{{ site.github_url }}">{{ site.github_url | remove: 'https://' }}</a>
+  <span>Python 3.9+, Linux and macOS, no dependencies.</span>
+</footer>
+</div>
+<script src="{{ '/assets/js/demo.js' | relative_url }}"></script>
+</body>
+</html>
