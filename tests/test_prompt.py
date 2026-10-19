@@ -50,6 +50,23 @@ def test_push_u_accepted_without_prompt(gg: GG, repo: Path, subsrc: Path) -> Non
     assert not gg.check(repo).blocked
 
 
+def test_vscode_merge_base_accepted_without_prompt(gg: GG, repo: Path, subsrc: Path) -> None:
+    """VS Code's git extension writes `branch.<x>.vscode-merge-base` on opening
+    a repository (seen with code-server): accepted like branch tracking, and
+    refused as soon as the value is not a ref name."""
+    with_origin(gg, repo, subsrc)
+    assert gg.run("git", "checkout", "-qb", "feat", cwd=repo).rc == 0
+    assert gg.run("git", "push", "-qu", "origin", "feat", cwd=repo).rc == 0
+    assert gg.run("git", "status", cwd=repo).rc == 0 and not gg.check(repo).blocked
+    gg.git("config", "branch.feat.vscode-merge-base", "origin/main", cwd=repo)
+    r = gg.run("git", "status", cwd=repo)
+    assert r.rc == 0 and "branch tracking for feat" in r.err and "has changed" not in r.err, r.text
+    assert not gg.check(repo).blocked
+    gg.git("config", "branch.feat.vscode-merge-base", "--upload-pack=evil", cwd=repo)
+    assert gg.run("git", "status", cwd=repo).blocked
+    assert gg.check(repo).blocked
+
+
 def test_branch_u_from_linked_worktree(gg: GG, repo: Path, subsrc: Path, tmp_path: Path) -> None:
     """From a linked worktree, git writes into the main repository's config
     (scope `common`): same shortcut."""

@@ -427,10 +427,14 @@ before refusing (`check_or_die`, `interactive=True` only in exec mode;
    `refs/heads/…`), gitguard re-trusts on its own, prints one line and runs
    git. This is what `push -u`, `branch -u`, `checkout -b` with
    `autoSetupMerge` write. As `push -u` writes the config **after** the
-   check, it is the next command that accepts. A closed list of two harmless
-   keys, **not** a blocklist: do not extend it without a demonstration that
-   the key cannot execute anything (`branch.x.rebase`, `remote.*.url`, a
-   lone comment: refused → prompt). A `config` that differs only by comments
+   check, it is the next command that accepts. Same for
+   `branch.<x>.vscode-merge-base` (value a ref name: no leading `-`, no
+   blank), which VS Code's git extension writes on opening a repository —
+   every repository turned "modified" on first open in code-server; git
+   ignores the key, VS Code passes the value to `git merge-base`. A closed
+   list of three harmless keys, **not** a blocklist: do not extend it
+   without a demonstration that the key cannot execute anything
+   (`branch.x.rebase`, `remote.*.url`, a lone comment: refused → prompt). A `config` that differs only by comments
    is not accepted either (empty delta = not for us).
 2. **Question on the terminal** (`ask_on_tty`): the diff is shown as before,
    then "Trust this state and run git? [y/N]". Read and written on

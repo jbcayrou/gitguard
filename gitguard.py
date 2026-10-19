@@ -2278,20 +2278,29 @@ def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None, git: 
 
 
 # ------------------------------------------------- auto-accept and prompt
-_BRANCH_KEYS = {"remote", "merge"}
+_BRANCH_KEYS = {"remote", "merge", "vscode-merge-base"}
 _REF_OK = re.compile(r"^refs/heads/[^\s]+$")
+# `branch.<x>.vscode-merge-base = origin/main`: written by VS Code's git
+# extension when a repository is opened (seen with code-server on the VM:
+# every repository turned "modified" on first open). git ignores the key;
+# VS Code passes the value to `git merge-base` as a ref name. Accepted when it
+# looks like one: no leading `-` (an option), no blank, no control character.
+_REFNAME_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@{}^~-]*$")
 
 
 def branch_tracking_only(old_items: list[tuple[str, str, str]],
                          new_items: list[tuple[str, str, str]]) -> list[str]:
     """If the only semantic difference between two configs is the addition or
-    removal of `branch.<x>.remote` / `branch.<x>.merge`, return the branches
-    concerned; otherwise []. This is what `push -u`, `branch -u` and
-    `checkout -b` (autoSetupMerge) write: neither key can make anything run.
-    `remote` must name a remote already present in the trusted config (or
-    `.`), `merge` a `refs/heads/…`. Closed list, not to be extended without
-    proof: this is not a blocklist of dangerous keys but an allowlist of two
-    harmless ones — the fingerprint remains the rule for everything else."""
+    removal of `branch.<x>.remote` / `branch.<x>.merge` (what `push -u`,
+    `branch -u` and `checkout -b` with autoSetupMerge write) or of
+    `branch.<x>.vscode-merge-base` (what VS Code's git extension writes on
+    opening a repository), return the branches concerned; otherwise []. None
+    of these keys can make anything run. `remote` must name a remote already
+    present in the trusted config (or `.`), `merge` a `refs/heads/…`,
+    `vscode-merge-base` a ref name. Closed list, not to be extended without
+    proof: this is not a blocklist of dangerous keys but an allowlist of
+    three harmless ones — the fingerprint remains the rule for everything
+    else."""
     from collections import Counter
     old_c, new_c = Counter(old_items), Counter(new_items)
     delta = list((old_c - new_c).elements()) + list((new_c - old_c).elements())
@@ -2308,6 +2317,8 @@ def branch_tracking_only(old_items: list[tuple[str, str, str]],
         if key == "remote" and value != "." and value not in remotes:
             return []
         if key == "merge" and not _REF_OK.match(value):
+            return []
+        if key == "vscode-merge-base" and not _REFNAME_OK.match(value):
             return []
         branches.add(name)
     return sorted(branches)

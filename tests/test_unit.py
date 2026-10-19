@@ -329,6 +329,11 @@ TRACK = [("branch.feat", "remote", "origin"), ("branch.feat", "merge", "refs/hea
     (BASE, BASE + [("branch.feat", "merge", "../../x")], []),        # not refs/heads/
     (BASE, BASE + [("branch.feat", "merge", "refs/heads/a b")], []),
     (BASE, BASE + [("branch.feat", "rebase", "true")], []),          # key outside the list
+    (BASE + TRACK, BASE + TRACK + [("branch.feat", "vscode-merge-base", "origin/main")], ["feat"]),  # VS Code on open
+    (BASE + TRACK + [("branch.feat", "vscode-merge-base", "origin/main")], BASE + TRACK, ["feat"]),
+    (BASE, BASE + [("branch.feat", "vscode-merge-base", "--upload-pack=evil")], []),   # an option, not a ref
+    (BASE, BASE + [("branch.feat", "vscode-merge-base", "a b")], []),
+    (BASE, BASE + [("branch.feat", "vscode-merge-base", "")], []),
     (BASE, BASE + TRACK + [("core", "fsmonitor", "/tmp/evil")], []), # something else as well
     (BASE, BASE + TRACK + [("remote.evil", "url", "ext::sh")], []),
     (BASE, [("core", "bare", "false")] + TRACK, []),                 # a remote disappeared

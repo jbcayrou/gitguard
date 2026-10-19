@@ -173,8 +173,9 @@ that run it first (lazygit, fugitive) took a refusal for an old git.
 **Branch tracking is accepted on its own.** If the only change is
 `branch.<x>.remote` / `branch.<x>.merge` lines in `.git/config` pointing at
 a remote already known, which is what `push -u`, `branch -u` and
-`checkout -b` write, gitguard re-trusts, prints one line and runs git. This
-is a closed list of two harmless keys, not a blocklist.
+`checkout -b` write, or the `branch.<x>.vscode-merge-base` line VS Code
+writes when it opens a repository, gitguard re-trusts, prints one line and
+runs git. This is a closed list of three harmless keys, not a blocklist.
 
 **Anything else is shown and asked on the terminal.** A new remote, a hook,
 an `include.path`: the diff is printed, then
