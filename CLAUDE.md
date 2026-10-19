@@ -108,7 +108,17 @@ That git's system config (`<prefix>/etc/gitconfig`, derived from the
 binary's path) is read along with `/etc/gitconfig`: changing the real git
 changes the fingerprint (one `trust`). Hooks and `rebase --exec` run by the
 real git call `<exec-path>/git`, unwrapped by design (no recursion; their
-todo files are read instead, [36]).
+todo files are read instead, [36]). `/usr/bin/git-receive-pack`,
+`git-upload-pack` and `git-upload-archive` are symlinks to `/usr/bin/git`
+(Debian): diverted, they land on gitguard, which `main` recognises by
+`argv[0]` (`TRANSPORT`) and passes to the real git — sshd runs them for
+every push and fetch *to* the machine, they serve a repository named by
+argument (a bare one, not handled) and run nothing of the caller's; a
+local push already reaches them unwrapped through the exec path. Found on
+the Debian VM: every ssh push to the host failed with "unknown command
+'/home/user/srv.git'". `git --version` / `git version` pass through as
+well: they read no repository, and lazygit and fugitive run them first and
+took the refusal for an old git.
 
 ### Environment variables
 
@@ -391,7 +401,9 @@ basename without `.git`). After git succeeds, `save_trust` is called
   sandbox can write. (clone's own `-c` is applied after the template: no
   effect, verified with git 2.50);
 - `--bare`, `--mirror`, `--separate-git-dir`.
-In those cases we warn and leave a manual `gitguard trust`.
+With a template we warn and leave a manual `gitguard trust`; bare, mirror
+and `--separate-git-dir` are silently left alone (a bare repository cannot
+be trusted at all).
 
 ## Exec-mode shortcuts: auto-accept, prompt, pending
 
@@ -484,6 +496,29 @@ user will read.
 
 Implementation trap: `open("/dev/tty", "r+")` in text mode fails ("not
 seekable"); two opens, one for reading, one for writing.
+
+## Tools that run git, as observed (Debian 13 VM, system-wide install)
+
+Every git a prompt or a TUI spawns from a terminal session inherits the
+controlling terminal (`ps -o tty=` says `pts/N`), so on a modified
+repository it is refused at once, no `pending` record, no wait: starship
+(three calls per prompt, `config -lz` and `for-each-ref` with `--git-dir`/
+`--work-tree`/`-c core.fsmonitor=`; branch still shown, from libgit2),
+oh-my-zsh (`command git rev-parse` synchronously, then the dirty check in a
+`<( )` worker that *does* keep the tty — `tty=?` only showed during session
+teardown), fish, `__git_ps1`, lazygit (dies with gitguard's message in its
+error), tig ("Not a git repository"). powerlevel10k runs no git at all:
+`gitstatusd` reads `.git` itself, shows branch and status whatever gitguard
+thinks, executes nothing. vim/fugitive runs its first git (`config --list`)
+as a job without a terminal: that one waits `GITGUARD_WAIT`, then `:Git
+status` (with the tty) prints the refusal inside vim. pre-commit's hook
+runs under the real git's exec path (`HOOKGIT=/usr/lib/git-core/git`); the
+four wrapped calls seen came from `pre-commit install`, before the hook
+existed. cron: `PATH=/usr/bin:/bin`, no tty, waits the default 60 s,
+records `sh ← cron ← cron`; the `%` of a `date +%s` in a crontab is a
+newline, not a gitguard matter. A rootless podman container writing as its
+root (= the user's uid) plants hook, config and include in one go; as uid
+1000 inside (subuid outside) it cannot write into `.git` at all.
 
 ## Nested repositories: the gitlink is the barrier, no walk of the tree
 

@@ -2381,10 +2381,28 @@ def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
     raise Refuse("refusing to run git.")
 
 
+# `/usr/bin/git-receive-pack`, `git-upload-pack` and `git-upload-archive` are
+# symlinks to `/usr/bin/git` (Debian): with the system-wide install they land
+# on gitguard, invoked under those names by sshd for every push and fetch
+# *to* the machine. They serve a repository named by argument (a bare one,
+# which gitguard does not handle) and run nothing of the caller's; a local
+# push already reaches them unwrapped through the real git's exec path. So
+# they pass through, like `--version`, which reads no repository at all.
+TRANSPORT = {"git-receive-pack": "receive-pack", "git-upload-pack": "upload-pack",
+             "git-upload-archive": "upload-archive"}
+
+
 def main(argv: list[str]) -> int:
     mode, yes = "check", False
-    if Path(argv[0]).name == "git":
+    name = Path(argv[0]).name
+    if name in TRANSPORT:
+        git = real_git()
+        os.execv(git, [git, TRANSPORT[name], *argv[1:]])
+    if name == "git":
         mode, argv = "exec", argv[1:]    # invoked through a symlink named git
+        if argv[:1] in (["--version"], ["version"]):
+            git = real_git()             # reads no repository: lazygit, fugitive and
+            os.execv(git, [git, *argv])  # co. probe it first and misread a refusal
     else:
         argv = argv[1:]
         cmd = argv[0] if argv else ""
@@ -2398,6 +2416,9 @@ def main(argv: list[str]) -> int:
                 yes, argv = True, argv[1:]
         elif cmd == "git":
             mode, argv = "exec", argv[1:]
+            if argv[:1] in (["--version"], ["version"]):
+                git = real_git()
+                os.execv(git, [git, *argv])
         elif cmd == "list":
             cmd_list(); argv = argv[1:]
         elif cmd == "forget":

@@ -297,6 +297,42 @@ def test_symlink_named_git_runs_git(gg: GG, repo: Path, tmp_path: Path) -> None:
     assert r.stdout.strip() == "true"
 
 
+def test_transport_symlinks_pass_through(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """Debian's `/usr/bin/git-upload-pack` → `git`: with `/usr/bin/git → gitguard`
+    sshd runs gitguard under that name for every fetch/push to the machine. It
+    serves a repository named by argument and runs nothing of the caller's:
+    passed to the real git, whatever the cwd's state."""
+    import subprocess
+    from tests.conftest import GITGUARD
+    bare = tmp_path / "srv.git"
+    assert gg.git("init", "-q", "--bare", str(bare)).rc == 0
+    b = tmp_path / "bin"
+    b.mkdir(exist_ok=True)
+    link = b / "git-upload-pack"
+    os.symlink(GITGUARD, link)
+    write_exec(repo / ".git/hooks/pre-commit")           # cwd modified: irrelevant here
+    r = subprocess.run([str(link), "--advertise-refs", str(bare)], cwd=repo, env=gg.env,
+                       capture_output=True)
+    assert r.returncode == 0, r.stderr
+    assert b"gitguard" not in r.stderr
+    assert gg.check(repo).blocked                         # the ordinary check still does
+
+
+def test_version_passes_on_a_modified_repository(gg: GG, repo: Path) -> None:
+    """`git --version` reads no repository; lazygit and fugitive run it first and
+    took gitguard's refusal for an old git."""
+    write_exec(repo / ".git/hooks/pre-commit")
+    assert gg.run("git", "status", cwd=repo).blocked
+    r = gg.run("git", "--version", cwd=repo)
+    assert r.rc == 0 and r.out.startswith("git version"), r.text
+    r = gg.run("git", "version", cwd=repo)
+    assert r.rc == 0 and r.out.startswith("git version"), r.text
+    link = _git_symlink(repo.parent)
+    import subprocess
+    r = subprocess.run([str(link), "--version"], cwd=repo, env=gg.env, capture_output=True, text=True)
+    assert r.returncode == 0 and r.stdout.startswith("git version"), r.stderr
+
+
 def test_symlink_named_git_ahead_in_path_finds_the_real_git(gg: GG, repo: Path, tmp_path: Path) -> None:
     """Deployment `~/bin/git → gitguard` ahead in the PATH, no GITGUARD_REAL_GIT:
     the real git is the next one in the PATH, not gitguard again."""

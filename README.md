@@ -123,7 +123,12 @@ sudo ln -s gitguard /usr/bin/git
 gitguard runs a `git.real` found next to itself before looking at the
 `PATH`, so no environment variable is needed (cron, systemd and GUIs would
 not get one). Hooks and `rebase --exec` run by the real git use
-`/usr/lib/git-core/git`, unwrapped by design. To undo:
+`/usr/lib/git-core/git`, unwrapped by design. `/usr/bin/git-receive-pack`,
+`git-upload-pack` and `git-upload-archive` are symlinks to `git`, so they
+land on gitguard too: invoked under those names (by sshd, for every push
+and fetch *to* the machine) it passes straight to the real git, since they
+serve a repository named by argument and run nothing of the caller's. To
+undo:
 
 ```sh
 sudo rm /usr/bin/git
@@ -161,6 +166,9 @@ wrapper is trusted automatically (unless a template directory or
 Commit, checkout, merge, rebase, stash, bisect, gc, worktree and submodule
 operations touch only volatile files: nothing to do. When a command finds
 the repository changed, one of three things happens.
+
+`git --version` is never checked: it reads no repository, and the tools
+that run it first (lazygit, fugitive) took a refusal for an old git.
 
 **Branch tracking is accepted on its own.** If the only change is
 `branch.<x>.remote` / `branch.<x>.merge` lines in `.git/config` pointing at
@@ -213,6 +221,16 @@ without `gitguard trust` after inspection.
 
 `gitguard trust` on a changed repository shows the same diff and asks the
 same way; in a script it prints the diff and records.
+
+Tried on Debian with the system-wide install, on a repository modified
+behind the user's back: starship, oh-my-zsh, fish and `__git_ps1` prompts
+go quiet with no delay (their git has the terminal: refused at once);
+powerlevel10k keeps showing branch and status, since `gitstatusd` reads
+`.git` directly and never runs git, which is harmless; lazygit exits with
+gitguard's message, tig says "Not a git repository"; fugitive's `:Git`
+shows the refusal after `GITGUARD_WAIT` (its first git is a job without a
+terminal, which waits); pre-commit's hook runs with the real git, and the
+`pre-commit install` that rewrote the hook is what asks for a `trust`.
 
 To try the waiting path by hand, start a git with no controlling terminal.
 `nohup` and `&` keep the terminal; `setsid` detaches on Linux, and on macOS,
