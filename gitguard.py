@@ -1165,7 +1165,7 @@ def _expand2(value: str, base: Path) -> tuple[Path, Path]:
     """(literal path, canonical path) — the literal detects symlinks, the
     canonical one is hashed. Like git's interpolate_path: `~/x` is $HOME/x,
     `~user/x` is that user's home (getpwnam) — only `~/` was expanded, so a
-    `core.hooksPath = ~jb/vol/hooks` was never watched. [50] An unknown user
+    `core.hooksPath = ~user/vol/hooks` was never watched. [50] An unknown user
     stays literal (git dies on it)."""
     p = Path(os.path.expanduser(value)) if value.startswith("~") else Path(value)
     literal = p if p.is_absolute() else base / p

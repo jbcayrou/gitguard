@@ -136,7 +136,7 @@ gitguard.py refer to this list (how the project reviews itself: CLAUDE.md,
      git accepts (HEAD symlink to refs/, `commondir` redirection) were not
      recognised as planted gitdirs [23]. Fix: a port of is_git_directory.
 [50] `~user/` in a path value: git expands it (getpwnam), gitguard only
-     expanded `~/`, so `core.hooksPath = ~jb/vol/hooks` was never watched.
+     expanded `~/`, so `core.hooksPath = ~user/vol/hooks` was never watched.
 """
 from __future__ import annotations
 
