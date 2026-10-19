@@ -65,7 +65,9 @@ gitguard pending [<repo>... | -a | -c <repo>...]   decisions waiting for a git b
                        list; review (diff + calling process) and allow/refuse; clear
 gitguard forget <repo>... | --missing   remove entries (the repository becomes "never trusted" again)
 gitguard prune         = forget --missing
-gitguard retrust       re-validate in bulk the "ok" or "legacy" repositories (no backup); skips modified ones
+gitguard retrust       re-validate in bulk the "ok" or "legacy" repositories; a change to the
+                       global config is shown once and, on a terminal, accepted once for every
+                       repository it is the only deviation of; anything else modified is skipped
 gitguard help
 ```
 
@@ -300,7 +302,8 @@ not watched ([39]), then `/etc/gitconfig` (or
 `$XDG_CONFIG_HOME/git/config`. Their values name paths the sandbox can write
 — a **global** `core.hooksPath` or `include.path` pointing into the mounted
 volume was a complete bypass ([16]). The global config is also hashed as is
-(scope `global`), but never restored. Last, the **config git takes from its
+(scope `global`) and backed up so that its diff can be shown, but never
+restored. Last, the **config git takes from its
 environment and command line** (`env_config`: `GIT_CONFIG_PARAMETERS` in
 both of git's quoting syntaxes, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
 `VALUE_n`, and in exec mode the `-c`/`--config-env` of the command,
@@ -376,7 +379,8 @@ sha256 of the root's absolute path:
 
 ```
 <key>           reference manifest
-<key>.d/        backup of the watched files (.root, local/…, common/…, wt/…, ext/…)
+<key>.d/        backup of the watched files (.root, local/…, common/…, wt/…, ext/…,
+                global/… — the last one only for the diff, never restored)
 <key>.idx       cache of the index gitlinks (sha256 of the file + list), rewritten
                 by any check when the index changes; never a source of trust
 <key>.pending   a refusal nobody read (exec mode, no controlling terminal): kind
@@ -528,10 +532,12 @@ existed. cron: `PATH=/usr/bin:/bin`, no tty, waits the default 60 s,
 records `sh ← cron ← cron`; the `%` of a `date +%s` in a crontab is a
 newline, not a gitguard matter. `git lfs install` writes four
 `filter.lfs.*` keys into the global config: every registered repository
-turns "modified" at once and `retrust` skips them all — one `trust` per
-repository, each showing the same global diff (a `retrust` that reviews one
-global diff and applies it to every repository whose only change is that
-diff would be sound; not done). root running git in a user's repository
+turned "modified" at once, each with one unreadable line (`modified
+global:~/.gitconfig`, no backup of the global files, hence no diff) and
+`retrust` skipped them all: one `trust` per repository. Now the global
+files are backed up too (never restored), the diff is shown, and `retrust`
+groups the repositories whose only deviation is the same global diff: one
+review on the terminal, one answer, applied to the group. root running git in a user's repository
 gets "suspicious owner/permissions" on `config` (the file is not root's)
 and an empty state of its own. A rootless podman container writing as its
 root (= the user's uid) plants hook, config and include in one go; as uid

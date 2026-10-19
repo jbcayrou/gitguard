@@ -95,6 +95,40 @@ def test_restore_never_deletes_outside_the_trusted_roots(gg: GG, repo: Path, tmp
     assert not gg.check(repo).blocked
 
 
+def _global_config(gg: GG) -> Path:
+    return Path(gg.env.get("GIT_CONFIG_GLOBAL") or Path(gg.env["HOME"]) / ".gitconfig")
+
+
+def test_global_config_change_shows_its_diff(gg: GG, repo: Path) -> None:
+    """`git lfs install` turned every repository "modified" with one line,
+    `modified global:~/.gitconfig`, and nothing to read: the global files are
+    backed up too (never restored) so the diff can be shown."""
+    cfg = _global_config(gg)
+    with cfg.open("a") as f:
+        f.write("[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n")
+    r = gg.run("diff", cwd=repo)
+    assert r.rc == 0 and "global:" in r.out, r.text
+    assert f"diff of {cfg}" in r.out and "+?clean = git-lfs clean -- %f" in r.out, r.out
+    assert gg.run("restore", "-y", cwd=repo).rc == 0
+    assert "git-lfs" in cfg.read_text(), "the global config is never restored"
+
+
+def test_retrust_groups_a_global_only_change_but_needs_a_terminal(gg: GG, repo: Path, tmp_path: Path) -> None:
+    other = tmp_path / "other"
+    assert gg.git("init", "-q", str(other)).rc == 0
+    gg.trust(other)
+    with _global_config(gg).open("a") as f:
+        f.write("[alias]\n\tst = status\n")
+    write_exec(other / ".git/hooks/pre-commit")            # global + local: not groupable
+    assert gg.run("list").out.count("modified") == 2
+    r = gg.run("retrust")                                  # no terminal: shown, not accepted
+    assert r.rc == 0, r.text
+    assert "global config changed" in r.text and str(repo) in r.text and "+?st = status" in r.text
+    assert "from a terminal" in r.text
+    assert f"skipped (modified): {other}" in r.text
+    assert gg.run("list").out.count("modified") == 2
+
+
 def test_restore_noop(gg: GG, repo: Path) -> None:
     r = gg.run("restore", "-y", cwd=repo)
     assert r.rc == 0 and "nothing to restore" in r.out

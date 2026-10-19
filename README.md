@@ -251,6 +251,11 @@ A new version may change what the fingerprint contains; `gitguard list`
 then shows the repositories as "legacy". `gitguard retrust` re-validates in
 bulk the ones that are unchanged and skips the modified ones.
 
+The same command handles a change to your **global** config (`git config
+--global`, `git lfs install`), which marks every registered repository
+modified at once: `retrust` shows that diff once and, on a terminal, asks
+once for all the repositories it is the only change of.
+
 ## Commands
 
 | Command | What it does |
@@ -264,7 +269,7 @@ bulk the ones that are unchanged and skips the modified ones.
 | `gitguard pending [<repo>… \| -a \| -c <repo>…]` | Decisions waiting for a git blocked by a program: list, review and allow/refuse, or clear. |
 | `gitguard forget <repo>…` / `--missing` | Remove entries; the repository becomes "never trusted" again. |
 | `gitguard prune` | Same as `forget --missing`. |
-| `gitguard retrust` | Re-validate unchanged repositories after an upgrade. |
+| `gitguard retrust` | Re-validate unchanged repositories after an upgrade; review a global config change once for all. |
 
 Management commands write to stdout (`gitguard list | grep modified`
 works); refusals and diagnostics go to stderr.

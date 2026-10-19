@@ -1509,8 +1509,10 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]] | None = None,
     new.mkdir()
     (new / ".root").write_text(str(repo.label) + "\n")
     for (scope, rel), e in man.items():
-        if scope == "global":
-            continue
+        # `global` is copied too — never restored (the restore plan excludes
+        # the scope), kept so that a change there can be *shown*: without it
+        # a `git lfs install` turned every repository "modified" with one
+        # unreadable line, `modified global:~/.gitconfig`.
         src = scope_base(repo, scope) / rel
         dst = new / scope / rel.lstrip("/")
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1783,12 +1785,22 @@ def show_changes(repo: Repo, old: dict, new: dict, key: Path) -> None:
         cfg = scope_base(repo, scope) / "config"
         if old_cfg.is_file() and cfg.is_file() and old_cfg.read_bytes() != cfg.read_bytes():
             err("\n  " + STYLE.bold(f"diff of {san(cfg)}:"))
-            a = old_cfg.read_text(errors="replace").splitlines()
-            b = cfg.read_text(errors="replace").splitlines()
-            for line in list(difflib.unified_diff(a, b, lineterm=""))[2:]:   # without ---/+++
-                color = (STYLE.green if line.startswith("+") else STYLE.red if line.startswith("-")
-                         else STYLE.cyan if line.startswith("@@") else str)
-                err("  " + color(san(line)))
+            _print_diff(old_cfg, cfg)
+    for action, (scope, path) in changes(old, new):
+        if scope == "global" and action == "modified":
+            old_cfg = Path(str(key) + ".d") / "global" / path.lstrip("/")
+            if old_cfg.is_file() and Path(path).is_file():
+                err("\n  " + STYLE.bold(f"diff of {san(path)}:"))
+                _print_diff(old_cfg, Path(path))
+
+
+def _print_diff(old_cfg: Path, cfg: Path) -> None:
+    a = old_cfg.read_text(errors="replace").splitlines()
+    b = cfg.read_text(errors="replace").splitlines()
+    for line in list(difflib.unified_diff(a, b, lineterm=""))[2:]:   # without ---/+++
+        color = (STYLE.green if line.startswith("+") else STYLE.red if line.startswith("-")
+                 else STYLE.cyan if line.startswith("@@") else str)
+        err("  " + color(san(line)))
 
 
 # ------------------------------------------------------------------ restore
@@ -1945,15 +1957,57 @@ def cmd_forget(args: list[str]) -> None:
 
 def cmd_retrust() -> None:
     n = skipped = 0
+    # A change to the global/system config (`git lfs install`, `git config
+    # --global …`) turns every registered repository "modified" at once, with
+    # the same diff; trusting them one by one showed it N times. Repositories
+    # whose only deviation is that diff are grouped: one review on the
+    # terminal, one answer, applied to the group. Anything local on top keeps
+    # the repository out of the group (skipped, as before).
+    groups: dict[tuple, list] = {}
     for key, root, st in entries():
         if st in ("ok", "legacy") and root:
             save_trust(open_repo(root))
             clear_pending(key)
             n += 1
             info(f"re-trusted: {root}")
+        elif st == "modified" and root:
+            repo = open_repo(root)
+            refs = config_refs(repo)
+            new = manifest(repo, refs)
+            old = load_manifest(key)
+            diff = changes(old.entries, new) if old else []
+            if diff and all(k[0] == "global" for _, k in diff):
+                sig = tuple((a, k, old.entries[k].sha if k in old.entries else None,
+                             new[k].sha if k in new else None) for a, k in diff)
+                groups.setdefault(sig, []).append((key, repo, refs, old.entries, new))
+            else:
+                skipped += 1
+                warn(f"skipped ({st}): {root}")
         else:
             skipped += 1
             warn(f"skipped ({st}): {root or key.name}")
+    for members in groups.values():
+        key, repo, refs, old_entries, new = members[0]
+        rule()
+        warn(STYLE.bold(f"global config changed since the last trust of {len(members)} "
+                        f"repository(ies): {', '.join(san(str(m[1].label)) for m in members)}"))
+        show_changes(repo, old_entries, new, key)
+        err("")
+        rule()
+        if not can_ask():
+            skipped += len(members)
+            hint("run `gitguard retrust` from a terminal to accept this change for them, "
+                 "or `gitguard trust` in each")
+            continue
+        if not ask_on_tty(STYLE.yellow(f"Accept this global change for these {len(members)} "
+                                       f"repository(ies)? [y/N] ")):
+            skipped += len(members)
+            continue
+        for key, repo, refs, old_entries, new in members:
+            save_trust(repo, refs, new)      # the state shown, not a fresh scan
+            clear_pending(key)
+            n += 1
+            info(f"re-trusted: {repo.label}")
     info(f"{n} repository(ies) re-trusted, {skipped} skipped")
     check_safe_bare()
 
