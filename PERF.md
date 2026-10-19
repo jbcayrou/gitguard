@@ -3,6 +3,11 @@
 Overhead of `gitguard git <cmd>` over a plain `git <cmd>`, measured on
 2026-10-17 at commit `73b0d1c`.
 
+Re-checked on 2026-10-19 with the current code (pending decisions, real git
+resolved from the PATH): same overhead within 3 ms on the small repository,
+head to head against the `73b0d1c` script on the same machine state. The
+tables below are the original measurements.
+
 ## Environment
 
 - Apple M4 Pro, macOS (Darwin 27.0), APFS
@@ -18,13 +23,13 @@ Overhead of `gitguard git <cmd>` over a plain `git <cmd>`, measured on
 `git clone --depth 1` of torvalds/linux from kernel.org: 96 080 tracked
 files, 6 285 directories, ~10 MB index. N = 10.
 
-| command          | git     | gitguard git | overhead | `GITGUARD_SCAN_TREE=1` |
-|------------------|--------:|-------------:|---------:|-----------------------:|
-| `status`         | 247 ms  | 293 ms       | +46 ms   | +211 ms                |
-| `log -1`         |   6 ms  |  52 ms       | +46 ms   | +212 ms                |
-| `rev-parse HEAD` |   4 ms  |  49 ms       | +45 ms   | +210 ms                |
-| `diff --stat`    | 125 ms  | 172 ms       | +48 ms   | +217 ms                |
-| `branch`         |   5 ms  |  50 ms       | +45 ms   | +212 ms                |
+| command          | git     | gitguard git | overhead |
+|------------------|--------:|-------------:|---------:|
+| `status`         | 247 ms  | 293 ms       | +46 ms   |
+| `log -1`         |   6 ms  |  52 ms       | +46 ms   |
+| `rev-parse HEAD` |   4 ms  |  49 ms       | +45 ms   |
+| `diff --stat`    | 125 ms  | 172 ms       | +48 ms   |
+| `branch`         |   5 ms  |  50 ms       | +45 ms   |
 
 `gitguard` alone (check, no git): 49 ms.
 
@@ -36,13 +41,13 @@ the next command is back to 45 ms.
 
 ~30 files. N = 15.
 
-| command          | git   | gitguard git | overhead | `GITGUARD_SCAN_TREE=1` |
-|------------------|------:|-------------:|---------:|-----------------------:|
-| `status`         | 5 ms  | 48 ms        | +43 ms   | +41 ms                 |
-| `log -1`         | 5 ms  | 46 ms        | +40 ms   | +41 ms                 |
-| `rev-parse HEAD` | 4 ms  | 45 ms        | +41 ms   | +41 ms                 |
-| `diff --stat`    | 4 ms  | 45 ms        | +41 ms   | +41 ms                 |
-| `branch`         | 5 ms  | 45 ms        | +41 ms   | +41 ms                 |
+| command          | git   | gitguard git | overhead |
+|------------------|------:|-------------:|---------:|
+| `status`         | 5 ms  | 48 ms        | +43 ms   |
+| `log -1`         | 5 ms  | 46 ms        | +40 ms   |
+| `rev-parse HEAD` | 4 ms  | 45 ms        | +41 ms   |
+| `diff --stat`    | 4 ms  | 45 ms        | +41 ms   |
+| `branch`         | 5 ms  | 45 ms        | +41 ms   |
 
 `gitguard` alone: 45 ms.
 
@@ -54,20 +59,20 @@ the next command is back to 45 ms.
 | gitguard's own work on a small repository             | ~13 ms          |
 | extra on the kernel (gitdir hashing, `.idx` read)     | ~4 ms           |
 | index re-parse when the index changed (10 MB, cached) | +40 ms, once    |
-| tree scan, `GITGUARD_SCAN_TREE=1` (6 285 directories) | +165 ms         |
 | config parser (port of git's config.c), 17 KB config  | ~2 ms           |
 
 Conclusions:
 
 - The overhead is a constant ~45 ms per command, independent of the
   repository size; 70 % of it is the interpreter's startup. A compiled
-  rewrite would bring it to a few ms, and would change nothing for the
-  tree scan, which is bound by `readdir` (APFS serialises it; a C `find`
-  was measured slower, 8 threads 3× slower).
-- The tree scan (`GITGUARD_SCAN_TREE`, +210 ms on the kernel for an early
-  warning only) was removed the day after these measurements; the column is
-  kept as the record of why (see CLAUDE.md, "Nested repositories").
+  rewrite would bring it to a few ms.
 - The config parser is invisible at this scale.
+- Nothing walks the work tree. An opt-in tree scan (`GITGUARD_SCAN_TREE`,
+  looking for undeclared nested `.git`) existed when these measurements
+  were taken: +210 ms on the kernel, +165 ms of it in `readdir` (APFS
+  serialises it; a C `find` was slower, 8 threads 3× slower), for an early
+  warning the gitlink check already gives. It was removed on 2026-10-18;
+  see CLAUDE.md, "Nested repositories".
 
 ## Reproducing
 
@@ -80,12 +85,11 @@ GIT = "/opt/homebrew/bin/git"
 state = os.path.abspath("bench-state")
 env = dict(os.environ, GITGUARD_REAL_GIT=GIT, GITGUARD_STATE=state, NO_COLOR="1")
 
-def run(cmd, extra=None):
-    e = dict(env, **(extra or {}))
+def run(cmd):
     ts = []
     for _ in range(n):
         t = time.perf_counter()
-        r = subprocess.run(cmd, cwd=repo, env=e, capture_output=True)
+        r = subprocess.run(cmd, cwd=repo, env=env, capture_output=True)
         ts.append((time.perf_counter() - t) * 1000)
         assert r.returncode == 0, (cmd, r.stderr[-500:])
     return statistics.median(ts)
@@ -93,12 +97,11 @@ def run(cmd, extra=None):
 subprocess.run([sys.executable, GG, "trust"], cwd=repo, env=env, capture_output=True, check=True)
 cases = [("status", ["status"]), ("log -1", ["log", "-1"]), ("rev-parse HEAD", ["rev-parse", "HEAD"]),
          ("diff --stat", ["diff", "--stat"]), ("branch", ["branch"])]
-print(f"{'command':16} {'git':>10} {'gitguard git':>14} {'overhead':>10} {'+scan tree':>12}")
+print(f"{'command':16} {'git':>10} {'gitguard git':>14} {'overhead':>10}")
 for name, args in cases:
     raw = run([GIT, *args])
     gg = run([sys.executable, GG, "git", *args])
-    sc = run([sys.executable, GG, "git", *args], {"GITGUARD_SCAN_TREE": "1"})
-    print(f"{name:16} {raw:8.0f}ms {gg:12.0f}ms {gg - raw:+8.0f}ms {sc - raw:+10.0f}ms")
+    print(f"{name:16} {raw:8.0f}ms {gg:12.0f}ms {gg - raw:+8.0f}ms")
 print(f"{'gitguard (check)':16} {'':>10} {run([sys.executable, GG]):12.0f}ms")
 floor = run([sys.executable, "-c", "import difflib,hashlib,json,os,re,shlex,shutil,stat,subprocess,sys,time,dataclasses,functools,pathlib"])
 print(f"{'python floor':16} {'':>10} {floor:12.0f}ms")

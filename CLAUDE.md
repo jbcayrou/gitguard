@@ -1,10 +1,11 @@
 # gitguard
 
-**`gitguard.py`** — Python 3 standard library only, a single file, the only
-implementation. JSON manifest (version, root, date, typed entries), a complete
-git config parser, paths handled as objects. Runs on Linux and macOS
-(Python ≥ 3.9, tested on 3.12 and 3.14). A state written by an earlier
-format version is reported as "legacy": run `retrust`.
+**`gitguard.py`** is the whole program: one file, Python 3 standard library
+only, Linux and macOS (Python ≥ 3.9, tested on 3.12 and 3.14). This file is
+the design record: threat model, what is checked and why, the decisions
+that were ruled out, and the history of the bypasses found (numbered `[n]`,
+catalogued in `tests/attacks/__init__.py`). README.md is the user-facing
+version.
 
 A guard that refuses to run `git` on a repository whose "trusted" files
 (`.git/config`, hooks, attributes, alternates…) have changed since the user
@@ -12,11 +13,11 @@ last validated them.
 
 ## Why it exists (threat model)
 
-Untrusted code gets **write access to a host directory that contains git
-repositories**: a sandboxed LLM agent, a container or VM with a bind mount, a
-CI runner, a third-party build tool, a project you just cloned. Whatever the
-sandbox, writing into the work tree is the whole point, and `.git/` sits
-inside it. Malicious code in there can:
+Untrusted code runs in a container or VM with **a host directory mounted
+into it, and that directory contains git repositories**: a CI runner, a
+build of a project you just cloned, a third-party tool, a sandboxed LLM
+agent. Whatever the sandbox, writing into the work tree is the whole point,
+and `.git/` sits inside it. Malicious code in there can:
 
 - drop a hook into `.git/hooks/`;
 - add to `.git/config` a key that runs a command (`core.fsmonitor`,
@@ -72,40 +73,55 @@ The management commands (`list`/`forget`/`prune`/`retrust`) read
 `<key>.d/.root` to find the path; an entry without `.root` (trusted by an
 earlier version) is shown as "unknown" and can only be `prune`d.
 
-Intended deployment: a symlink `~/bin/git → gitguard` ahead of the real git
-in the PATH (the script detects it is called `git` and switches to exec
-mode) — it also wraps the tools that run git by name: shell prompts
+### Deployment
+
+A symlink `~/bin/git → gitguard` ahead of the real git in the PATH: the
+script detects it is called `git` and switches to exec mode. This also wraps the tools that run git by name: shell prompts
 (oh-my-zsh uses `command git`, which skips aliases), editors, build tools,
-which fire a planted `core.fsmonitor` at `cd` time; `alias git='gitguard
-git'` only wraps what the user types. System-wide (Debian): `dpkg-divert`
-the real git to `/usr/bin/git.real` and symlink `/usr/bin/git → gitguard`;
-macOS keeps the PATH symlink (`/usr/bin/git` is under SIP, renaming
-Homebrew's git is undone by `brew upgrade`) plus VS Code's `git.path`. The
-git it runs is `GITGUARD_REAL_GIT`, else a **`git.real` next to the invoked
-path or next to the script** (the divert layout; an environment variable
-reaches neither cron, systemd nor a GUI — the sibling wins over the PATH
-because it *is* the git the user would have run; a bare `argv[0]` has no
-directory, the cwd is never searched), else the first `git` of the PATH that
-is not gitguard itself (`real_git`; the former default `/usr/bin/git` ran
-Apple's git instead of Homebrew's, with another system config). That git's
-system config (`<prefix>/etc/gitconfig`, derived from the binary's path) is
-read along with `/etc/gitconfig`: changing the real git changes the
-fingerprint (one `trust`). Hooks and `rebase --exec` run by the real git
-call `<exec-path>/git`, unwrapped by design (no recursion; their todo files
-are read, [36]). Never-trusted repositories are not a problem of the
-system-wide install: clone/init through the wrapper auto-trust, and a
-repository cloned by an unwrapped git is mostly the sandbox's own clone,
-which must be refused; pre-existing repositories get one explicit `trust`
-each, by hand — no automatic migration, no trust-on-first-use (ruled out:
-it blesses an unknown first state for the sole benefit of a one-time
-migration). Variables: `GITGUARD_STATE`,
-`GITGUARD_REAL_GIT`, `GITGUARD_ALLOW_REBASE_EXEC`, `GITGUARD_NO_PROMPT`
-(never ask on the terminal, refuse directly), `GITGUARD_WAIT` (seconds a
-git without a controlling terminal waits for `gitguard pending`, default
-60, 0 = never), `GITGUARD_NO_NOTIFY` (no desktop notification),
-`GITGUARD_DEBUG` (full traceback of an internal error,
-otherwise a neutralized message and exit 1), `NO_COLOR`.
-After an upgrade that changes what the fingerprint contains: `gitguard retrust`.
+which fire a planted `core.fsmonitor` at `cd` time. `alias git='gitguard
+git'` only wraps what the user types.
+
+System-wide (Debian): `dpkg-divert` the real git to `/usr/bin/git.real` and
+symlink `/usr/bin/git → gitguard`. macOS keeps the PATH symlink
+(`/usr/bin/git` is under SIP, renaming Homebrew's git is undone by `brew
+upgrade`) plus VS Code's `git.path`.
+
+Pre-existing repositories get one explicit `trust` each, by hand, after a
+look at their `config` and `hooks/`. **No automatic migration, no
+trust-on-first-use**: ruled out, it blesses an unknown first state for the
+sole benefit of a one-time migration. Never-trusted repositories are not a
+problem of the system-wide install: clone/init through the wrapper
+auto-trust, and a repository cloned by an unwrapped git is mostly the
+sandbox's own clone, which must be refused.
+
+### Which git runs (`real_git`)
+
+In order: `GITGUARD_REAL_GIT`; else a **`git.real` next to the invoked path
+or next to the script** (the divert layout — an environment variable reaches
+neither cron, systemd nor a GUI; the sibling wins over the PATH because it
+*is* the git the user would have run; a bare `argv[0]` has no directory, the
+cwd is never searched); else the first `git` of the PATH that is not
+gitguard itself. The former default `/usr/bin/git` ran Apple's git instead
+of Homebrew's, with another system config.
+
+That git's system config (`<prefix>/etc/gitconfig`, derived from the
+binary's path) is read along with `/etc/gitconfig`: changing the real git
+changes the fingerprint (one `trust`). Hooks and `rebase --exec` run by the
+real git call `<exec-path>/git`, unwrapped by design (no recursion; their
+todo files are read instead, [36]).
+
+### Environment variables
+
+`GITGUARD_STATE` (state directory), `GITGUARD_REAL_GIT`,
+`GITGUARD_ALLOW_REBASE_EXEC`, `GITGUARD_NO_PROMPT` (never ask on the
+terminal, refuse directly), `GITGUARD_WAIT` (seconds a git without a
+controlling terminal waits for `gitguard pending`, default 60, 0 = never),
+`GITGUARD_NO_NOTIFY` (no desktop notification), `GITGUARD_DEBUG` (full
+traceback of an internal error, otherwise a neutralized message and exit 1,
+git not run), `NO_COLOR`.
+
+After an upgrade that changes what the fingerprint contains (`FORMAT_VERSION`):
+entries are reported as "legacy", `gitguard retrust` re-validates them.
 
 ## What the script checks, in order
 
@@ -130,7 +146,7 @@ After an upgrade that changes what the fingerprint contains: `gitguard retrust`.
    directory holding `.git` (`Repo.anchor`, `Repo.label`): a `core.worktree`
    written by the sandbox is an ordinary config change shown in the diff,
    not a "never trusted" repository.
-2. **`resolve_gitdir`** (in `open_repo`): `.git` must not be a symlink; if it
+2. **`open_repo`** (`read_gitfile`): `.git` must not be a symlink; if it
    is a `gitdir:` file, the target must not be *inside* the work tree
    (legitimate worktrees and submodules point outside).
 3. **`check_structure`** (refuses before anything else):
@@ -377,9 +393,9 @@ basename without `.git`). After git succeeds, `save_trust` is called
 - `--bare`, `--mirror`, `--separate-git-dir`.
 In those cases we warn and leave a manual `gitguard trust`.
 
-## Exec-mode shortcuts: auto-accept and prompt
+## Exec-mode shortcuts: auto-accept, prompt, pending
 
-When `gitguard git …` finds a deviation from the reference, two shortcuts
+When `gitguard git …` finds a deviation from the reference, three shortcuts
 before refusing (`check_or_die`, `interactive=True` only in exec mode;
 `gitguard` alone remains a diagnostic that reports):
 
@@ -530,7 +546,7 @@ into the tree was not watched.
 
 ## Tests
 
-**`python3 -m pytest`** (~460 tests of which 1 expected failure, ~100 s),
+**`python3 -m pytest`** (~420 tests, 1 expected failure — [44] —, ~100 s),
 to run before any change:
 
 - `tests/attacks/` — **the attack corpus**, one module per family (`gitdir`,
