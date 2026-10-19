@@ -301,7 +301,7 @@ once for all the repositories it is the only change of.
 | `gitguard diff` | Show what differs from the reference. |
 | `gitguard restore [-y]` | Put the watched files back into the reference state. |
 | `gitguard git <args>` | Check, then run the real git. Honours `-C`, `--git-dir`, `--work-tree`, `-c`. |
-| `gitguard list` | Registered repositories and their status (ok / modified / structure / missing / legacy / unknown). |
+| `gitguard list` | Registered repositories and their status (ok / modified / structure / tampered / missing / legacy / unknown). |
 | `gitguard pending [<repo>… \| -a \| -c <repo>…]` | Decisions waiting for a git blocked by a program: list, review and allow/refuse, or clear. |
 | `gitguard forget <repo>…` / `--missing` | Remove entries; the repository becomes "never trusted" again. |
 | `gitguard prune` | Same as `forget --missing`. |
@@ -330,7 +330,9 @@ works); refusals and diagnostics go to stderr.
   contain the symlink, is not checked (see "You are not the only one running
   git"). A `-c key=value` given to such a git is invisible too.
 - It cannot close the race between its check and git's execution if the
-  sandbox is still writing. Stop the sandbox before running git on the host.
+  sandbox is still writing: a hook modified while git runs has run before
+  the post-run check reports it. Detection after the fact, not prevention.
+  Stop the sandbox before running git on the host when you can.
 - `restore` only cleans the pivot vector: objects, commits and tree files
   dropped by the sandbox stay there for you to inspect.
 - Hooks tracked *in the tree* under `core.hooksPath` (husky, `.githooks`)
