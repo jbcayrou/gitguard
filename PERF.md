@@ -51,6 +51,21 @@ the next command is back to 45 ms.
 
 `gitguard` alone: 45 ms.
 
+### Same on Linux (Debian 13, VM)
+
+Debian 13 aarch64 in a VM on the same machine, ext4, Python 3.13.5
+(system), git 2.47.3, system-wide install (`/usr/bin/git → gitguard`, real
+git at `git.real`). Small repository, N = 20, 2026-10-19.
+
+| command          | git   | gitguard git | overhead |
+|------------------|------:|-------------:|---------:|
+| `status`         | 1 ms  | 27 ms        | +26 ms   |
+| `log -1`         | 0 ms  | 27 ms        | +26 ms   |
+| `rev-parse HEAD` | 0 ms  | 26 ms        | +26 ms   |
+
+`gitguard` alone: 29 ms; Python floor 16 ms. Same shape as macOS: the
+interpreter's startup is most of it, Linux starts it twice as fast.
+
 ## Where the time goes
 
 | component                                             | cost            |

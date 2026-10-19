@@ -1749,16 +1749,28 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
     # A deletion may only target the inside of the gitdir or of a root that the
     # **trusted** config designated. Without this, an `ext:` path that appeared
     # after the trust (hooksPath turned into a symlink to $HOME, say) made
-    # gitguard delete files outside the repository — found in review.
+    # gitguard delete files outside the repository — found in review. Such a
+    # file is left in place and named, and the rest is restored: it is only
+    # watched because the planted config names it (`include.path = ../x`),
+    # and once that config is back it is an ordinary file, in the tree or
+    # outside, for the user to look at. Refusing the whole restore left the
+    # hook and the config in place too (seen with a container planting the
+    # three at once).
     allowed = [repo.gitdir, repo.common] + [p for _, p in trusted_refs]
-    for action, (scope, path) in plan:
+    kept = []
+    for action, (scope, path) in list(plan):
         if action != "delete":
             continue
         target = (scope_base(repo, scope) / path).resolve()
         if not any(a == target or a in target.parents for a in allowed):
-            raise Refuse(f"{scope}:{path} is outside the paths designated by the trusted "
-                         f"config: refusing to delete. Inspect the repository by hand.")
+            plan.remove((action, (scope, path)))
+            kept.append((scope, path))
+    for scope, path in kept:
+        warn(f"{_label(scope, path)} is outside the paths designated by the trusted config: "
+             f"left in place, not deleted. Inspect it by hand.")
     if not plan:
+        if kept:
+            raise Refuse("nothing else to restore")
         info(f"nothing to restore, {repo.label} is in the trusted state")
         return
     err(STYLE.bold(f"Actions on {san(repo.root)}:"))

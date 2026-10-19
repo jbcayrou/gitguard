@@ -594,6 +594,11 @@ to run before any change:
   `tests/attacks/`. See "Known limitations" for the list.
 - `tests/conftest.py` — fixtures: `gg` (isolated environment: HOME, state,
   global config in `tmp_path`), `repo` (clean trusted repository), `subsrc`.
+  The scenarios are built with `REAL_GIT`, the first `git` (or `git.real`)
+  of the PATH that is not gitguard, put ahead of the fixture's PATH: on a
+  machine with the system-wide install, `git` *is* gitguard and every
+  scenario was refused as never trusted by the test's own state (77 failures
+  on a Debian with `/usr/bin/git → gitguard`).
 
 **Checking `pending` by hand.** A git with a controlling terminal never
 waits (`has_tty`), so `nohup … &` or a plain `&` from a shell does not
@@ -700,7 +705,13 @@ content; fail closed on anything the parser cannot make sense of.
   the common case of a mounted parent directory. Stop the sandbox before
   running git on the host.
 - `restore` only cleans the pivot vector; objects, commits and tree files
-  dropped by the sandbox remain, to be inspected by hand.
+  dropped by the sandbox remain, to be inspected by hand. It never deletes
+  outside the gitdir and the roots the **trusted** config designates (an
+  `ext:` path that appeared after the trust pointed into `$HOME`, found in
+  review): such a file (`include.path = ../evil.inc` planted with the hook)
+  is left in place and named in a warning, and the rest is restored — a
+  container planting hook, config and include at once left all three in
+  place when the whole restore was refused.
 - A trusted hook that invokes a program by name (`node`, `python`) depends on
   the user's `PATH`; if a `PATH` directory is in the mounted volume, that is
   out of gitguard's reach.

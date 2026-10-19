@@ -18,6 +18,32 @@ GITGUARD = ROOT / "gitguard.py"
 sys.path.insert(0, str(ROOT))
 
 
+def _is_gitguard(p: Path) -> bool:
+    try:
+        with open(p, "rb") as f:
+            return b"gitguard" in f.read(512)
+    except OSError:
+        return False
+
+
+def _real_git() -> str:
+    """The git the scenarios are built with. On a machine with the system-wide
+    install, the `git` of the PATH is already gitguard (`/usr/bin/git →
+    gitguard`, the real one diverted to `git.real`): every scenario would then
+    be refused as "never trusted" by the test's own isolated state."""
+    if os.environ.get("GITGUARD_REAL_GIT"):
+        return os.environ["GITGUARD_REAL_GIT"]
+    for d in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        for name in ("git", "git.real"):
+            cand = Path(d or ".") / name
+            if cand.is_file() and os.access(cand, os.X_OK) and not _is_gitguard(cand):
+                return str(cand)
+    raise RuntimeError("no git other than gitguard in the PATH: set GITGUARD_REAL_GIT")
+
+
+REAL_GIT = _real_git()
+
+
 @dataclass
 class Result:
     rc: int
@@ -68,8 +94,11 @@ def gg(tmp_path: Path) -> GG:
     home = tmp_path / "home"
     state = tmp_path / "state"
     home.mkdir()
+    realgit = tmp_path / "bin-real-git"     # `git` = the real one, ahead of the PATH
+    realgit.mkdir()
+    os.symlink(REAL_GIT, realgit / "git")
     env = {
-        "PATH": os.environ["PATH"],
+        "PATH": f"{realgit}{os.pathsep}{os.environ['PATH']}",
         "HOME": str(home),
         "GITGUARD_STATE": str(state),
         "GIT_CONFIG_NOSYSTEM": "1",

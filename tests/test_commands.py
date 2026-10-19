@@ -57,6 +57,44 @@ def test_restore_repairs_gitdir(gg: GG, repo: Path) -> None:
     assert gg.git("commit", "-qam", "c2", cwd=repo).rc == 0, "repository still functional"
 
 
+def test_restore_leaves_a_planted_include_target_but_cleans_the_rest(gg: GG, repo: Path) -> None:
+    """A container plants a hook, an include.path into the tree and the file it
+    names. restore puts config and hooks back and leaves the included file in
+    place (never a deletion outside the trusted roots), named in a warning;
+    the repository is back in the trusted state since nothing names it any more."""
+    write_exec(repo / ".git/hooks/pre-commit")
+    with (repo / ".git/config").open("a") as f:
+        f.write("[core]\n\tfsmonitor = /tmp/evil\n[include]\n\tpath = ../evil.inc\n")
+    (repo / "evil.inc").write_text("[core]\n\tpager = sh -c 'id; cat'\n")
+    assert gg.check(repo).blocked
+    r = gg.run("restore", "-y", cwd=repo)
+    assert r.rc == 0, r.err
+    assert "evil.inc" in r.err and "left in place" in r.err
+    assert (repo / "evil.inc").exists()
+    assert not (repo / ".git/hooks/pre-commit").exists()
+    assert "fsmonitor" not in (repo / ".git/config").read_text()
+    assert not gg.check(repo).blocked
+
+
+def test_restore_never_deletes_outside_the_trusted_roots(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """hooksPath redirected after the trust to a directory outside the repository
+    (a stand-in for $HOME): the files there are not deleted, the config is
+    restored, and with nothing else to restore the command says so."""
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "precious").write_text("keep me\n")
+    write_exec(outside / "pre-commit")
+    gg.git("config", "core.hooksPath", str(outside), cwd=repo)
+    assert gg.check(repo).blocked
+    r = gg.run("restore", "-y", cwd=repo)
+    assert r.rc == 0, r.err
+    assert (outside / "precious").read_text() == "keep me\n"
+    assert (outside / "pre-commit").exists()
+    assert "left in place" in r.err
+    assert gg.git("config", "core.hooksPath", cwd=repo).rc != 0
+    assert not gg.check(repo).blocked
+
+
 def test_restore_noop(gg: GG, repo: Path) -> None:
     r = gg.run("restore", "-y", cwd=repo)
     assert r.rc == 0 and "nothing to restore" in r.out
