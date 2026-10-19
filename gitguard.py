@@ -527,6 +527,18 @@ def find_root(cwd: Path) -> Path | None:
                 return (gd / value).resolve()
         return cwd.resolve()
     d = cwd.resolve()
+    # Where git stops ascending, gitguard stops too, or it checks — and refuses
+    # on — a repository git would not open (seen with a tmpfs mounted inside
+    # a modified repository, and with GIT_CEILING_DIRECTORIES). Port of
+    # setup.c: the ceiling directories are the longest one that is a proper
+    # ancestor of the cwd and are never entered; a parent on another device
+    # is never entered unless GIT_DISCOVERY_ACROSS_FILESYSTEM.
+    ceil = _ceiling_offset(d)
+    one_fs = not _env_bool("GIT_DISCOVERY_ACROSS_FILESYSTEM")
+    try:
+        dev = d.stat().st_dev
+    except OSError:
+        dev = None
     while True:
         g = d / ".git"
         if g.is_symlink() or g.is_file():
@@ -547,7 +559,48 @@ def find_root(cwd: Path) -> Path | None:
                          f"intended; {SAFE_BARE_HINT}.")
         if d.parent == d:
             return None
+        if ceil is not None and len(str(d.parent)) <= ceil:
+            return None               # GIT_DIR_HIT_CEILING
+        if one_fs and dev is not None:
+            try:
+                if d.parent.stat().st_dev != dev:
+                    return None       # GIT_DIR_HIT_MOUNT_POINT
+            except OSError:
+                return None
         d = d.parent
+
+
+def _env_bool(name: str) -> bool:
+    """git_env_bool: unset or empty is false; else git's boolean parsing."""
+    v = os.environ.get(name, "")
+    return v.strip().lower() in ("1", "true", "yes", "on") if v else False
+
+
+def _ceiling_offset(cwd: Path) -> int | None:
+    """longest_ancestor_length: the length of the longest GIT_CEILING_DIRECTORIES
+    entry that is a proper ancestor of `cwd`, None when there is none. Entries
+    are canonicalised (`real_path`) until an empty entry, after which they are
+    taken literally — git's rule, to spare a slow filesystem."""
+    raw = os.environ.get("GIT_CEILING_DIRECTORIES")
+    if not raw:
+        return None
+    best, literal, s = None, False, str(cwd)
+    for entry in raw.split(os.pathsep):
+        if entry == "":
+            literal = True
+            continue
+        if not entry.startswith("/"):
+            continue
+        if not literal:
+            try:
+                entry = str(Path(entry).resolve())
+            except OSError:
+                continue
+        entry = entry.rstrip("/") or "/"
+        prefix = entry if entry == "/" else entry + "/"
+        if s.startswith(prefix) and s != entry:
+            best = max(best or -1, len(entry))
+    return best
 
 
 def read_gitfile(p: Path) -> Path:

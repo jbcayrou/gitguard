@@ -148,7 +148,13 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    case we refuse: an unhandled bare repository, or a booby-trapped directory
    git would use instead of the repository (flaw [23]). Calling `git
    rev-parse` would already read the trapped config — never reintroduce
-   that. With `--git-dir`/`GIT_DIR`, the checked tree is
+   that. The walk stops where git's does: never into a
+   `GIT_CEILING_DIRECTORIES` entry that is a proper ancestor of the cwd
+   (entries canonicalised until an empty one, `_ceiling_offset`), never
+   onto another device unless `GIT_DISCOVERY_ACROSS_FILESYSTEM` — before
+   that, a tmpfs mounted inside a modified repository, or a ceiling, made
+   gitguard refuse on a repository git would not have opened (parity
+   tests; the mount checked on the VM). With `--git-dir`/`GIT_DIR`, the checked tree is
    `--work-tree`/`GIT_WORK_TREE`, else `core.worktree`, else the cwd ([28]).
    Without them, a `core.worktree` in the config (common `config`, then
    `config.worktree` if `extensions.worktreeConfig`) redirects the tree as
@@ -516,7 +522,14 @@ runs under the real git's exec path (`HOOKGIT=/usr/lib/git-core/git`); the
 four wrapped calls seen came from `pre-commit install`, before the hook
 existed. cron: `PATH=/usr/bin:/bin`, no tty, waits the default 60 s,
 records `sh ← cron ← cron`; the `%` of a `date +%s` in a crontab is a
-newline, not a gitguard matter. A rootless podman container writing as its
+newline, not a gitguard matter. `git lfs install` writes four
+`filter.lfs.*` keys into the global config: every registered repository
+turns "modified" at once and `retrust` skips them all — one `trust` per
+repository, each showing the same global diff (a `retrust` that reviews one
+global diff and applies it to every repository whose only change is that
+diff would be sound; not done). root running git in a user's repository
+gets "suspicious owner/permissions" on `config` (the file is not root's)
+and an empty state of its own. A rootless podman container writing as its
 root (= the user's uid) plants hook, config and include in one go; as uid
 1000 inside (subuid outside) it cannot write into `.git` at all.
 
@@ -622,8 +635,9 @@ to run before any change:
   `san`, `Style`, `walk_gitdir` filter, `index_gitlinks` and its cache,
   `branch_tracking_only`.
 - `tests/test_git_parity.py` — **git as the oracle**: everything git reads
-  (config parser, path expansion, includes, alias tokens, discovery, index
-  gitlinks, config file origins) gitguard must read too. Known divergences
+  (config parser, path expansion, includes, alias tokens, discovery — ceiling
+  directories included —, index gitlinks, config file origins) gitguard must
+  read too. Known divergences
   are marked `xfail(strict=True)`: the suite stays green, a fix makes the
   test XPASS so the mark gets removed and the scenario promoted to
   `tests/attacks/`. See "Known limitations" for the list.

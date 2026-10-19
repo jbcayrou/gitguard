@@ -506,3 +506,46 @@ def test_env_config_hookspath(gg: GG, repo: Path, how: str) -> None:
     gg.trust(repo)
     write_exec(repo / ".githooks/pre-commit", EVIL)
     assert gg.check(repo).blocked
+
+
+# ------------------------------------------------- discovery: where git stops
+def _with_env(gg: GG, **extra: str) -> GG:
+    return GG(env={**gg.env, **extra}, state=gg.state)
+
+
+def test_ceiling_directories_stop_gitguard_where_git_stops(gg: GG, repo: Path) -> None:
+    """GIT_CEILING_DIRECTORIES=<repo>: from <repo>/sub git does not enter <repo>
+    and finds nothing. gitguard used to walk up anyway, check the repository
+    git would not open, and refuse on it."""
+    sub = repo / "sub"
+    sub.mkdir()
+    write_exec(repo / ".git/hooks/pre-commit")               # modified: a refusal if checked
+    assert gg.check(repo).blocked
+    g = _with_env(gg, GIT_CEILING_DIRECTORIES=str(repo))
+    oracle = g.git("rev-parse", "--show-toplevel", cwd=sub)
+    assert oracle.rc != 0 and "not a git repository" in oracle.err
+    r = g.run("git", "rev-parse", "--show-toplevel", cwd=sub)
+    assert "gitguard" not in r.err, r.err
+    assert r.rc == oracle.rc and "not a git repository" in r.err
+    assert g.run(cwd=sub).rc == 0 and not g.run(cwd=sub).blocked      # plain check: nothing here
+    # the ceiling itself is not entered, but the cwd always is
+    g2 = _with_env(gg, GIT_CEILING_DIRECTORIES=str(repo.parent))
+    assert g2.git("rev-parse", "--show-toplevel", cwd=sub).rc == 0
+    assert g2.run("git", "rev-parse", "--show-toplevel", cwd=sub).blocked      # found, modified: refused
+    assert g2.git("rev-parse", "--show-toplevel", cwd=repo).rc == 0
+    assert g2.run("git", "status", cwd=repo).blocked
+
+
+def test_ceiling_entries_are_resolved_unless_after_an_empty_one(gg: GG, repo: Path, tmp_path: Path) -> None:
+    sub = repo / "sub"
+    sub.mkdir()
+    link = tmp_path / "link-to-repo"
+    os.symlink(repo, link)
+    write_exec(repo / ".git/hooks/pre-commit")
+    g = _with_env(gg, GIT_CEILING_DIRECTORIES=str(link))               # resolved → the repo: a ceiling
+    assert g.git("rev-parse", cwd=sub).rc != 0
+    assert not g.run("git", "rev-parse", cwd=sub).err.count("gitguard")
+    g = _with_env(gg, GIT_CEILING_DIRECTORIES=os.pathsep + str(link))  # literal → no ancestor: no ceiling
+    assert g.git("rev-parse", cwd=sub).rc == 0
+    assert g.run("git", "rev-parse", cwd=sub).blocked
+
