@@ -579,6 +579,23 @@ to run before any change:
 - `tests/conftest.py` — fixtures: `gg` (isolated environment: HOME, state,
   global config in `tmp_path`), `repo` (clean trusted repository), `subsrc`.
 
+**Checking `pending` by hand.** A git with a controlling terminal never
+waits (`has_tty`), so `nohup … &` or a plain `&` from a shell does not
+exercise shortcut 3: both keep the terminal. Detach it: `setsid -w git
+status` on Linux; macOS has no `setsid`, use what the tests use,
+`python3 -c 'import subprocess, sys; subprocess.run(sys.argv[1:],
+start_new_session=True, stdin=subprocess.DEVNULL, stdout=open("/tmp/git.log",
+"w"), stderr=subprocess.STDOUT)' gitguard git status &`. Isolate with
+`GITGUARD_STATE=/tmp/ggstate`, `GITGUARD_NO_NOTIFY=1` unless the
+notification is the point, `GITGUARD_WAIT=300` to have time to run
+`gitguard pending <repo>` from another terminal; `cat /tmp/git.log` shows
+what the waiter did (`allowed through gitguard pending`, `refused through
+gitguard pending`, or `no decision within … s`). The review of a record
+without a terminal (`gitguard pending <repo> </dev/null`) prints the diff
+and the calling chain but refuses to decide. In zsh, `GG="python3
+gitguard.py"; $GG …` fails (no word splitting): put a `gitguard` symlink on
+the PATH instead.
+
 **`tests/nested_git_is_a_threat.sh`** — standalone bash proof: an undeclared
 nested repository does execute code from the root as soon as a gitlink
 exists. Not a test of gitguard, a test of git: re-run it if a git version

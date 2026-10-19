@@ -137,16 +137,48 @@ minutes) and **waits** up to `GITGUARD_WAIT` seconds (default 60; 0 = never
 wait) for your decision. In a terminal:
 
 ```
-gitguard pending            # what waits: repository, since when, which program ran git
+gitguard pending            # what waits: repository, since when, how many gits
 gitguard pending <repo>     # the diff, the calling process, then allow or refuse
+gitguard pending -a         # review every record in turn
+gitguard pending -c <repo>  # clear a record without deciding
+```
+
+What it looks like:
+
+```
+$ gitguard pending
+changed         4s  1 waiting  /home/user/work/api
+  gitguard pending <repo>   to see the diff and decide     -a: all
+$ gitguard pending ~/work/api
+/home/user/work/api  [changed, since 6s]
+    git waiting (pid 41250, 6s): code[40988] ← systemd[1]
+      /usr/share/code/code --type=utility
+────────────────────────────────────────────────────────
+  added     hooks/pre-commit
+────────────────────────────────────────────────────────
+Allow: record this state and let the waiting git run? [y/N] n
+! gitguard: refused: the waiting git is not run; the record is cleared. If malicious:  gitguard restore
 ```
 
 Allowing records the state you were shown as the reference and the waiting
 git runs; refusing makes it fail, and `gitguard restore` puts the files
-back. If you decide after the timeout, the decision applies to the next
-invocation (editors poll again by themselves). A never-trusted repository
-or a structural anomaly is recorded and refused at once: nothing can be
-allowed there without inspection.
+back. If the files changed again between the block and your review, the
+diff shown is the current one and says so. If you decide after the timeout,
+the decision applies to the next invocation (editors poll again by
+themselves). A never-trusted repository or a structural anomaly is recorded
+and refused at once: nothing can be allowed there without inspection.
+
+To try it by hand, start a git with no controlling terminal. `nohup` and `&`
+keep the terminal; `setsid` detaches on Linux, and on macOS, which has no
+`setsid`, Python's `start_new_session` does the same:
+
+```sh
+cd ~/work/api && printf '#!/bin/sh\necho pwned\n' > .git/hooks/pre-commit
+GITGUARD_WAIT=300 python3 -c 'import subprocess, sys
+subprocess.run(sys.argv[1:], start_new_session=True, stdin=subprocess.DEVNULL,
+               stdout=open("/tmp/git.log", "w"), stderr=subprocess.STDOUT)' git status &
+gitguard pending ~/work/api      # decide; then read /tmp/git.log
+```
 
 A git that *has* a terminal (a shell prompt's `$(git …)`, a script you run
 in a terminal) is refused immediately as before: blocking it would freeze
