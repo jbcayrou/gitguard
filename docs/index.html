@@ -126,8 +126,9 @@ description: A guard that refuses to run git on a repository whose trusted files
 <p>System-wide on Debian: <code>dpkg-divert</code> the real git to <code>/usr/bin/git.real</code> and symlink <code>/usr/bin/git</code> to gitguard. gitguard finds a <code>git.real</code> next to itself. On macOS keep the <code>PATH</code> symlink and set <code>git.path</code> in VS Code.</p></li>
     <li><p>Set the companion setting git already ships. It is independent of gitguard and closes a hole gitguard cannot reach from tools that bypass the wrapper.</p>
 <pre class="term"><span class="p">$</span> git config --global safe.bareRepository explicit</pre></li>
-    <li><p>Trust each repository you already have. A <code>clone</code> or <code>init</code> made through the wrapper is trusted on its own.</p>
-<pre class="term"><span class="p">$</span> cd ~/work/api && gitguard trust
+    <li><p>Trust each repository you already have, after a look at its <code>config</code> and <code>hooks/</code>: nothing is blessed unseen, there is no trust-on-first-use. A <code>clone</code> or <code>init</code> made through the wrapper is trusted on its own.</p>
+<pre class="term"><span class="p">$</span> cd ~/work/api && cat .git/config && ls -la .git/hooks
+<span class="p">$</span> gitguard trust
 <span class="ok">✓</span> gitguard: trust state recorded for /home/user/work/api</pre></li>
   </ol>
 </section>
@@ -138,7 +139,7 @@ description: A guard that refuses to run git on a repository whose trusted files
     <div class="prose">
       <p>Most commands change nothing gitguard watches, so you never hear from it. When something did change, three cases.</p>
       <p><b>Branch tracking only.</b> <code>push -u</code>, <code>branch -u</code> and <code>checkout -b</code> write <code>branch.x.remote</code> and <code>branch.x.merge</code> to the config. If that is the whole difference, gitguard updates the reference itself, prints one line and runs git. That list is closed at those two keys.</p>
-      <p><b>Anything else.</b> The diff is shown, then a question on the terminal: trust this state and run git, default no. The question goes through <code>/dev/tty</code>, so git's stdin is left alone. No question without a terminal, with stderr redirected, or with <code>GITGUARD_NO_PROMPT=1</code>.</p>
+      <p><b>Anything else.</b> The diff is shown, then a question on the terminal: trust this state and run git, default no. The question goes through <code>/dev/tty</code>, so git's stdin is left alone. No question without a terminal, with stdout or stderr redirected, or with <code>GITGUARD_NO_PROMPT=1</code>.</p>
       <p><b>Never trusted, or structurally wrong.</b> A symlinked <code>.git</code>, a bare gitdir in a subdirectory, an <code>exec</code> line injected into a rebase, a control character in a name. No question is asked. Fix it, or trust it explicitly.</p>
       <p><b>A program ran git.</b> An editor's polling, a build tool, cron: no terminal, nobody reads its stderr. gitguard records what it saw, sends one desktop notification and waits up to <code>GITGUARD_WAIT</code> seconds. In a terminal, <code>gitguard pending</code> lists what waits; <code>gitguard pending &lt;repo&gt;</code> shows the diff and the calling process, then asks. Allowing records what you were shown and lets the waiting git run; refusing makes it fail and clears the record. A decision taken after the timeout applies to the next invocation. A git that has a terminal, such as a prompt's <code>$(git …)</code>, is refused at once instead: blocking it would freeze your shell.</p>
       <p>What you say yes to is exactly what you were shown. gitguard saves the state it diffed, never a fresh scan taken after your answer.</p>
@@ -225,12 +226,14 @@ From github.com:org/api
 <section id="limits" class="prose">
   <h2>What it does not do</h2>
   <ul>
-    <li>It only covers git invocations that resolve to the wrapper. A tool with a hardcoded path to the real git, or started with a <code>PATH</code> that does not contain the symlink, is not checked.</li>
+    <li>It only covers git invocations that resolve to the wrapper. A tool with a hardcoded path to the real git, or started with a <code>PATH</code> that does not contain the symlink, is not checked. A <code>-c key=value</code> given to such a git is invisible too.</li>
+    <li>It cannot close the race between its check and git's execution if the sandbox is still writing. Stop the sandbox before running git on the host.</li>
+    <li><code>restore</code> only cleans the pivot vector. Objects, commits and tree files the sandbox dropped stay there for you to inspect.</li>
+    <li>Hooks tracked <em>in the tree</em> under <code>core.hooksPath</code> (husky, <code>.githooks</code>) are watched, but a <code>checkout</code>, <code>merge</code> or <code>pull</code> of a commit the sandbox created rewrites them after the check, and git runs the new version in the same command. <code>gitguard trust</code> warns when that layout is in place; review incoming changes to those files.</li>
+    <li>A trusted hook that calls a program by name depends on your <code>PATH</code>. If a <code>PATH</code> directory sits in the mounted volume, that is out of reach.</li>
     <li>The question needs stdout and stderr on a terminal. A prompt's <code>$(git …)</code> or a <code>git log | head</code> on a changed repository is refused, not asked: rerun without the pipe, or <code>gitguard trust</code>.</li>
     <li>No desktop notification without a session (ssh, cron, systemd). The pending record is still written and the wait still times out; check <code>gitguard pending</code> by hand.</li>
-    <li>It cannot close the race between its check and git's execution if the sandbox is still writing. Stop the sandbox before running git on the host.</li>
-    <li>A trusted hook that calls a program by name depends on your <code>PATH</code>. If a <code>PATH</code> directory sits in the mounted volume, that is out of reach.</li>
-    <li>Bare repositories are refused, not managed.</li>
+    <li>Bare repositories are refused, not managed. <code>core.splitIndex</code> is refused: the gitlinks it needs to read live in <code>sharedindex.*</code>.</li>
     <li>Parity with git is checked against git itself in <code>tests/test_git_parity.py</code>; a gap found there is marked as an expected failure until fixed, and none is open at the moment. Deliberate, fail-closed divergences: a NUL byte or a line git dies on in a config file is refused.</li>
   </ul>
   <p>The suite replays a catalogue of fifty bypasses and false positives found over nine adversarial review passes, and requires a refusal for each one while ordinary git workflows stay silent. The catalogue, the review method and the design notes are in the repository.</p>
