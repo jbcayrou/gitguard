@@ -158,6 +158,18 @@ gitguard.py refer to this list (how the project reviews itself: CLAUDE.md,
      `git-merge-ort<CR>x = /y`, a script of the work tree. Found while
      validating [51]. Fix: read bytes, the port of get_next_char already
      handles CRLF.
+[53] Other text-mode reads of files git reads, audited after [52]. The
+     config diff shown before [y/N] used splitlines(): a lone CR made
+     `hooksPath = .githooks<CR>x = y` look like two clean lines. The gitfile
+     and `commondir` were read with splitlines()/strip() and a lexical
+     resolve(): a trailing blank, a lone CR, a second line or ` ../..` gave
+     gitguard a repository where git finds none and dies — no execution,
+     but a parity break the suite would have caught. Fix: LF-only split for
+     the diff; git's exact reading (trailing CR/LF only) and a strict
+     resolve for path files. A NUL in `commondir` is refused, never "not a
+     gitdir": git truncates at it and opens the directory, and a planted
+     bare gitdir walked past is [23]. The todo files were checked against git 2.47
+     and 2.50 and need nothing: whenever git runs an `exec`, gitguard refuses.
 """
 from __future__ import annotations
 

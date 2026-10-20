@@ -99,6 +99,20 @@ def _global_config(gg: GG) -> Path:
     return Path(gg.env.get("GIT_CONFIG_GLOBAL") or Path(gg.env["HOME"]) / ".gitconfig")
 
 
+def test_config_diff_keeps_a_lone_cr_inside_its_line(gg: GG, repo: Path) -> None:
+    """[53] The diff shown before [y/N] split lines in text mode: a lone CR became
+    a line break, so `hooksPath = .githooks<CR>x = y` showed as two clean lines,
+    `hooksPath = .githooks` and `x = y`, while git reads ONE value naming another
+    directory. Lines are split on LF only, as git does; CRLF stays a line end."""
+    cfg = repo / ".git/config"
+    cfg.write_bytes(cfg.read_bytes() + b"[core]\r\n\thooksPath = .githooks\rx = y\n")
+    r = gg.run("diff", cwd=repo)
+    lines = r.out.splitlines()
+    assert any("+?hooksPath = .githooks?x = y" in l for l in lines), r.out
+    assert not any(l.strip() in ("+x = y", "x = y") for l in lines), r.out
+    assert any(l.strip() == "+[core]" for l in lines), "CRLF must read as a plain line end"
+
+
 def test_global_config_change_shows_its_diff(gg: GG, repo: Path) -> None:
     """`git lfs install` turned every repository "modified" with one line,
     `modified global:~/.gitconfig`, and nothing to read: the global files are

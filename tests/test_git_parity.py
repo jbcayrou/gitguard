@@ -345,7 +345,8 @@ def test_discovery_invalid_dotgit_dir_skipped_by_git(explicit: GG, repo: Path, m
     _assert_same_repo(explicit, repo / "src", monkeypatch)
 
 
-@pytest.mark.parametrize("layout", ["head_symlink", "commondir", "head_sha", "head_ref_tab"])
+@pytest.mark.parametrize("layout", ["head_symlink", "commondir", "commondir_nul", "head_sha",
+                                    "head_ref_tab"])
 def test_discovery_gitdir_variants_match_git(explicit: GG, repo: Path, tmp_path: Path,
                                              monkeypatch, layout: str) -> None:
     """[49] is_git_directory as git has it: HEAD may be a symlink to refs/…,
@@ -353,9 +354,11 @@ def test_discovery_gitdir_variants_match_git(explicit: GG, repo: Path, tmp_path:
     g = repo / "src/.git"
     g.mkdir(parents=True)
     (g / "config").write_text("[core]\n")
-    if layout == "commondir":
+    if layout.startswith("commondir"):
         (g / "HEAD").write_text("ref: refs/heads/main\n")
-        (g / "commondir").write_text("../../.git\n")
+        # NUL: git truncates (C string) and still finds the common dir. [53]
+        (g / "commondir").write_bytes(b"../../.git\n" if layout == "commondir"
+                                      else b"../../.git\0junk\n")
     else:
         (g / "objects").mkdir(); (g / "refs").mkdir()
         if layout == "head_symlink":
@@ -365,6 +368,47 @@ def test_discovery_gitdir_variants_match_git(explicit: GG, repo: Path, tmp_path:
         else:
             (g / "HEAD").write_text("ref:\trefs/heads/main\n")
     _assert_same_repo(explicit, repo / "src", monkeypatch)
+
+
+# [53] Files git reads as ONE path: the gitfile (`gitdir: <path>`) and
+# `commondir`. git trims every trailing CR/LF and nothing else; a blank, a lone
+# CR or a second line are part of the path, git finds no repository and dies.
+# gitguard read them with splitlines()/strip() and a lexical resolve(): it
+# checked a repository git never opens. Strict here: same verdict both ways.
+PATH_FILE_VARIANTS = [
+    ("plain", b"{p}\n", True), ("crlf", b"{p}\r\n", True), ("no_newline", b"{p}", True),
+    ("two_newlines", b"{p}\n\n", True), ("cr_only_end", b"{p}\r", True),
+    ("trailing_space", b"{p} \n", False), ("trailing_tab", b"{p}\t\n", False),
+    ("lone_cr_inside", b"{p}\rx\n", False), ("second_line", b"{p}\nx\n", False),
+    ("leading_space", b" {p}\n", False),
+]
+
+
+def _same_verdict(gg: GG, cwd: Path, monkeypatch, git_accepts: bool) -> None:
+    want, got = _git_view(gg, cwd), _gg_view(cwd, monkeypatch)
+    assert (want is not None) == git_accepts, f"git's own behaviour changed: {want}"
+    assert got == want, f"git uses {want}, gitguard checks {got}"
+
+
+@pytest.mark.parametrize("fmt,git_accepts", [c[1:] for c in PATH_FILE_VARIANTS],
+                         ids=[c[0] for c in PATH_FILE_VARIANTS])
+def test_gitfile_read_like_git(explicit: GG, repo: Path, tmp_path: Path, monkeypatch,
+                               fmt: bytes, git_accepts: bool) -> None:
+    wt = tmp_path / "wt"
+    assert explicit.git("worktree", "add", "-q", str(wt), cwd=repo).rc == 0
+    target = str(repo / ".git/worktrees/wt").encode()
+    (wt / ".git").write_bytes(b"gitdir: " + fmt.replace(b"{p}", target))
+    _same_verdict(explicit, wt, monkeypatch, git_accepts)
+
+
+@pytest.mark.parametrize("fmt,git_accepts", [c[1:] for c in PATH_FILE_VARIANTS],
+                         ids=[c[0] for c in PATH_FILE_VARIANTS])
+def test_commondir_read_like_git(explicit: GG, repo: Path, tmp_path: Path, monkeypatch,
+                                 fmt: bytes, git_accepts: bool) -> None:
+    wt = tmp_path / "wt"
+    assert explicit.git("worktree", "add", "-q", str(wt), cwd=repo).rc == 0
+    (repo / ".git/worktrees/wt/commondir").write_bytes(fmt.replace(b"{p}", b"../.."))
+    _same_verdict(explicit, wt, monkeypatch, git_accepts)
 
 
 @pytest.mark.parametrize("layout", ["commondir", "head_symlink_unborn", "full_bare"])

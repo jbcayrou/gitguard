@@ -529,9 +529,9 @@ def is_bare_gitdir(d: Path) -> bool:
     cd = d / "commondir"
     if cd.is_file():
         try:
-            common = d / cd.read_text(errors="surrogateescape").rstrip("\r\n")
-        except OSError:
-            return False
+            common = d / _read_path_file(cd)     # a Refuse (NUL) propagates: git
+        except OSError:                          # truncates and opens the dir,
+            return False                         # "not a gitdir" would walk past it
     objects = Path(os.environ["GIT_OBJECT_DIRECTORY"]) if os.environ.get("GIT_OBJECT_DIRECTORY") \
         else common / "objects"
     return os.access(objects, os.X_OK) and os.access(common / "refs", os.X_OK)
@@ -633,12 +633,37 @@ def _ceiling_offset(cwd: Path) -> int | None:
     return best
 
 
+def _read_path_file(p: Path) -> str:
+    """A file git reads as one path (`commondir`, the gitfile's `gitdir:`): the
+    whole content, every trailing CR/LF trimmed, nothing else — no strip(), no
+    line split: `x<SPACE>`, `x<CR>y` or a second line are part of the path for
+    git, which then finds no repository there and dies. Reading them more
+    leniently made gitguard check a repository git never opens. NUL: git
+    truncates (C string), refused here. [53]"""
+    buf = p.read_bytes()
+    if b"\0" in buf:
+        raise Refuse(f"{p}: NUL byte")
+    return buf.rstrip(b"\r\n").decode(errors="surrogateescape")
+
+
 def read_gitfile(p: Path) -> Path:
-    for line in p.read_text(errors="surrogateescape").splitlines():
-        if line.startswith("gitdir: "):
-            target = Path(line[8:].strip())
-            return (target if target.is_absolute() else p.parent / target).resolve()
-    raise Refuse(f"{p}: invalid .git file")
+    """read_gitfile_gently: `gitdir: ` at the very start of the file, then the
+    path as _read_path_file reads it, relative to the file's directory."""
+    text = _read_path_file(p)
+    if not text.startswith("gitdir: ") or len(text) == 8:
+        raise Refuse(f"{p}: invalid .git file")
+    target = Path(text[8:])
+    return _resolve_existing(target if target.is_absolute() else p.parent / target, p)
+
+
+def _resolve_existing(path: Path, src: Path) -> Path:
+    """resolve(strict=True): the OS walk git's own access does. Non-strict
+    resolve() cancels `x/..` lexically once `x` is missing (` ../..` became the
+    parent where git finds no directory and dies). [53]"""
+    try:
+        return path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise Refuse(f"{src} names a path that does not exist: {path}") from None
 
 
 def open_repo(root: Path) -> Repo:
@@ -658,7 +683,9 @@ def open_repo(root: Path) -> Repo:
     common = g
     cd = g / "commondir"
     if cd.is_file():
-        common = (g / cd.read_text().strip()).resolve()
+        common = _resolve_existing(g / _read_path_file(cd), cd)
+        if not common.is_dir():
+            raise Refuse(f"{cd} names no directory: {common}")
     anchor = root
     if not os.environ.get("GIT_DIR"):
         # core.worktree: git takes that directory as the work tree (relative
@@ -1859,9 +1886,22 @@ def show_changes(repo: Repo, old: dict, new: dict, key: Path) -> None:
                 _print_diff(old_cfg, Path(path))
 
 
+def _config_lines(p: Path) -> list[str]:
+    """The lines of a config file as git splits them: on LF only, a CR right
+    before it dropped (CRLF). Not read_text().splitlines(): a lone CR (or VT,
+    FF, U+2028…) became a line break, and `hooksPath = .githooks<CR>x = y`,
+    one value for git, showed as two clean lines before [y/N]. The CR stays
+    in its line, where san() shows it as `?`. [53]"""
+    text = p.read_bytes().decode(errors="replace")
+    lines = text.split("\n")
+    if text.endswith("\n"):
+        lines.pop()                  # the terminator, not an empty last line
+    return [l[:-1] if l.endswith("\r") else l for l in lines]
+
+
 def _print_diff(old_cfg: Path, cfg: Path) -> None:
-    a = old_cfg.read_text(errors="replace").splitlines()
-    b = cfg.read_text(errors="replace").splitlines()
+    a = _config_lines(old_cfg)
+    b = _config_lines(cfg)
     for line in list(difflib.unified_diff(a, b, lineterm=""))[2:]:   # without ---/+++
         color = (STYLE.green if line.startswith("+") else STYLE.red if line.startswith("-")
                  else STYLE.cyan if line.startswith("@@") else str)

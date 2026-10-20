@@ -168,7 +168,13 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    not a "never trusted" repository.
 2. **`open_repo`** (`read_gitfile`): `.git` must not be a symlink; if it
    is a `gitdir:` file, the target must not be *inside* the work tree
-   (legitimate worktrees and submodules point outside).
+   (legitimate worktrees and submodules point outside). The gitfile and
+   `commondir` are read as git reads them (`_read_path_file`): bytes, every
+   trailing CR/LF trimmed and nothing else, `gitdir: ` at byte 0, then a
+   strict resolve (an OS walk, not a lexical `x/..`). A blank, a lone CR or a
+   second line are part of the path for git, which dies there; `splitlines()`
+   / `strip()` made gitguard check a repository git never opens ([53],
+   `test_gitfile_read_like_git`, `test_commondir_read_like_git`).
 3. **`check_structure`** (refuses before anything else):
    - `core.splitIndex` (`sharedindex.*` present): explicit refusal, the
      gitlinks live in a file `index_gitlinks` does not read ([31]).
@@ -342,7 +348,10 @@ is idempotent on a message already coloured via `STYLE`, and everything can
 go through it without precaution — `info/warn/fail/hint` always neutralize,
 `Refuse` neutralizes at construction, there is no "raw" mode. `\n` is
 preserved (intended in messages; in a file name it is already refused by
-`check_structure`).
+`check_structure`). The config diff splits lines on LF only, as git does
+(`_config_lines`): with `splitlines()` a lone CR became a line break and
+`hooksPath = .githooks<CR>x = y`, one value for git, showed as two clean
+lines before `[y/N]` ([53]).
 
 History: the first version filtered everything in `err()` and printed
 `?[31m`; the second had a `raw=True` flag to set by hand, forgotten on the
