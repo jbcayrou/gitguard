@@ -411,6 +411,47 @@ def test_commondir_read_like_git(explicit: GG, repo: Path, tmp_path: Path, monke
     _same_verdict(explicit, wt, monkeypatch, git_accepts)
 
 
+# ============================================ rebase todo: `exec` as git reads it
+# (name, bytes prepended to git-rebase-todo, does git run the line). The rule
+# is one-way: whenever git runs it, gitguard must refuse; a refusal where git
+# does nothing is a false positive we accept (fail closed). git's own column is
+# asserted too, so that a git version changing what it runs is seen here.
+# Checked with git 2.47.3 (Debian) and 2.50.0 (Homebrew). [35] [53]
+TODO_EXEC_VARIANTS = [
+    ("plain", b"exec {c}\n", True),
+    ("crlf", b"exec {c}\r\n", True),
+    ("tab_after_word", b"exec\t{c}\n", True),
+    ("leading_tab", b"\texec {c}\n", True),
+    ("leading_spaces", b"  exec {c}\n", True),
+    ("x_nickname", b"x {c}\n", True),
+    ("leading_cr", b"\rexec {c}\n", False),
+    ("leading_vt", b"\vexec {c}\n", False),
+    ("cr_after_word", b"exec\r{c}\n", False),
+    ("cr_mid_line", b"noop\rexec {c}\n", False),
+    ("after_nul", b"noop\0\nexec {c}\n", False),
+    ("upper_case", b"EXEC {c}\n", False),
+]
+
+
+@pytest.mark.parametrize("fmt,git_runs", [c[1:] for c in TODO_EXEC_VARIANTS],
+                         ids=[c[0] for c in TODO_EXEC_VARIANTS])
+def test_todo_exec_seen_whenever_git_runs_it(gg: GG, repo: Path, tmp_path: Path,
+                                             fmt: bytes, git_runs: bool) -> None:
+    from tests.attacks.tool_itself import _interrupted_rebase
+    todo = _interrupted_rebase(gg, repo, tmp_path)
+    gg.trust(repo)
+    marker = Path(gg.env["HOME"]) / "PWNED"
+    cmd = f'touch "{marker}"'.encode()
+    todo.write_bytes(fmt.replace(b"{c}", cmd) + todo.read_bytes())
+    refused = gg.check(repo).blocked              # before git consumes the todo
+    subprocess.run(["git", "rebase", "--continue"], cwd=repo, capture_output=True,
+                   env={**gg.env, "GIT_EDITOR": "true"})
+    ran = marker.exists()
+    assert ran == git_runs, f"git's own behaviour changed: ran={ran}"
+    if ran:
+        assert refused, "git ran the exec line and gitguard had let it through"
+
+
 @pytest.mark.parametrize("layout", ["commondir", "head_symlink_unborn", "full_bare"])
 def test_planted_gitdir_refused_by_git_with_explicit(explicit: GG, repo: Path, layout: str) -> None:
     """Bare-gitdir variants that is_bare_gitdir does not recognise (commondir,

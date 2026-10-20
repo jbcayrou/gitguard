@@ -736,6 +736,14 @@ nothing of the previous ones:
 5. A positive control for every negative result: when claiming "git does not
    execute X here", also show the case where it does (see
    `test_first_add_does_not_execute`).
+6. **Replay the fix too, with variants, before believing it.** A green test
+   proves only what it exercises. The [51] fix was validated by its own test
+   four times while a `strip()`, an empty name, a lone CR and a swallowed NUL
+   each let the real git through; every gap came out of a shell loop over
+   byte variants (`\t`, `\r`, `\v`, `\0`, a trailing blank, a second line)
+   run against the real git on the VM. Any reader of a file git reads gets
+   that loop, and the loop becomes a parity test with git as the oracle
+   (`PATH_FILE_VARIANTS`, `TODO_EXEC_VARIANTS`).
 
 **Angles for independent agents** (disjoint, so that each can go deep;
 give each one the threat model, the "what is checked" section and the
