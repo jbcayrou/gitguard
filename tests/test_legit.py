@@ -347,3 +347,18 @@ def test_env_common_dir_own_gitdir(gg: GG, repo: Path, tmp_path: Path) -> None:
     gg.env["GIT_COMMON_DIR"] = str(repo / ".git")  # what its commondir file already says
     assert not gg.check(tmp_path / "wt").blocked
     assert not gg.run("git", "status", cwd=tmp_path / "wt").blocked
+
+
+@pytest.mark.parametrize("name", [".github/workflows/ci.yml", ".gitignore", ".gitattributes",
+                                  "dir/.gitkeep", "a.git/x", "x.git", "..x", "x..", "...",
+                                  ".git-blame-ignore-revs", "d/.gitmodules-like", "g.it/x"])
+def test_index_names_close_to_git_rules(gg: GG, repo: Path, name: str) -> None:
+    """Names git accepts in an index, next to the ones [55] must refuse
+    (`.git`, `.`, `..`, empty, absolute): no alert, through the wrapper too."""
+    p = repo / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("x\n")
+    assert gg.git("add", name, cwd=repo).rc == 0
+    assert gg.git("commit", "-qm", name, cwd=repo).rc == 0
+    assert not gg.check(repo).blocked
+    assert not gg.run("git", "checkout", "--", ".", cwd=repo).blocked

@@ -769,11 +769,17 @@ def index_gitlinks(index: Path, cache: Path | None = None) -> list[str]:
     This is the criterion that matters: a nested repository is only dangerous
     once a gitlink references it, and the gitlink names it wherever it is.
 
+    Every entry name is also checked as git's verify_path would (see
+    `verify_path`): git writes a name from the index without that check. [55]
+
     `cache` (`<key>.idx` in the state dir, out of the container's reach)
-    memoizes the result keyed by the file's sha256: the Python parse costs
-    ~40 ms for 96k entries (Linux kernel), the hash 4 ms. A modified — or
-    forged — index has another sha256 and is re-parsed; an unreadable or
-    inconsistent cache is ignored. Nothing is cached when the parser refuses."""
+    memoizes the result keyed by the file's sha256, one record per index
+    file (the repository's, its submodules', its worktrees'): the Python
+    parse costs ~40 ms for 96k entries (Linux kernel), the hash 4 ms. A
+    modified — or forged — index has another sha256 and is re-parsed; an
+    unreadable, inconsistent or older-version cache is ignored (a cache
+    written before the name check would vouch for a forged index). Nothing
+    is cached when the parser refuses."""
     p = index
     try:
         data = p.read_bytes()
@@ -782,24 +788,243 @@ def index_gitlinks(index: Path, cache: Path | None = None) -> list[str]:
     if len(data) < 12 or data[:4] != b"DIRC":
         return []
     digest = hashlib.sha256(data).hexdigest()
+    records: dict = {}
     if cache is not None:
         try:
             c = json.loads(cache.read_text())
-            if (isinstance(c, dict) and c.get("sha256") == digest
-                    and isinstance(c.get("gitlinks"), list)
-                    and all(isinstance(x, str) for x in c["gitlinks"])):
-                return list(c["gitlinks"])
+            if (isinstance(c, dict) and c.get("v") == INDEX_CACHE_VERSION
+                    and isinstance(c.get("indexes"), dict)):
+                records = c["indexes"]
+                hit = records.get(str(p))
+                if (isinstance(hit, dict) and hit.get("sha256") == digest
+                        and isinstance(hit.get("gitlinks"), list)
+                        and all(isinstance(x, str) for x in hit["gitlinks"])):
+                    return list(hit["gitlinks"])
         except (OSError, ValueError):
-            pass
+            records = {}
     out = _parse_index_gitlinks(data, p)
     if cache is not None:
         try:
+            keep = {k: v for k, v in records.items()
+                    if isinstance(k, str) and k != str(p) and os.path.exists(k)}
+            keep[str(p)] = {"sha256": digest, "gitlinks": out}
             tmp = Path(str(cache) + ".tmp")
-            tmp.write_text(json.dumps({"sha256": digest, "gitlinks": out}))
+            tmp.write_text(json.dumps({"v": INDEX_CACHE_VERSION, "indexes": keep}))
             os.replace(tmp, cache)
         except OSError:
             pass
     return out
+
+
+# 2: entry names checked by verify_path [55]; 1 (unversioned) never checked them.
+INDEX_CACHE_VERSION = 2
+
+
+# ------------------------------------------------- index entry names [55]
+# Port of git's verify_path (read-cache.c) with core.protectHFS and
+# core.protectNTFS both on: git refuses these names when it reads a tree
+# into the index, `git add`s or `update-index`es them, but `checkout -- .`,
+# `restore --worktree` and `checkout-index` write whatever the index holds.
+# Both protections are applied on every platform (fail closed): git
+# refuses the same names at `add` on macOS (HFS) and everywhere (NTFS,
+# default since 2.24), so a legitimate index never holds them.
+_HFS_IGNORED = {0x200c, 0x200d, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d,
+                0x202e, 0x206a, 0x206b, 0x206c, 0x206d, 0x206e, 0x206f, 0xfeff}
+
+
+def _utf8_chars(b: bytes, i: int) -> Iterator[int | None]:
+    """Code points from offset `i` as pick_one_utf8_char reads them: None
+    on malformed UTF-8 (then nothing more), 0 at the end."""
+    while i < len(b):
+        c = b[i]
+        n = 1 if c < 0x80 else 2 if c >> 5 == 6 else 3 if c >> 4 == 14 else 4 if c >> 3 == 30 else 0
+        try:
+            if not n:
+                raise ValueError
+            ch = b[i:i + n].decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            yield None
+            return
+        yield ord(ch)
+        i += n
+    yield 0
+
+
+def _is_hfs_dot(b: bytes, i: int, needle: bytes) -> bool:
+    """is_hfs_dot_generic: `.<needle>` ignoring the code points HFS+
+    ignores, ASCII case-insensitive, then the end or `/`. Malformed UTF-8
+    reads as the end (git's next_hfs_char returns 0)."""
+    it = (c for c in _utf8_chars(b, i) if c not in _HFS_IGNORED)
+    def nxt() -> int:
+        c = next(it, 0)
+        return 0 if c is None else c
+    if nxt() != ord("."):
+        return False
+    for want in needle:
+        c = nxt()
+        if c > 127 or chr(c).lower() != chr(want):
+            return False
+    c = nxt()
+    return c == 0 or c == ord("/")
+
+
+def _is_ntfs_dotgit(b: bytes, i: int) -> bool:
+    """is_ntfs_dotgit: `.git` or `git~1`, then only spaces and dots up to
+    the end, a `/`, a `\\` or a `:` (an NTFS stream: `.git:x` is `.git`)."""
+    r = b[i:]
+    if r[:1] == b"." and r[1:4].lower() == b"git":
+        j = 4
+    elif r[:3].lower() == b"git" and r[3:5] == b"~1":
+        j = 5
+    else:
+        return False
+    for c in r[j:] + b"\0":
+        if c in (0, 0x3A, 0x2F, 0x5C):
+            return True
+        if c not in (0x2E, 0x20):
+            return False
+    return True
+
+
+def _is_ntfs_dot_generic(b: bytes, i: int, name: bytes, short: bytes) -> bool:
+    """is_ntfs_dot_generic (used for `.gitmodules`): the long name, its
+    `xxxxxx~1..4` short form, or the hashed fall-back short name, then only
+    spaces and dots up to the end or a `:`."""
+    r = b[i:] + b"\0"
+    def rest_ok(j: int) -> bool:
+        for c in r[j:]:
+            if c in (0, 0x3A):
+                return True
+            if c not in (0x20, 0x2E):
+                return False
+        return True
+    if r[:1] == b"." and r[1:1 + len(name)].lower() == name:
+        return rest_ok(len(name) + 1)
+    if r[:6].lower() == name[:6] and r[6:7] == b"~" and b"1" <= r[7:8] <= b"4":
+        return rest_ok(8)
+    k, saw_tilde = 0, False
+    while k < 8:
+        c = r[k]
+        if c == 0:
+            return False
+        if saw_tilde:
+            if not 0x30 <= c <= 0x39:
+                return False
+        elif c == 0x7E:
+            k += 1
+            if not 0x31 <= r[k] <= 0x39:
+                return False
+            saw_tilde = True
+        elif k >= 6 or c & 0x80 or chr(c).lower() != chr(short[k]):
+            return False
+        k += 1
+    return rest_ok(8)
+
+
+def _verify_dotfile(b: bytes, i: int, mode: int) -> bool:
+    """verify_dotfile: `b[i]` follows a `.` that starts a component."""
+    r = b[i:i + 4]
+    if i >= len(b) or b[i] == 0x2F:
+        return False                                   # "."
+    if r[:1] in (b"g", b"G") and r[1:3].lower() == b"it":
+        if i + 3 >= len(b) or b[i + 3] == 0x2F:
+            return False                               # ".git"
+        if mode & 0xF000 == 0xA000:
+            tail = b[i + 3:]
+            if tail[:7].lower() == b"modules" and (len(tail) == 7 or tail[7] == 0x2F):
+                return False                           # symlink ".gitmodules"
+    elif r[:1] == b".":
+        if i + 1 >= len(b) or b[i + 1] == 0x2F:
+            return False                               # ".."
+    return True
+
+
+# A name that can be refused contains one of these: an empty, `.` or `..`
+# component (or is empty, or starts/ends with `/`), a `\\`, a non-ASCII
+# byte (HFS ignorables, malformed UTF-8), `.git`, `git~`, or the `.gitmodules`
+# short names. Anything else is accepted without the full walk (the port
+# costs ~3.5 µs per name). The parity test runs both paths against git.
+_SUSPECT = re.compile(rb"(?:^|/)\.{0,2}(?:/|$)|[\\\x80-\xff]|\.git|git~|gitmod|gi7eb", re.I)
+# The same over every name of an index at once, NUL-separated (a name never
+# holds a NUL: the parser refuses it): plain substring searches (memmem, C)
+# on the lower-cased buffer, then the port only on the names they point at.
+# Every refusable name has a component that is empty, or starts with `.`
+# (`.git` and the HFS forms), or holds a `\\` (NTFS separator), `git~`
+# (`git~1`), the `.gitmodules` short names or a non-ASCII byte. Kernel-sized
+# index (96k names, 2.6 MB joined): ~30 ms once, then cached by sha256; a
+# regex over the buffer cost 40 ms, the port on every name 340 ms.
+_SUSPECT_SUBSTRINGS = [b"\0\0", b"\0/", b"/\0", b"//", b"\0.", b"/.",
+                       b"\\", b"git~", b"gitmod", b"gi7eb"]
+
+
+def forged_entry(entries: list[tuple[bytes, int]]) -> bytes | None:
+    """The first (name, mode) of an index that verify_path refuses, else None."""
+    buf = (b"\0" + b"\0".join(n for n, _ in entries) + b"\0").lower()
+    hits: set[int] = set()
+    for pat in _SUSPECT_SUBSTRINGS:
+        off = buf.find(pat)
+        while off != -1:
+            hits.update((off, off + len(pat) - 1))      # a hit may straddle a NUL
+            off = buf.find(pat, off + 1)
+    if not buf.isascii():
+        hits.update(m.start() for m in re.finditer(rb"[\x80-\xff]", buf))
+    nuls, last, done = 0, 0, -1       # NULs before `off`: `off` is inside entries[nuls - 1]
+    for off in sorted(hits):
+        nuls += buf.count(b"\0", last, off)
+        last = off
+        # On the separator itself (`\0\0`, `\0/`…): the name that follows it.
+        i = nuls if buf[off] == 0 else nuls - 1
+        if i == done or i >= len(entries):
+            continue
+        done = i
+        name, mode = entries[i]
+        if not verify_path(name, mode):
+            return name
+    return None
+
+
+def verify_path(b: bytes, mode: int) -> bool:
+    """git's verify_path(path, mode), protectHFS and protectNTFS on. A
+    terminating `/` is allowed only for a sparse directory entry."""
+    if not _SUSPECT.search(b):
+        return True
+    link = mode & 0xF000 == 0xA000
+    i = 0
+    while True:
+        # start of a component (`inside:` in git)
+        if _is_hfs_dot(b, i, b"git") or _is_ntfs_dotgit(b, i):
+            return False
+        if link and (_is_hfs_dot(b, i, b"gitmodules")
+                     or _is_ntfs_dot_generic(b, i, b"gitmodules", b"gi7eba")):
+            return False
+        if i >= len(b):
+            return mode & 0xF000 == 0x4000             # empty name / trailing "/"
+        c = b[i]
+        i += 1
+        if (c == 0x2E and not _verify_dotfile(b, i, mode)) or c == 0x2F:
+            return False
+        while True:
+            if i >= len(b):
+                return True
+            c = b[i]
+            i += 1
+            if c == 0x2F:
+                break
+            if c == 0x5C:                              # "\\": NTFS separator
+                if _is_ntfs_dotgit(b, i):
+                    return False
+                if link and _is_ntfs_dot_generic(b, i, b"gitmodules", b"gi7eba"):
+                    return False
+
+
+def forged_index_hint(p: Path, name: bytes) -> str:
+    return (f"forged git index: entry {name.decode(errors='replace')!r} in {p} escapes the "
+            f"work tree — `git checkout -- .` or `git restore` would write it as is (into "
+            f"the gitdir, outside the repository or at an absolute path) and can run it as a "
+            f"hook. git never writes such an entry itself. Rebuild the index from the "
+            f"commits, which git validates: `rm {p}` then `git reset -q` in that repository "
+            f"or worktree (staged changes are lost); then look at what else the sandbox "
+            f"left. [55]")
 
 
 def _parse_index_gitlinks(data: bytes, p: Path) -> list[str]:
@@ -809,6 +1034,7 @@ def _parse_index_gitlinks(data: bytes, p: Path) -> list[str]:
         raise Refuse(f"unsupported git index version ({version}): cannot check "
                      f"nested repositories of {p}")
     out, off, prev = [], 12, b""
+    entries: list[tuple[bytes, int]] = []
     for _ in range(count):
         if off + 62 > len(data):
             break
@@ -845,8 +1071,12 @@ def _parse_index_gitlinks(data: bytes, p: Path) -> list[str]:
         if end > len(data) or b"\0" in name or data[end:end + 1] != b"\0":
             raise Refuse(f"corrupt or forged git index (inconsistent name length): {p}")
         prev = name
+        entries.append((name, mode))
         if mode & 0xF000 == 0xE000:      # 0160000: gitlink
             out.append(name.decode(errors="surrogateescape"))
+    bad = forged_entry(entries)
+    if bad is not None:
+        raise Refuse(forged_index_hint(p, bad))
     return out
 
 
@@ -960,8 +1190,22 @@ def _check_strategy(p: Path, name: str) -> None:
             f"GITGUARD_ALLOW_REBASE_EXEC=1.")
 
 
+def check_indexes(repo: Repo) -> None:
+    """The entry names of every index git may check files out from: the
+    submodules' (`modules/<x>/index`: `submodule update`, `--recurse-
+    submodules` or `submodule foreach` run an unwrapped git there) and the
+    other worktrees' (`worktrees/<x>/index`, and the main one seen from a
+    linked worktree). The repository's own index (`Repo.index`) is read by
+    `Repo.gitfiles`. Same parser and cache: a few small files. [55]"""
+    cache = Path(str(repo.key) + ".idx")
+    for r in dict.fromkeys([*gitdir_roots(repo.gitdir), *gitdir_roots(repo.common)]):
+        if r != repo.gitdir:
+            index_gitlinks(r / "index", cache)
+
+
 def check_structure(repo: Repo, refs: list[tuple[str, Path]]) -> None:
     check_split_index(repo)
+    check_indexes(repo)
     # Every nested .git — declared in .gitmodules or referenced by an index
     # gitlink, wherever it is (node_modules/, build/…) — must be
     # a file pointing under .git/modules (submodule) or under .git/worktrees

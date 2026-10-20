@@ -278,35 +278,59 @@ def test_index_gitlinks_minimal_index(tmp_path: Path, entries, expected) -> None
 
 def test_index_gitlinks_cache(tmp_path: Path) -> None:
     """The cache is reused while the index sha256 is identical, ignored
-    otherwise (modified index or forged/corrupt cache), and never written on
-    refusal."""
+    otherwise (modified index, forged/corrupt cache, older cache version that
+    never checked names [55]), and never written on refusal."""
     import json
     idx = tmp_path / "index"
     cache = tmp_path / "state" / "k.idx"
     cache.parent.mkdir()
     idx.write_bytes(_index_v2([(0o100644, b"f"), (0o160000, b"vendor")]))
-    assert gg_mod.index_gitlinks(tmp_path / "index", cache) == ["vendor"]
+    assert gg_mod.index_gitlinks(idx, cache) == ["vendor"]
     c = json.loads(cache.read_text())
-    assert c["gitlinks"] == ["vendor"] and len(c["sha256"]) == 64
+    rec = c["indexes"][str(idx)]
+    assert c["v"] == gg_mod.INDEX_CACHE_VERSION
+    assert rec["gitlinks"] == ["vendor"] and len(rec["sha256"]) == 64
+    def put(gitlinks, sha=rec["sha256"], v=gg_mod.INDEX_CACHE_VERSION):
+        cache.write_text(json.dumps({"v": v, "indexes": {str(idx): {"sha256": sha,
+                                                                    "gitlinks": gitlinks}}}))
     # Consistent cache: reused as is (we tamper with it to prove it).
-    cache.write_text(json.dumps({"sha256": c["sha256"], "gitlinks": ["from-cache"]}))
-    assert gg_mod.index_gitlinks(tmp_path / "index", cache) == ["from-cache"]
+    put(["from-cache"])
+    assert gg_mod.index_gitlinks(idx, cache) == ["from-cache"]
+    # Version 1 (flat, no name check) is ignored, even with the right sha256.
+    cache.write_text(json.dumps({"sha256": rec["sha256"], "gitlinks": ["v1"]}))
+    assert gg_mod.index_gitlinks(idx, cache) == ["vendor"]
+    put(["old"], v=1)
+    assert gg_mod.index_gitlinks(idx, cache) == ["vendor"]
     # Modified index: the cache no longer matches, re-parsed and rewritten.
     idx.write_bytes(_index_v2([(0o100644, b"f"), (0o160000, b"other")]))
-    assert gg_mod.index_gitlinks(tmp_path / "index", cache) == ["other"]
-    assert json.loads(cache.read_text())["gitlinks"] == ["other"]
+    assert gg_mod.index_gitlinks(idx, cache) == ["other"]
+    rec = json.loads(cache.read_text())["indexes"][str(idx)]
+    assert rec["gitlinks"] == ["other"]
+    # A second index file gets its own record, the first one is kept.
+    idx2 = tmp_path / "sub" / "index"
+    idx2.parent.mkdir()
+    idx2.write_bytes(_index_v2([(0o160000, b"nested")]))
+    assert gg_mod.index_gitlinks(idx2, cache) == ["nested"]
+    assert set(json.loads(cache.read_text())["indexes"]) == {str(idx), str(idx2)}
     # Corrupt or malformed cache: ignored.
-    for bad in ("{", "[]", json.dumps({"sha256": "x", "gitlinks": ["a"]}),
-                json.dumps({"sha256": json.loads(cache.read_text())["sha256"], "gitlinks": "a"})):
+    for bad in ("{", "[]", json.dumps({"v": 2, "indexes": []}),
+                json.dumps({"v": 2, "indexes": {str(idx): {"sha256": "x", "gitlinks": ["a"]}}}),
+                json.dumps({"v": 2, "indexes": {str(idx): {"sha256": rec["sha256"],
+                                                           "gitlinks": "a"}}})):
         cache.write_text(bad)
-        assert gg_mod.index_gitlinks(tmp_path / "index", cache) == ["other"]
+        assert gg_mod.index_gitlinks(idx, cache) == ["other"]
     # Parser refusal: nothing is written.
     cache.unlink()
     forged = bytearray(_index_v2([(0o160000, b"vendor")]))
     forged[72:74] = (3).to_bytes(2, "big")          # namelen 3 != real NUL at 6
     idx.write_bytes(bytes(forged))
     with pytest.raises(Refuse):
-        gg_mod.index_gitlinks(tmp_path / "index", cache)
+        gg_mod.index_gitlinks(idx, cache)
+    assert not cache.exists()
+    # Forged name: refused, nothing cached. [55]
+    idx.write_bytes(_index_v2([(0o100644, b".git/hooks/post-checkout")]))
+    with pytest.raises(Refuse, match="forged git index"):
+        gg_mod.index_gitlinks(idx, cache)
     assert not cache.exists()
     # Missing state directory: no error, correct result.
     idx.write_bytes(_index_v2([(0o160000, b"v")]))

@@ -35,7 +35,11 @@ files, 6 285 directories, ~10 MB index. N = 10.
 
 Index cache invalidated (`<key>.idx` removed, i.e. right after a command
 that rewrote the 10 MB index): check at 80–90 ms instead of 45 ms, once;
-the next command is back to 45 ms.
+the next command is back to 45 ms. Since [55] the same parse also checks
+every entry name (port of git's verify_path): +30 ms on 96k synthetic
+kernel-like names (ten substring scans of the 2.6 MB joined names, the
+full port only on the names they flag), so ~110–120 ms once after an
+index rewrite, cached afterwards.
 
 ## Small repository (gitguard itself)
 
@@ -74,6 +78,7 @@ interpreter's startup is most of it, Linux starts it twice as fast.
 | gitguard's own work on a small repository             | ~13 ms          |
 | extra on the kernel (gitdir hashing, `.idx` read)     | ~4 ms           |
 | index re-parse when the index changed (10 MB, cached) | +40 ms, once    |
+| entry-name check on that re-parse (verify_path, [55])  | +30 ms, once    |
 | config parser (port of git's config.c), 17 KB config  | ~2 ms           |
 
 Conclusions:

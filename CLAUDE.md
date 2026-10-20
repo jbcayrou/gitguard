@@ -211,6 +211,21 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
      declare it in `.gitmodules`, `git submodule absorbgitdirs` (gitfile under
      `.git/modules/`), `trust`; otherwise delete `<dir>/.git` **before** `git
      rm --cached <dir>`.
+   - **Index entry names** (`forged_entry`, `verify_path`, run by the index
+     parser on every index of the repository: its own, `modules/<x>/index`,
+     `worktrees/<x>/index` — `check_indexes`): git validates a name when it
+     reads a tree into the index, never when it writes a file from the
+     index, so a forged `.git/index` entry `.git/hooks/post-checkout`,
+     `./.git/…`, `x/../.git/…`, `../x` or `/abs/x` is written as is by
+     `checkout -- .`, `restore --worktree`, `checkout-index`, and the hook
+     runs in the same command ([55]). `verify_path` is a port of git's, with
+     `core.protectHFS` and `core.protectNTFS` both on whatever the platform
+     (git refuses the same names at `add`, so a legitimate index never holds
+     them), checked name by name against `git update-index --cacheinfo`
+     (`test_verify_path_matches_git`). Cost: ten substring scans over the
+     joined names, ~30 ms once on a 96k-entry index, then cached. The way
+     out named by the refusal: delete the index, `git reset` rebuilds it
+     from the commits, which git validates.
    - `check_rebase_todo`: no `exec`/`x` line in `rebase-merge/git-rebase-todo`,
      `rebase-apply/git-rebase-todo` or `sequencer/todo` — these files live in
      volatile directories (git rewrites them at every step, they cannot be
@@ -421,8 +436,11 @@ sha256 of the root's absolute path:
 <key>           reference manifest
 <key>.d/        backup of the watched files (.root, local/…, common/…, wt/…, ext/…,
                 global/… — the last one only for the diff, never restored)
-<key>.idx       cache of the index gitlinks (sha256 of the file + list), rewritten
-                by any check when the index changes; never a source of trust
+<key>.idx       cache of the index parse: version, then one record per index file
+                of the repository (its own, modules/<x>, worktrees/<x>: sha256 of the
+                file + gitlinks), rewritten by any check when an index changes; a
+                record only exists for an index whose names passed verify_path [55],
+                an older version is ignored; never a source of trust
 <key>.pending   a refusal nobody read (exec mode, no controlling terminal): kind
                 (changed/never/structural), message, the state seen (changed),
                 the waiting pids and their calling processes; read by `pending`

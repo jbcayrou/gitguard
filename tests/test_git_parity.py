@@ -755,3 +755,138 @@ def test_env_index_file_gitlinks_match_ls_files(gg: GG, repo: Path, form: str) -
         assert index_gitlinks(rp.index) == ["vendor"]
     finally:
         del os.environ["GIT_INDEX_FILE"]
+
+
+# ============ 9. index entry names git writes without validating them [55]
+from tests.attacks._helpers import INDEX_ESCAPES, add_submodule, forge_index  # noqa: E402
+
+CHECKOUT_FROM_INDEX = [["checkout", "--", "."], ["restore", "--worktree", "--", "."],
+                       ["checkout-index", "-a", "-f"]]
+
+
+def _case_insensitive(p: Path) -> bool:
+    return (p / ".GIT").exists()
+
+
+@pytest.mark.parametrize("cmd", CHECKOUT_FROM_INDEX, ids=lambda c: c[0])
+@pytest.mark.parametrize("variant", sorted(INDEX_ESCAPES))
+def test_forged_index_name_is_written_by_git(gg: GG, repo: Path, variant: str, cmd) -> None:
+    """Oracle for the [55] attacks: git does write these names from a forged
+    index (while it refuses them from a tree, see below). If a git version
+    starts validating them, this test fails and [55] can be closed by git."""
+    name, lands = INDEX_ESCAPES[variant]
+    if variant == "dotgit_case" and not _case_insensitive(repo):
+        pytest.skip("`.GIT` is another directory on a case-sensitive filesystem")
+    target = (repo / lands).resolve()
+    forge_index(gg, repo, [(0o100644, b"MARKER\n", name)])
+    assert not target.exists()
+    gg.git(*cmd, cwd=repo)
+    assert target.is_file() and target.read_bytes() == b"MARKER\n", f"{variant}: not written"
+
+
+@pytest.mark.parametrize("cmd", CHECKOUT_FROM_INDEX, ids=lambda c: c[0])
+def test_forged_index_absolute_name_is_written_by_git(gg: GG, repo: Path, tmp_path: Path,
+                                                      cmd) -> None:
+    """Oracle for attack_index_absolute_name: an absolute name is written at
+    that very path, anywhere on the disk. (Through a symlinked component —
+    macOS `/var` → `/private/var` — git tries to unlink it instead.)"""
+    target = tmp_path.resolve() / "abs-escaped"
+    forge_index(gg, repo, [(0o100644, b"MARKER\n", str(target).encode())])
+    gg.git(*cmd, cwd=repo)
+    assert target.read_bytes() == b"MARKER\n"
+
+
+def test_forged_tree_name_is_refused_by_git(gg: GG, repo: Path) -> None:
+    """Control: the same name in a commit's tree is refused by git
+    (verify_path) for every checkout, `restore --source` included — the
+    vector is the index, not the objects."""
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, env=gg.env,
+                          input=b"MARKER\n", capture_output=True, check=True).stdout.decode().strip()
+    sub = blob
+    for comp, mode in ((b"post-checkout", b"100644"), (b"hooks", b"40000")):
+        raw = mode + b" " + comp + b"\0" + bytes.fromhex(sub)
+        sub = subprocess.run(["git", "hash-object", "-t", "tree", "-w", "--literally", "--stdin"],
+                             cwd=repo, env=gg.env, input=raw, capture_output=True,
+                             check=True).stdout.decode().strip()
+    f = gg.git("rev-parse", "HEAD:f", cwd=repo).out.strip()
+    raw = b"40000 .git\0" + bytes.fromhex(sub) + b"100644 f\0" + bytes.fromhex(f)
+    tree = subprocess.run(["git", "hash-object", "-t", "tree", "-w", "--literally", "--stdin"],
+                          cwd=repo, env=gg.env, input=raw, capture_output=True,
+                          check=True).stdout.decode().strip()
+    c = gg.git("commit-tree", tree, "-p", "HEAD", "-m", "x", cwd=repo).out.strip()
+    for cmd in (["restore", f"--source={c}", "--worktree", "--", "."], ["checkout", c, "--", "."],
+                ["checkout", c], ["reset", "--hard", c], ["read-tree", "-u", "-m", c]):
+        gg.git(*cmd, cwd=repo)
+        assert not (repo / ".git/hooks/post-checkout").exists(), cmd
+
+
+def test_forged_submodule_index_writes_into_superproject(gg: GG, repo: Path,
+                                                         tmp_path: Path) -> None:
+    """Oracle for attack_index_submodule_escape: `checkout -- .` in a
+    submodule (what `submodule foreach`, an unwrapped git, runs) writes a
+    `../.git/hooks/…` name of its index into the superproject's hooks."""
+    sub = add_submodule(gg, repo, tmp_path)
+    forge_index(gg, sub, [(0o100644, b"MARKER\n", b"../.git/hooks/post-checkout")],
+                gitdir=repo / ".git/modules/sub")
+    gg.git("checkout", "--", ".", cwd=sub)
+    assert (repo / ".git/hooks/post-checkout").read_bytes() == b"MARKER\n"
+
+
+@pytest.mark.parametrize("cmd", CHECKOUT_FROM_INDEX[:2], ids=lambda c: c[0])
+def test_forged_index_hook_runs_through_wrapper(gg: GG, repo: Path, tmp_path: Path, cmd) -> None:
+    """End to end: one write into `.git/index` (volatile, outside the
+    fingerprint), then the user's wrapped `checkout -- .` wrote the hook and
+    ran it in the same command. gitguard refuses before git starts, and the
+    way out it names (`rm` the index, `git reset`) brings the repository back."""
+    mark = tmp_path / "PWNED"
+    forge_index(gg, repo, [(0o100755, f"#!/bin/sh\ntouch {mark}\n".encode(),
+                            b".git/hooks/post-checkout")])
+    r = gg.run("git", *cmd, cwd=repo)
+    assert not mark.exists(), "the forged hook ran"
+    assert r.blocked and not (repo / ".git/hooks/post-checkout").exists(), r.text
+    assert "forged git index" in r.err and "git reset -q" in r.err, r.err
+    (repo / ".git/index").unlink()
+    assert not gg.run("git", "reset", "-q", cwd=repo).blocked
+    assert not gg.run("git", *cmd, cwd=repo).blocked
+    assert not mark.exists() and gg.git("status", "--porcelain", cwd=repo).out == ""
+
+
+# verify_path as git applies it (`update-index --cacheinfo` calls it), with
+# both protections on — the names a legitimate index can never hold. [55]
+VERIFY_PATH_NAMES = [
+    b"f", b"d/f", b".git", b".GIT", b".Git/x", b"x/.git", b"x/.git/y", b".git/hooks/a",
+    b"./x", b"x/./y", b"x/.", b"../x", b"x/../y", b"x/..", b"..", b".", b"x//y", b"//x",
+    b"/x", b"x/", b".gitx", b".git~", b".git-x", b"git~1", b"GIT~1/x", b"git~2", b"x/git~1",
+    b".git ", b".git.", b".git. .", b".git :x", b".git:x", b".git\\x", b"x\\.git", b"x\\.git\\y",
+    b"\\.git", b"x\\git~1", b".g\xe2\x80\x8cit", b"\xe2\x80\x8c.git", b".git\xe2\x80\x8c",
+    b".\xef\xbb\xbfgit/x", b".gi\xe2\x80\x8et/x", b".git\xff", b".gi\xff", b"\xff.git",
+    b".gitmodules", b".gitmodules ", b".gitmodules.", b".gitmodules:x", b"x/.gitmodules",
+    b".GITMODULES", b"gitmod~1", b"GITMOD~4", b"gitmod~5", b"gi7eba~1", b"gi7eba~9",
+    b"gi7eb~12", b".gitmodules/x", b".g\xe2\x80\x8citmodules", b"x\\.gitmodules",
+    b"..x", b"...", b"x..", b"x.", b".github/x", b".gitignore", b"a.git/x", b"x.git",
+    b".g/x", b"\xc3\xa9/.git", b" .git", b"x/ .git", b".git/", b"x/.git/",
+    b".git /x", b".git./x", b"git~1/x", b"git~1 /x", b"x\\.git /y", b"x\\git~1\\y",
+    b".git::$INDEX_ALLOCATION", b"git~1:x", b".gitmodules /x", b"gitmod~1:x",
+]
+
+
+@pytest.mark.parametrize("mode", [0o100644, 0o120000], ids=["file", "symlink"])
+def test_verify_path_matches_git(gg: GG, tmp_path: Path, mode: int) -> None:
+    """Every name: gitguard refuses exactly what git's verify_path refuses
+    (a name git refuses but gitguard accepts is a [55] bypass; the reverse,
+    a false positive)."""
+    blob = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+    o = tmp_path / "o"
+    assert gg.git("init", "-q", str(o)).rc == 0
+    diffs = []
+    for i, name in enumerate(VERIFY_PATH_NAMES):
+        env = dict(gg.env, GIT_INDEX_FILE=str(tmp_path / f"idx{i}"))
+        r = subprocess.run([b"git", b"-c", b"core.protectHFS=true", b"-c", b"core.protectNTFS=true",
+                            b"update-index", b"--add", b"--cacheinfo",
+                            b"%o,%s,%s" % (mode, blob.encode(), name)],
+                           cwd=o, env=env, capture_output=True)
+        git_ok = r.returncode == 0
+        assert git_ok or b"nvalid path" in r.stderr, (name, r.stderr)   # the oracle is verify_path
+        if git_ok != gg_mod.verify_path(name, mode):
+            diffs.append((name, "git accepts" if git_ok else "git refuses", r.stderr[:80]))
+    assert not diffs, diffs

@@ -79,8 +79,9 @@ That silence is the signal.
 Every later `git` invocation is checked against that fingerprint first. Any
 deviation, structural anomaly (symlinked `.git`, bare gitdir planted in a
 subdirectory, undeclared nested repository, `exec` lines injected into a
-rebase todo, control characters in names…) or unknown repository → git is
-not run. The config is parsed by a port of git's own parser, never by
+rebase todo, an index entry whose name escapes the work tree — `.git/hooks/x`,
+`../x`, which `checkout -- .` and `restore` would write as is —, control
+characters in names…) or unknown repository → git is not run. The config is parsed by a port of git's own parser, never by
 calling `git config`: git would honour the config being judged.
 
 The fingerprint lives in `~/.local/state/gitguard/`, outside any mounted

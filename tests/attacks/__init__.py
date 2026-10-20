@@ -187,6 +187,26 @@ gitguard.py refer to this list (how the project reviews itself: CLAUDE.md,
      directories in one run (the cwd during discovery, the root after).
      GIT_OBJECT_DIRECTORY was already honoured in discovery; objects run
      nothing and are volatile, nothing else to read there.
+[55] Index entry names that escape the work tree. git validates a path
+     (verify_path) when it reads a tree into the index, not when it writes a
+     file from the index: `checkout -- .`, `restore --worktree` and
+     `checkout-index` write a forged `.git/index` entry as is. Names
+     `.git/hooks/post-checkout` (any case on a case-insensitive filesystem),
+     `./.git/…`, `x/../.git/…`, `x//../.git/…` land in the gitdir; `../x`
+     outside the repository; an absolute name at that very path. The index
+     is volatile, the hook is written after the check, and `post-checkout`
+     runs in the same command: one write into `.git/index`, no
+     core.hooksPath needed. A submodule's index reaches the superproject's
+     hooks through an unwrapped `submodule foreach`. The same names in a
+     commit's tree are refused by git: the vector is the index. Reported by
+     a reviewer, replayed against git 2.50 and 2.47 (oracles:
+     test_git_parity.py, section 9). Fix: a port of verify_path (protectHFS
+     and protectNTFS on, checked name by name against `update-index` as the
+     oracle) run by the index parser on every entry of every index of the
+     repository (its own, `modules/<x>/`, `worktrees/<x>/`); the `.idx`
+     cache is versioned so that a record written before the check vouches
+     for nothing. The refusal names the way out: delete the index, `git
+     reset` rebuilds it from the commits, which git validates.
 """
 from __future__ import annotations
 
