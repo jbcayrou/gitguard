@@ -305,7 +305,7 @@ works); refusals and diagnostics go to stderr.
 
 | Variable | Effect |
 |---|---|
-| `GITGUARD_STATE` | State directory (default `~/.local/state/gitguard`). |
+| `GITGUARD_STATE` | State directory (default `$XDG_STATE_HOME/gitguard`, i.e. `~/.local/state/gitguard`). Never inside a mounted volume. |
 | `GITGUARD_REAL_GIT` | Path to the real git (default: a `git.real` next to gitguard, else the first `git` in the PATH that is not gitguard itself). Changing the real git changes its system config, hence the fingerprint: one `trust`. |
 | `GITGUARD_ALLOW_REBASE_EXEC=1` | Allow `exec` lines in rebase todo files. |
 | `GITGUARD_NO_PROMPT=1` | Never ask on the terminal; refuse directly. |

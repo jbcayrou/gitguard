@@ -482,3 +482,22 @@ def test_wait_seconds(monkeypatch) -> None:
     monkeypatch.setenv("GITGUARD_WAIT", "soon")
     with pytest.raises(Refuse):
         gg_mod.wait_seconds()
+
+
+# ------------------------------------------------------------- state directory
+def test_state_dir_order(monkeypatch, tmp_path: Path) -> None:
+    """GITGUARD_STATE, else an absolute XDG_STATE_HOME, else ~/.local/state;
+    a relative XDG_STATE_HOME is invalid per the spec and ignored."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("GITGUARD_STATE", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    assert gg_mod.state_dir() == tmp_path / ".local/state/gitguard"
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    assert gg_mod.state_dir() == tmp_path / "xdg/gitguard"
+    monkeypatch.setenv("XDG_STATE_HOME", "relative/state")
+    assert gg_mod.state_dir() == tmp_path / ".local/state/gitguard"
+    monkeypatch.setenv("XDG_STATE_HOME", "")
+    assert gg_mod.state_dir() == tmp_path / ".local/state/gitguard"
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("GITGUARD_STATE", str(tmp_path / "explicit"))
+    assert gg_mod.state_dir() == tmp_path / "explicit"

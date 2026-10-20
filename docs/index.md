@@ -254,7 +254,7 @@ When your editor ran git, not you
 
 | Variable | Effect |
 |---|---|
-| `GITGUARD_STATE` | State directory. Default `~/.local/state/gitguard`, outside any mounted volume. Never move it into `.git`. |
+| `GITGUARD_STATE` | State directory. Default `$XDG_STATE_HOME/gitguard`, i.e. `~/.local/state/gitguard`, outside any mounted volume. Never move it into `.git`. |
 | `GITGUARD_REAL_GIT` | Path to the real git. Default: a `git.real` next to gitguard, else the first `git` in the `PATH` that is not gitguard itself. |
 | `GITGUARD_ALLOW_REBASE_EXEC=1` | Allow `exec` lines in rebase todo files, for people who use `rebase --exec`. |
 | `GITGUARD_NO_PROMPT=1` | Never ask on the terminal. Refuse directly. |

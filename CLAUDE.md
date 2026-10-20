@@ -124,7 +124,9 @@ took the refusal for an old git.
 
 ### Environment variables
 
-`GITGUARD_STATE` (state directory), `GITGUARD_REAL_GIT`,
+`GITGUARD_STATE` (state directory; else `$XDG_STATE_HOME/gitguard` when that
+variable is absolute, as the spec requires, else `~/.local/state/gitguard`),
+`GITGUARD_REAL_GIT`,
 `GITGUARD_ALLOW_REBASE_EXEC`, `GITGUARD_NO_PROMPT` (never ask on the
 terminal, refuse directly), `GITGUARD_WAIT` (seconds a git without a
 controlling terminal waits for `gitguard pending`, default 60, 0 = never),
@@ -374,7 +376,8 @@ never restored).
 
 ## Storage
 
-`~/.local/state/gitguard/` (mode 700), key = first 16 hex digits of the
+`$XDG_STATE_HOME/gitguard/`, i.e. `~/.local/state/gitguard/` (mode 700;
+XDG's home for per-machine, non-portable state), key = first 16 hex digits of the
 sha256 of the root's absolute path:
 
 ```
