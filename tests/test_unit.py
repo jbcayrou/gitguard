@@ -273,7 +273,7 @@ def _index_v2(entries: list[tuple[int, bytes]]) -> bytes:
 ])
 def test_index_gitlinks_minimal_index(tmp_path: Path, entries, expected) -> None:
     (tmp_path / "index").write_bytes(_index_v2(entries))
-    assert gg_mod.index_gitlinks(tmp_path) == expected
+    assert gg_mod.index_gitlinks(tmp_path / "index") == expected
 
 
 def test_index_gitlinks_cache(tmp_path: Path) -> None:
@@ -285,32 +285,32 @@ def test_index_gitlinks_cache(tmp_path: Path) -> None:
     cache = tmp_path / "state" / "k.idx"
     cache.parent.mkdir()
     idx.write_bytes(_index_v2([(0o100644, b"f"), (0o160000, b"vendor")]))
-    assert gg_mod.index_gitlinks(tmp_path, cache) == ["vendor"]
+    assert gg_mod.index_gitlinks(tmp_path / "index", cache) == ["vendor"]
     c = json.loads(cache.read_text())
     assert c["gitlinks"] == ["vendor"] and len(c["sha256"]) == 64
     # Consistent cache: reused as is (we tamper with it to prove it).
     cache.write_text(json.dumps({"sha256": c["sha256"], "gitlinks": ["from-cache"]}))
-    assert gg_mod.index_gitlinks(tmp_path, cache) == ["from-cache"]
+    assert gg_mod.index_gitlinks(tmp_path / "index", cache) == ["from-cache"]
     # Modified index: the cache no longer matches, re-parsed and rewritten.
     idx.write_bytes(_index_v2([(0o100644, b"f"), (0o160000, b"other")]))
-    assert gg_mod.index_gitlinks(tmp_path, cache) == ["other"]
+    assert gg_mod.index_gitlinks(tmp_path / "index", cache) == ["other"]
     assert json.loads(cache.read_text())["gitlinks"] == ["other"]
     # Corrupt or malformed cache: ignored.
     for bad in ("{", "[]", json.dumps({"sha256": "x", "gitlinks": ["a"]}),
                 json.dumps({"sha256": json.loads(cache.read_text())["sha256"], "gitlinks": "a"})):
         cache.write_text(bad)
-        assert gg_mod.index_gitlinks(tmp_path, cache) == ["other"]
+        assert gg_mod.index_gitlinks(tmp_path / "index", cache) == ["other"]
     # Parser refusal: nothing is written.
     cache.unlink()
     forged = bytearray(_index_v2([(0o160000, b"vendor")]))
     forged[72:74] = (3).to_bytes(2, "big")          # namelen 3 != real NUL at 6
     idx.write_bytes(bytes(forged))
     with pytest.raises(Refuse):
-        gg_mod.index_gitlinks(tmp_path, cache)
+        gg_mod.index_gitlinks(tmp_path / "index", cache)
     assert not cache.exists()
     # Missing state directory: no error, correct result.
     idx.write_bytes(_index_v2([(0o160000, b"v")]))
-    assert gg_mod.index_gitlinks(tmp_path, tmp_path / "nope" / "k.idx") == ["v"]
+    assert gg_mod.index_gitlinks(tmp_path / "index", tmp_path / "nope" / "k.idx") == ["v"]
 
 
 # ------------------------------------------------------- branch_tracking_only

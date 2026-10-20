@@ -134,6 +134,20 @@ controlling terminal waits for `gitguard pending`, default 60, 0 = never),
 traceback of an internal error, otherwise a neutralized message and exit 1,
 git not run), `NO_COLOR`.
 
+Git's own repository-local variables are honoured as git honours them,
+because each one moves a file gitguard reads: `GIT_DIR`/`GIT_WORK_TREE`
+([28]), `GIT_COMMON_DIR` (the common dir in discovery and once open, the
+`commondir` file ignored; absolute only, a relative value is refused — git
+reads it against the cwd during discovery and against the root afterwards,
+two directories in one run) and `GIT_INDEX_FILE` (the index whose gitlinks
+are read; relative to the work tree root git chdirs to, `Repo.index`)
+([54]), `GIT_OBJECT_DIRECTORY` (discovery only: objects are volatile and run
+nothing, `GIT_ALTERNATE_OBJECT_DIRECTORIES` likewise needs nothing),
+`GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`,
+`GIT_CONFIG_*` ([48]), `GIT_TEMPLATE_DIR` ([42]). The sandbox cannot set
+them; a script or a tool of the user can, with a value naming a path of the
+volume.
+
 After an upgrade that changes what the fingerprint contains (`FORMAT_VERSION`):
 entries are reported as "legacy", `gitguard retrust` re-validates them.
 
@@ -160,7 +174,9 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    gitguard refuse on a repository git would not have opened (parity
    tests; the mount checked on the VM). With `--git-dir`/`GIT_DIR`, the checked tree is
    `--work-tree`/`GIT_WORK_TREE`, else `core.worktree`, else the cwd ([28]).
-   Without them, a `core.worktree` in the config (common `config`, then
+   `GIT_COMMON_DIR` enters the recognition as it enters git's: `objects`
+   and `refs` are looked up there, so a lone `HEAD` makes any directory a
+   gitdir — refused as bare ([54]). Without them, a `core.worktree` in the config (common `config`, then
    `config.worktree` if `extensions.worktreeConfig`) redirects the tree as
    git does ([47]); the state key, `.root` and the messages stay on the
    directory holding `.git` (`Repo.anchor`, `Repo.label`): a `core.worktree`
@@ -168,7 +184,9 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    not a "never trusted" repository.
 2. **`open_repo`** (`read_gitfile`): `.git` must not be a symlink; if it
    is a `gitdir:` file, the target must not be *inside* the work tree
-   (legitimate worktrees and submodules point outside). The gitfile and
+   (legitimate worktrees and submodules point outside). The common dir is
+   `GIT_COMMON_DIR` when set (`env_common_dir`, [54]), else what
+   `commondir` names, else the gitdir. The gitfile and
    `commondir` are read as git reads them (`_read_path_file`): bytes, every
    trailing CR/LF trimmed and nothing else, `gitdir: ` at byte 0, then a
    strict resolve (an OS walk, not a lexical `x/..`). A blank, a lone CR or a
@@ -708,7 +726,7 @@ Rule: any new vector or false positive discovered must first become a test.
 ## Adversarial review playbook
 
 gitguard has been through nine adversarial review passes (the numbered
-catalogue in `tests/attacks/__init__.py` is their output: 50 bypasses and
+catalogue in `tests/attacks/__init__.py` is their output: 54 bypasses and
 false positives, two of them RCEs found after the tool was believed solid;
 [44] is still open, see "Known limitations"; the ninth pass was the
 promotion of the git-parity `xfail`s [46]–[50]).
@@ -838,7 +856,13 @@ content; fail closed on anything the parser cannot make sense of.
   the place for a future open attack that fits the corpus.
 - A `-c`/`--config-env` given to a git that gitguard did not wrap (hook,
   alias, IDE) is invisible; the one of the wrapped command and the
-  environment are read ([48]).
+  environment are read ([48]). Same for the repository-local variables
+  (`GIT_COMMON_DIR`, `GIT_INDEX_FILE`…): read from gitguard's own
+  environment, which is the wrapped git's ([54]). Program-naming variables
+  (`GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GIT_EDITOR`, `GIT_PAGER`,
+  `GIT_EXTERNAL_DIFF`, `GIT_SEQUENCE_EDITOR`, `GIT_EXEC_PATH`) are not
+  read: a value naming a script of the volume is the same class as a
+  `PATH` directory in it (above), not fingerprinted.
 - gitguard.py has no dependency outside the stdlib (diff via `difflib`); the
   tests need `pytest` and `git`.
 - A context without a terminal and without a desktop session (ssh, cron,

@@ -170,6 +170,23 @@ gitguard.py refer to this list (how the project reviews itself: CLAUDE.md,
      gitdir": git truncates at it and opens the directory, and a planted
      bare gitdir walked past is [23]. The todo files were checked against git 2.47
      and 2.50 and need nothing: whenever git runs an `exec`, gitguard refuses.
+[54] Repository-local variables of the environment that move git's files:
+     GIT_COMMON_DIR replaces the common dir in every case — during
+     discovery (is_git_directory looks for objects/ and refs/ there: any
+     directory with a valid HEAD becomes a gitdir) and once open (config,
+     hooks/, info/, objects/, worktrees/ come from it, the `commondir` file
+     is ignored); GIT_INDEX_FILE replaces the index, hence the gitlinks.
+     gitguard read the gitdir's own files and fingerprinted a repository
+     git was not using: a hook or a config in a directory of the volume, a
+     forged index whose gitlink names a nested trapped repository. The
+     sandbox cannot set the variables; a script, a Makefile or a tool of the
+     user can, and the value may name a path of the volume. Reported by a
+     reviewer. Fix: honour both as git does (an absolute GIT_INDEX_FILE, or
+     one relative to the work tree root git chdirs to); a relative
+     GIT_COMMON_DIR is refused — git itself reads it against two different
+     directories in one run (the cwd during discovery, the root after).
+     GIT_OBJECT_DIRECTORY was already honoured in discovery; objects run
+     nothing and are volatile, nothing else to read there.
 """
 from __future__ import annotations
 

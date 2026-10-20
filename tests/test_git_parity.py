@@ -511,7 +511,7 @@ def test_index_gitlinks_match_ls_files(gg: GG, repo: Path, version: int, skiphas
     assert gg.git(*pre, "update-index", "--index-version", str(version), cwd=repo).rc == 0
     want = _git_gitlinks(gg, repo)
     assert len(want) == len(paths)
-    assert sorted(index_gitlinks(repo / ".git")) == want
+    assert sorted(index_gitlinks(repo / ".git/index")) == want
 
 
 # ======================== 7. system/global config files that git reads
@@ -638,3 +638,120 @@ def test_ceiling_entries_are_resolved_unless_after_an_empty_one(gg: GG, repo: Pa
     assert g.git("rev-parse", cwd=sub).rc == 0
     assert g.run("git", "rev-parse", cwd=sub).blocked
 
+
+
+# ================= 8. repository-local environment variables vs git [54]
+def _git_common_dir(gg: GG, cwd: Path) -> Path | None:
+    r = gg.git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=cwd)
+    return None if r.rc else Path(r.out.strip()).resolve()
+
+
+def _gg_common_dir(cwd: Path) -> Path | None:
+    try:
+        root = gg_mod.find_root(cwd)
+        return None if root is None else gg_mod.open_repo(root).common.resolve()
+    except gg_mod.Refuse:
+        return None
+
+
+def _other_gitdir(repo: Path, tmp_path: Path) -> Path:
+    import shutil
+    other = tmp_path / "other"
+    shutil.copytree(repo / ".git", other)
+    with open(other / "config", "a") as f:
+        f.write("[x]\n\tmarker = other\n")
+    return other
+
+
+@pytest.mark.parametrize("where", ["root", "subdir", "linked_worktree"])
+def test_env_common_dir_is_the_common_dir(explicit: GG, repo: Path, tmp_path: Path,
+                                          monkeypatch, where: str) -> None:
+    """GIT_COMMON_DIR (absolute): git reads config and hooks there, in a
+    linked worktree too (its `commondir` file is ignored). gitguard must
+    parse and fingerprint that directory, not the gitdir's own files."""
+    other = _other_gitdir(repo, tmp_path)
+    if where == "linked_worktree":
+        assert explicit.git("worktree", "add", "-q", str(tmp_path / "wt"), cwd=repo).rc == 0
+        cwd = tmp_path / "wt"
+    else:
+        cwd = repo if where == "root" else repo / "a/b"
+        cwd.mkdir(parents=True, exist_ok=True)
+    explicit.env["GIT_COMMON_DIR"] = str(other)
+    monkeypatch.setenv("GIT_COMMON_DIR", str(other))
+    assert explicit.git("config", "x.marker", cwd=cwd).out.strip() == "other"   # oracle
+    want, got = _git_common_dir(explicit, cwd), _gg_common_dir(cwd)
+    assert want == other.resolve() and got == want, f"git uses {want}, gitguard {got}"
+    # And the config git honours is the one gitguard parses: a hooksPath
+    # written there into the tree is watched.
+    explicit.env.pop("GIT_COMMON_DIR")
+    explicit.trust(repo)
+    explicit.env["GIT_COMMON_DIR"] = str(other)
+    r = explicit.check(repo)
+    assert r.blocked and "common" in r.text, r.text
+
+
+def test_env_common_dir_relative_refused(explicit: GG, repo: Path, tmp_path: Path,
+                                         monkeypatch) -> None:
+    """Deliberate divergence, fail closed: git reads a relative GIT_COMMON_DIR
+    against the cwd during discovery and against the root once it has
+    chdir'ed there — `../other` from `a/b` finds no repository at all,
+    `../../other` finds it but reads an empty config. gitguard refuses the
+    relative form instead of choosing one of the two."""
+    _other_gitdir(repo, tmp_path)
+    sub = repo / "a/b"
+    sub.mkdir(parents=True)
+    for rel in ("../other", "../../other", "", "."):
+        monkeypatch.setenv("GIT_COMMON_DIR", rel)
+        with pytest.raises(gg_mod.Refuse, match="GIT_COMMON_DIR"):
+            gg_mod.open_repo(gg_mod.find_root(sub) or repo)
+        explicit.env["GIT_COMMON_DIR"] = rel
+        r = explicit.run("git", "status", cwd=sub)
+        assert r.blocked and "GIT_COMMON_DIR" in r.err, (rel, r.text)
+
+
+def test_env_common_dir_discovery_head_only(gg: GG, repo: Path, tmp_path: Path,
+                                            monkeypatch) -> None:
+    """With GIT_COMMON_DIR, is_git_directory looks for objects/ and refs/ in
+    the common dir: a directory holding a bare HEAD file is a gitdir for
+    git's discovery (without `safe.bareRepository=explicit`, which makes git
+    refuse it on its own). gitguard walked past it to the parent's .git."""
+    other = _other_gitdir(repo, tmp_path)
+    src = repo / "src"
+    src.mkdir()
+    (src / "HEAD").write_text("ref: refs/heads/main\n")
+    assert _git_view(gg, src) == (repo.resolve(), (repo / ".git").resolve())   # no env: .git
+    gg.env["GIT_COMMON_DIR"] = str(other)
+    monkeypatch.setenv("GIT_COMMON_DIR", str(other))
+    r = gg.git("rev-parse", "--absolute-git-dir", cwd=src)
+    assert r.rc == 0 and Path(r.out.strip()).resolve() == src.resolve(), r.text   # oracle
+    with pytest.raises(gg_mod.Refuse, match="bare gitdir"):
+        gg_mod.find_root(src)
+    r = gg.run("git", "status", cwd=src)
+    assert r.blocked and "bare gitdir" in r.err, r.text
+
+
+@pytest.mark.parametrize("form", ["absolute", "root_relative", "subdir_relative"])
+def test_env_index_file_gitlinks_match_ls_files(gg: GG, repo: Path, form: str) -> None:
+    """GIT_INDEX_FILE: the gitlinks git honours are those of that file. A
+    relative value is read against the work tree root git chdirs to, from
+    a subdirectory as well (`git rev-parse --git-path index` says so)."""
+    sha = gg.git("rev-parse", "HEAD", cwd=repo).out.strip()
+    (repo / "a/b").mkdir(parents=True)
+    cwd = repo / "a/b" if form == "subdir_relative" else repo
+    value = {"absolute": str(repo / "forged.idx"), "root_relative": "forged.idx",
+             "subdir_relative": "a/forged.idx"}[form]
+    gg.env["GIT_INDEX_FILE"] = value
+    r = gg.git("update-index", "--add", "--cacheinfo", f"160000,{sha},vendor", cwd=cwd)
+    assert r.rc == 0, r.text
+    expect = {"absolute": repo / "forged.idx", "root_relative": repo / "forged.idx",
+              "subdir_relative": repo / "a/forged.idx"}[form]
+    assert expect.is_file()                                        # git wrote it there
+    assert _git_gitlinks(gg, repo) == ["vendor"]                   # oracle
+    assert index_gitlinks(repo / ".git/index") == []               # the gitdir's own: none
+    os.environ["GIT_INDEX_FILE"] = value
+    try:
+        rp = gg_mod.open_repo(gg_mod.find_root(cwd))
+        assert rp.index.resolve() == expect.resolve()
+        assert index_gitlinks(rp.index) == ["vendor"]
+    finally:
+        del os.environ["GIT_INDEX_FILE"]

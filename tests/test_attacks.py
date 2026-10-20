@@ -29,6 +29,7 @@ ATTACKS = attacks.collect()
 DEFERRED = {
     "attack_nested_git_undeclared": ("add", None),
     "attack_bare_gitdir_planted_in_subdir": ("cd", "src"),
+    "attack_env_common_dir_head_planted_in_subdir": ("cd", "src"),
 }
 
 

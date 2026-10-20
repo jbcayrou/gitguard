@@ -314,3 +314,36 @@ def test_remote_of_remote_not_followed(gg: GG, repo: Path, tmp_path: Path) -> No
     gg.trust(repo)
     (far / "hooks/pre-receive").write_text("#!/bin/sh\n")
     assert not gg.check(repo).blocked
+
+
+def test_env_index_file_scratch_index(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """A script's scratch index (`GIT_INDEX_FILE=tmp git add … && git
+    write-tree`, pre-commit's stash dance): read like git reads it, no
+    alert when it holds no gitlink; the gitdir's index is untouched. [54]"""
+    (repo / "g").write_text("g\n")
+    gg.env["GIT_INDEX_FILE"] = str(tmp_path / "scratch.idx")
+    assert gg.git("read-tree", "HEAD", cwd=repo).rc == 0
+    assert gg.git("add", "g", cwd=repo).rc == 0
+    assert gg.git("write-tree", cwd=repo).rc == 0
+    assert not gg.check(repo).blocked
+    assert not gg.run("git", "status", cwd=repo).blocked
+    gg.env["GIT_INDEX_FILE"] = "scratch-in-tree.idx"               # relative to the root
+    assert gg.git("add", "g", cwd=repo).rc == 0
+    assert not gg.check(repo).blocked
+    del gg.env["GIT_INDEX_FILE"]
+    assert not gg.check(repo).blocked
+
+
+def test_env_common_dir_own_gitdir(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """GIT_COMMON_DIR naming the repository's own gitdir, or the main
+    repository from its linked worktree: the same files, no alert. [54]"""
+    gg.env["GIT_COMMON_DIR"] = str(repo / ".git")
+    assert not gg.check(repo).blocked
+    assert not gg.run("git", "status", cwd=repo).blocked
+    del gg.env["GIT_COMMON_DIR"]
+    assert gg.git("worktree", "add", "-q", str(tmp_path / "wt"), cwd=repo).rc == 0
+    gg.trust(tmp_path / "wt")                      # a linked worktree has its own key
+    assert not gg.check(tmp_path / "wt").blocked
+    gg.env["GIT_COMMON_DIR"] = str(repo / ".git")  # what its commondir file already says
+    assert not gg.check(tmp_path / "wt").blocked
+    assert not gg.run("git", "status", cwd=tmp_path / "wt").blocked

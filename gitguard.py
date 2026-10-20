@@ -484,13 +484,23 @@ class Repo:
         """How the repository is named to the user: the directory holding `.git`."""
         return self.anchor or self.root
 
+    @property
+    def index(self) -> Path:
+        """The index git reads: `GIT_INDEX_FILE` when set — absolute, or
+        relative to the work tree root git chdirs to before opening it (from
+        a subdirectory too: `rev-parse --git-path index` says so) — else the
+        gitdir's. The gitlinks of a scratch index in the volume were not
+        read. [54]"""
+        v = os.environ.get("GIT_INDEX_FILE")
+        return self.gitdir / "index" if v is None else self.root / v
+
     @cached_property
     def gitfiles(self) -> list[Path]:
         """Every nested `.git` to check: those declared in `.gitmodules` and
         those referenced by an index gitlink, wherever they are
         (`node_modules/pkg` included). [6] [14] [24]"""
         out = set(gitmodules_gits(self.root))
-        for rel in index_gitlinks(self.gitdir, Path(str(self.key) + ".idx")):
+        for rel in index_gitlinks(self.index, Path(str(self.key) + ".idx")):
             g = self.root / rel / ".git"
             if g.exists() or g.is_symlink():
                 out.add(g)
@@ -516,6 +526,27 @@ def _validate_headref(p: Path) -> bool:
     return re.match(rb"[0-9a-fA-F]{40}", buf) is not None
 
 
+def env_common_dir() -> Path | None:
+    """`GIT_COMMON_DIR`: git takes it as the common dir in every case — in
+    discovery (`is_git_directory` looks for `objects` and `refs` there, so a
+    lone `HEAD` makes any directory a gitdir) and once the repository is open
+    (`config`, `hooks/`, `info/`, `objects/`, `worktrees/` come from it; the
+    `commondir` file is ignored). gitguard read the gitdir's own files and
+    fingerprinted a repository git was not using. [54]
+
+    A relative value is read by git against the cwd during discovery, then
+    against the work tree root it has chdir'ed to: `../x` from a
+    subdirectory finds no repository at all, `../../x` finds one and reads
+    an empty config. Refused rather than picking one of the two."""
+    v = os.environ.get("GIT_COMMON_DIR")
+    if v is None:
+        return None
+    if not v.startswith("/"):
+        raise Refuse(f"GIT_COMMON_DIR={v!r}: gitguard needs an absolute path (git reads a "
+                     f"relative one against two different directories in one run)")
+    return Path(v)
+
+
 def is_bare_gitdir(d: Path) -> bool:
     """git's is_git_directory, the test behind its discovery: a valid HEAD,
     then `objects` and `refs` reachable (access X_OK) in the common dir — the
@@ -525,9 +556,9 @@ def is_bare_gitdir(d: Path) -> bool:
     `HEAD` symlink and a `commondir` redirection git accepts. [49]"""
     if not _validate_headref(d / "HEAD"):
         return False
-    common = d
+    common = env_common_dir() or d
     cd = d / "commondir"
-    if cd.is_file():
+    if common == d and cd.is_file():
         try:
             common = d / _read_path_file(cd)     # a Refuse (NUL) propagates: git
         except OSError:                          # truncates and opens the dir,
@@ -552,7 +583,7 @@ def find_root(cwd: Path) -> Path | None:
         if wt:
             return Path(wt).resolve()
         gd = Path(os.environ["GIT_DIR"])
-        for section, key, value in parse_git_config(gd / "config"):
+        for section, key, value in parse_git_config((env_common_dir() or gd) / "config"):
             if section == "core" and key == "worktree":
                 return (gd / value).resolve()
         return cwd.resolve()
@@ -682,7 +713,12 @@ def open_repo(root: Path) -> Repo:
         raise Refuse(f"{g} is not a directory")
     common = g
     cd = g / "commondir"
-    if cd.is_file():
+    env = env_common_dir()
+    if env is not None:                          # the commondir file is ignored [54]
+        if not env.is_dir():
+            raise Refuse(f"GIT_COMMON_DIR names no directory: {env}")
+        common = env.resolve()
+    elif cd.is_file():
         common = _resolve_existing(g / _read_path_file(cd), cd)
         if not common.is_dir():
             raise Refuse(f"{cd} names no directory: {common}")
@@ -725,9 +761,10 @@ def gitmodules_gits(root: Path) -> list[Path]:
     return sorted(found)
 
 
-def index_gitlinks(gitdir: Path, cache: Path | None = None) -> list[str]:
-    """Paths recorded as gitlinks (mode 160000) in `.git/index`, read by
-    parsing the file — never via `git`, which would read the config we judge.
+def index_gitlinks(index: Path, cache: Path | None = None) -> list[str]:
+    """Paths recorded as gitlinks (mode 160000) in the index file (`Repo.index`:
+    `.git/index`, or `GIT_INDEX_FILE`), read by parsing it — never via `git`,
+    which would read the config we judge.
 
     This is the criterion that matters: a nested repository is only dangerous
     once a gitlink references it, and the gitlink names it wherever it is.
@@ -737,7 +774,7 @@ def index_gitlinks(gitdir: Path, cache: Path | None = None) -> list[str]:
     ~40 ms for 96k entries (Linux kernel), the hash 4 ms. A modified — or
     forged — index has another sha256 and is re-parsed; an unreadable or
     inconsistent cache is ignored. Nothing is cached when the parser refuses."""
-    p = gitdir / "index"
+    p = index
     try:
         data = p.read_bytes()
     except OSError:

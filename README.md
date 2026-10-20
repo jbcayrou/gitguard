@@ -314,12 +314,18 @@ works); refusals and diagnostics go to stderr.
 | `GITGUARD_DEBUG=1` | Full traceback on internal errors (otherwise a one-line message, exit 1, git not run). |
 | `NO_COLOR` | Disable colours. |
 
+Git's own `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
+`GIT_CEILING_DIRECTORIES` and `GIT_CONFIG_*` are read as git reads them:
+the repository checked is the one git opens. A relative `GIT_COMMON_DIR` is
+refused (git itself reads it against two different directories in one run).
+
 ## What it does not do
 
 - It only covers git invocations that resolve to the wrapper. A tool with a
   hardcoded path to the real git, or started with a `PATH` that does not
   contain the symlink, is not checked (see "You are not the only one running
-  git"). A `-c key=value` given to such a git is invisible too.
+  git"). A `-c key=value` or a `GIT_INDEX_FILE` given to such a git is
+  invisible too.
 - It cannot close the race between its check and git's execution if the
   sandbox is still writing. Stop the sandbox before running git on the host.
 - `restore` only cleans the pivot vector: objects, commits and tree files
