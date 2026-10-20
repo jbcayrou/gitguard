@@ -307,7 +307,7 @@ works); refusals and diagnostics go to stderr.
 |---|---|
 | `GITGUARD_STATE` | State directory (default `$XDG_STATE_HOME/gitguard`, i.e. `~/.local/state/gitguard`). Never inside a mounted volume. |
 | `GITGUARD_REAL_GIT` | Path to the real git (default: a `git.real` next to gitguard, else the first `git` in the PATH that is not gitguard itself). Changing the real git changes its system config, hence the fingerprint: one `trust`. |
-| `GITGUARD_ALLOW_REBASE_EXEC=1` | Allow `exec` lines in rebase todo files. |
+| `GITGUARD_ALLOW_REBASE_EXEC=1` | Allow `exec` lines in rebase todo files, and a merge strategy that is not one of git's builtins (`rebase-merge/strategy`, `sequencer/opts`). |
 | `GITGUARD_NO_PROMPT=1` | Never ask on the terminal; refuse directly. |
 | `GITGUARD_WAIT` | Seconds a git without a terminal waits for `gitguard pending` (default 60, 0 = never). |
 | `GITGUARD_NO_NOTIFY=1` | No desktop notification. |

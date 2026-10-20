@@ -65,6 +65,34 @@ def test_rebase_cherry_pick_revert(gg: GG, repo: Path) -> None:
     assert not gg.check(repo).blocked
 
 
+def test_rebase_builtin_strategy_in_progress(gg: GG, repo: Path) -> None:
+    """An interrupted rebase that recorded a builtin `strategy` (`-s resolve`)
+    must not alert: only a non-builtin name is an exec vector. [51]"""
+    import shlex, subprocess, sys
+    for i in range(3):
+        commit(gg, repo, "g", str(i))
+    editor = repo.parent / "seq-editor.py"
+    editor.write_text("import sys\np = sys.argv[1]\nl = open(p).read().split('\\n')\n"
+                      "l.insert(1, 'break')\nopen(p, 'w').write('\\n'.join(l))\n")
+    env = dict(gg.env, GIT_SEQUENCE_EDITOR=f"{shlex.quote(sys.executable)} {shlex.quote(str(editor))}")
+    subprocess.run(["git", "rebase", "-i", "-s", "resolve", "HEAD~2"], cwd=repo,
+                   env=env, capture_output=True, text=True)
+    strat = repo / ".git/rebase-merge/strategy"
+    assert strat.is_file() and strat.read_text().strip() == "resolve"
+    gg.trust(repo)
+    assert not gg.check(repo).blocked
+
+
+def test_cherry_pick_builtin_strategy_in_progress(gg: GG, repo: Path) -> None:
+    """A stopped `cherry-pick --strategy=recursive` keeps `strategy = recursive`
+    in sequencer/opts: builtin, must not alert. [51]"""
+    from tests.attacks.tool_itself import _interrupted_cherry_pick
+    opts = _interrupted_cherry_pick(gg, repo)
+    assert "strategy = recursive" in opts.read_text()
+    gg.trust(repo)
+    assert not gg.check(repo).blocked
+
+
 def test_bisect_in_progress(gg: GG, repo: Path) -> None:
     """BISECT_* present: excluded (and the glob was a bash trap)."""
     for i in range(3):

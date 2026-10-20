@@ -194,7 +194,16 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
      command word counts (`exec<TAB>…`, [35]), and the todo files of every
      nested gitdir root (`modules/<x>`, `worktrees/<x>`, `gitdir_roots`) are
      read too: `submodule foreach 'git rebase --continue'` runs an unwrapped
-     git ([36]). `GITGUARD_ALLOW_REBASE_EXEC=1` for people who run `rebase --exec`.
+     git ([36]). The same function refuses a merge strategy outside git's
+     builtins (`ort`, `recursive`, `resolve`, `octopus`, `ours`, `subtree`) in
+     `rebase-merge/strategy` and in `sequencer/opts` (`[options] strategy`,
+     cherry-pick/revert): on `--continue` git execs `git-merge-<name>` for any
+     other name — an empty one included —, skipping the validation of a plain
+     `git merge -s`, and a `/` in the name makes it relative to the cwd, a
+     script of the work tree ([51]). The value is compared as git reads it:
+     one trailing newline trimmed, read as bytes, no `strip()` (`ort<TAB>` and
+     `ort<CR>` are other names). `GITGUARD_ALLOW_REBASE_EXEC=1` for people who
+     run `rebase --exec` or a custom strategy.
    - no control character in a watched name; no symlink in the first two
      levels of the gitdir; `config` and `hooks/` (of the gitdir and of the
      commondir) belong to the user and are not world-writable; no path named
@@ -290,7 +299,8 @@ UTF-8 BOM, a `\` ending a comment line, a `\` at EOF, internal whitespace
 (`\v`, `\f`, NBSP — never use `str.strip()` on a config value), each one
 hiding a `core.hooksPath` ([46]). A line git dies on ("bad config line")
 is **refused** rather than read differently; a NUL byte too (git truncates
-the value, a C string). `~user/` is expanded like `~/` ([50]). The cost is
+the value, a C string). `~user/` is expanded like `~/` ([50]). The file is read as bytes: text mode
+turned a lone CR into a line break where git keeps it inside the value ([52]). The cost is
 ~2 ms for a 17 KB config.
 
 **Config files parsed** (not merely hashed): `config` and `config.worktree`

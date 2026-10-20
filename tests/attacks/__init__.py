@@ -137,6 +137,27 @@ gitguard.py refer to this list (how the project reviews itself: CLAUDE.md,
      recognised as planted gitdirs [23]. Fix: a port of is_git_directory.
 [50] `~user/` in a path value: git expands it (getpwnam), gitguard only
      expanded `~/`, so `core.hooksPath = ~user/vol/hooks` was never watched.
+[51] The merge strategy of an interrupted operation sits in volatile files
+     outside the fingerprint: `.git/rebase-merge/strategy` (rebase) and
+     `.git/sequencer/opts`, `[options] strategy` (cherry-pick, revert). On
+     `--continue` git execs `git-merge-<name>` for any name it does not know
+     as a builtin, skipping the "available strategies" check of a plain
+     `git merge -s <name>`. The name may contain a `/`: `git-merge-/x` is
+     relative to the cwd, i.e. a script of the work tree, no PATH access
+     needed. check_rebase_todo only read the todo `exec` lines. Fix: refuse
+     any strategy outside git's builtin set, same escape hatch as the todo
+     (GITGUARD_ALLOW_REBASE_EXEC). Found in review by a reporter; the first
+     fix compared a strip()ped value (`ort\t` passed as `ort`, git execs
+     `git-merge-ort<TAB>`), skipped an empty name (git execs `git-merge-`)
+     and missed sequencer/opts: all caught by replaying on the Debian VM.
+[52] parse_git_config read the file in text mode: Python's universal newlines
+     turned a lone CR into a line break, where git's parser sees whitespace
+     kept inside the value. `hooksPath = .githooks<CR>x = y` is one value for
+     git (a directory gitguard never watched); `strategy = ort<CR>x = /y` in
+     sequencer/opts passed the [51] check as `ort` while git execs
+     `git-merge-ort<CR>x = /y`, a script of the work tree. Found while
+     validating [51]. Fix: read bytes, the port of get_next_char already
+     handles CRLF.
 """
 from __future__ import annotations
 

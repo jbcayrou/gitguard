@@ -149,6 +149,17 @@ VOLATILE_RELPATHS = {"info/refs", "objects/info/packs", "objects/info/commit-gra
 # they cannot be part of the fingerprint since git rewrites them at every step.
 TODO_FILES = ("rebase-merge/git-rebase-todo", "rebase-apply/git-rebase-todo",
               "sequencer/todo")
+# `.git/rebase-merge/strategy` holds the merge strategy name of an interrupted
+# interactive/merge rebase. On `rebase --continue` git passes it straight to
+# the merge machinery, which, for a name it does not know as a builtin, execs
+# `git-merge-<name>` from the exec-path/PATH — without the "available strategies"
+# validation a plain `git merge -s <name>` applies. A non-fingerprintable
+# volatile file turned into a command, exactly like the todo `exec` lines, so
+# check_rebase_todo refuses any value outside git's builtin set. [51]
+STRATEGY_FILES = ("rebase-merge/strategy",)
+# cherry-pick/revert keep theirs in a config-format file, `[options] strategy`.
+SEQUENCER_OPTS = "sequencer/opts"
+BUILTIN_MERGE_STRATEGIES = {"ort", "recursive", "resolve", "octopus", "ours", "subtree"}
 OBJECT_FANOUT = re.compile(r"^[0-9a-f]{2}$")
 
 
@@ -428,9 +439,11 @@ def parse_git_config(path: Path) -> list[tuple[str, str, str]]:
     ("includeIf.gitdir:x"), key lower-cased, exactly as git reads them. Never
     via `git config`: git would honour the very config we are trying to judge.
     A NUL byte makes git truncate the value (C string): refused instead, a
-    config is never meant to contain one."""
+    config is never meant to contain one. Read as bytes: text mode would turn
+    a lone CR into a newline, where git sees whitespace inside the value
+    (`hooksPath = .githooks<CR>x = y` is one value for git). [52]"""
     try:
-        text = path.read_text(errors="surrogateescape")
+        text = path.read_bytes().decode(errors="surrogateescape")
     except OSError:
         return []
     if "\0" in text:
@@ -831,7 +844,9 @@ def check_rebase_todo(repo: Repo) -> None:
     `exec <cmd>` lines that git runs verbatim. The container can inject some
     during an in-progress rebase: refuse their presence, unless the user runs
     `--exec` rebases themselves. Also in submodules and linked worktrees:
-    `submodule foreach 'git rebase --continue'` runs an unwrapped git. [36]"""
+    `submodule foreach 'git rebase --continue'` runs an unwrapped git. [36]
+    Same for a planted merge strategy (`rebase-merge/strategy`,
+    `sequencer/opts`), which git turns into `git-merge-<name>`. [51]"""
     if os.environ.get("GITGUARD_ALLOW_REBASE_EXEC"):
         return
     roots = dict.fromkeys([*gitdir_roots(repo.gitdir), *gitdir_roots(repo.common)])
@@ -846,6 +861,39 @@ def check_rebase_todo(repo: Repo) -> None:
                     f"`exec` line in {p}: git would run it on the next "
                     f"`rebase --continue`. Check this file; if this rebase is really "
                     f"yours, retry with GITGUARD_ALLOW_REBASE_EXEC=1.")
+    for r in roots:
+        for rel in STRATEGY_FILES:
+            p = r / rel
+            if p.is_file():
+                # Exactly as git reads it (read_oneliner): only ONE trailing
+                # newline is trimmed. No strip(): `ort\t` is not `ort`, git execs
+                # `git-merge-ort<TAB>`.
+                # Bytes, not read_text(): universal newlines would turn a lone
+                # CR (`ort\r`, a different name for git) into the newline we trim.
+                name = p.read_bytes().decode(errors="surrogateescape")
+                if name.endswith("\n"):          # strbuf_trim_trailing_newline
+                    name = name[:-1]
+                    if name.endswith("\r"):
+                        name = name[:-1]
+                _check_strategy(p, name)
+        p = r / SEQUENCER_OPTS
+        if p.is_file():
+            for sect, key, value in parse_git_config(p):
+                if sect == "options" and key == "strategy":
+                    _check_strategy(p, value)
+
+
+def _check_strategy(p: Path, name: str) -> None:
+    """Refuse a merge strategy name that is not one of git's builtins: for any
+    other, git execs `git-merge-<name>` — from PATH or the exec-path, and since
+    the name may contain a `/`, relative to the cwd, i.e. a script of the work
+    tree. An empty name is no exception: git execs `git-merge-` (checked). [51]"""
+    if name not in BUILTIN_MERGE_STRATEGIES:
+        raise Refuse(
+            f"non-builtin merge strategy {name!r} in {p}: git would exec "
+            f"`git-merge-{name}` on the next `--continue`. Check "
+            f"this file; if this operation is really yours, retry with "
+            f"GITGUARD_ALLOW_REBASE_EXEC=1.")
 
 
 def check_structure(repo: Repo, refs: list[tuple[str, Path]]) -> None:

@@ -53,6 +53,10 @@ PARSER_OK = [
     ("crlf", b"[core]\r\n\thooksPath = .githooks\r\n"),
     ("crlf_continuation", b"[core]\r\n\thooksPath = \\\r\n.githooks\r\n"),
     ("cr_only", b"[core]\r\thooksPath = .githooks\r"),
+    # A lone CR inside a value is whitespace git keeps; text-mode reading made
+    # it a line break (two keys instead of one, the real path unwatched). [52]
+    ("cr_inside_value", b"[core]\n\thooksPath = .githooks\rx = y\n"),
+    ("cr_inside_value_opts", b"[options]\n\tstrategy = ort\rx = /y\n"),
     ("old_style_subsection", b"[Core.Sub]\n\tX = 1\n"),
     ("old_style_branch", b"[branch.Main]\n\tremote = o\n"),
     ("subsection_case_kept", b'[Alias "X"]\n\tY = z\n'),
