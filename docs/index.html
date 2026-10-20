@@ -176,11 +176,12 @@ From github.com:org/api
 Actions on /home/user/work/api:
   <span class="x">delete</span>    hooks/pre-commit
 <span class="w">Continue? [y/N]</span> y
-<span class="ok">✓</span> gitguard: 1 file(s) restored, /home/user/work/api matches the trusted state again</pre>
+<span class="ok">✓</span> gitguard: 1 file(s) restored, /home/user/work/api
+  matches the trusted state again</pre>
       <p class="cap" style="margin-top:1.4rem">When your editor ran git, not you</p>
 <pre class="term"><span class="p">$</span> gitguard pending
 <span class="mod">changed</span>         4s  1 waiting  /home/user/work/api
-  <span class="hint">gitguard pending &lt;repo&gt;   to see the diff and decide     -a: all</span>
+  <span class="hint">gitguard pending &lt;repo&gt;  to see the diff and decide  -a: all</span>
 <span class="p">$</span> gitguard pending ~/work/api
 /home/user/work/api  [changed, since 6s]
     git waiting (pid 41250, 6s): code[40988] ← systemd[1]
@@ -189,8 +190,8 @@ Actions on /home/user/work/api:
   <span class="add">added</span>     hooks/pre-commit
 <span class="hr">────────────────────────────────────────────────────────</span>
 <span class="w">Allow: record this state and let the waiting git run? [y/N]</span> n
-<span class="w">!</span> gitguard: refused: the waiting git is not run; the record is cleared.
-  If malicious:  gitguard restore</pre>
+<span class="w">!</span> gitguard: refused: the waiting git is not run;
+  the record is cleared. If malicious:  gitguard restore</pre>
     </div>
   </div>
 </section>
