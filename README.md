@@ -170,12 +170,9 @@ the repository changed, one of three things happens.
 `git --version` is never checked: it reads no repository, and the tools
 that run it first (lazygit, fugitive) took a refusal for an old git.
 
-**Branch tracking is accepted on its own.** If the only change is
-`branch.<x>.remote` / `branch.<x>.merge` lines in `.git/config` pointing at
-a remote already known, which is what `push -u`, `branch -u` and
-`checkout -b` write, or the `branch.<x>.vscode-merge-base` line VS Code
-writes when it opens a repository, gitguard re-trusts, prints one line and
-runs git. This is a closed list of three harmless keys, not a blocklist.
+**Auto-accept: the change is one git or your editor made itself.**
+gitguard re-trusts on its own, prints one line and runs git. See the next
+subsection for the exact rule.
 
 **Anything else is shown and asked on the terminal.** A new remote, a hook,
 an `include.path`: the diff is printed, then
@@ -222,6 +219,36 @@ without `gitguard trust` after inspection.
 
 `gitguard trust` on a changed repository shows the same diff and asks the
 same way; in a script it prints the diff and records.
+
+### Auto-accept
+
+Not to be confused with **auto-trust**, which blesses a *new* repository
+after a `clone` or `init` made through the wrapper. Auto-accept applies to
+a repository already trusted that now differs from its reference, and
+accepts the difference without asking when it is one of the few things git
+and your editor write into `.git/config` by themselves in the course of a
+normal day. The point is to keep the `[y/N]` question for the rare changes
+you will actually read (`remote add`, a hook, an `include.path`), instead
+of training a reflex `y`.
+
+The rule: the only file that changed is `.git/config` (or the main
+repository's config, when working from a linked worktree), and the
+**semantic** difference between the trusted config and the new one is
+limited to added or removed lines of these keys (a config that only differs
+by a comment has no semantic difference, and is not accepted either):
+
+| Key | Written by | Accepted value | Why it cannot run anything |
+|---|---|---|---|
+| `branch.<x>.remote` | `push -u`, `branch -u`, `checkout -b` with `autoSetupMerge` | a remote already present in the trusted config, or `.` | names an existing `[remote]` section; a new remote is not accepted this way |
+| `branch.<x>.merge` | same | `refs/heads/…` | a ref name git resolves, never executes |
+| `branch.<x>.vscode-merge-base` | VS Code's git extension, when it opens a repository | a ref name: no leading `-`, no blank, no control character | git ignores the key; VS Code passes the value to `git merge-base` |
+
+Anything outside this, a `branch.<x>.rebase` or a new `[remote]` section
+for instance, goes through the question. It is a closed allowlist of three harmless keys, not
+a blocklist of dangerous ones: nothing enters it without a demonstration
+that the key cannot make git execute anything. Since git writes these
+lines *after* the check (`push -u` runs, then records the tracking), it is
+the next command that accepts them.
 
 Tried on Debian with the system-wide install, on a repository modified
 behind the user's back: starship, oh-my-zsh, fish and `__git_ps1` prompts
