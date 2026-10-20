@@ -123,7 +123,7 @@ description: A guard that refuses to run git on a repository whose trusted files
 <pre class="term"><span class="p">$</span> ln -s ~/bin/gitguard ~/bin/git
 <span class="dim"># or, for the git you type only</span>
 <span class="p">$</span> alias git='gitguard git'</pre>
-<p>System-wide on Debian: <code>dpkg-divert</code> the real git to <code>/usr/bin/git.real</code> and symlink <code>/usr/bin/git</code> to gitguard. gitguard finds a <code>git.real</code> next to itself. On macOS keep the <code>PATH</code> symlink and set <code>git.path</code> in VS Code.</p></li>
+<p>System-wide on Debian: <code>dpkg-divert</code> the real git to <code>/usr/bin/git.real</code> and symlink <code>/usr/bin/git</code> to gitguard. gitguard finds a <code>git.real</code> next to itself; <code>git-receive-pack</code>, <code>git-upload-pack</code> and <code>git-upload-archive</code>, symlinks to <code>git</code> that sshd runs for every push and fetch to the machine, pass straight through to the real git. On macOS keep the <code>PATH</code> symlink and set <code>git.path</code> in VS Code.</p></li>
     <li><p>Set the companion setting git already ships. It is independent of gitguard and closes a hole gitguard cannot reach from tools that bypass the wrapper.</p>
 <pre class="term"><span class="p">$</span> git config --global safe.bareRepository explicit</pre></li>
     <li><p>Trust each repository you already have, after a look at its <code>config</code> and <code>hooks/</code>: nothing is blessed unseen, there is no trust-on-first-use. A <code>clone</code> or <code>init</code> made through the wrapper is trusted on its own.</p>
@@ -137,12 +137,14 @@ description: A guard that refuses to run git on a repository whose trusted files
   <h2>Day to day</h2>
   <div class="two">
     <div class="prose">
-      <p>Most commands change nothing gitguard watches, so you never hear from it. When something did change, three cases.</p>
-      <p><b>Auto-accept.</b> <code>push -u</code>, <code>branch -u</code> and <code>checkout -b</code> write <code>branch.x.remote</code> and <code>branch.x.merge</code> to the config, and VS Code writes <code>branch.x.vscode-merge-base</code> when it opens a repository. If that is the whole difference, gitguard updates the reference itself, prints one line and runs git. That list is closed at those three keys.</p>
+      <p>Commit, checkout, merge, rebase, stash, bisect, gc, worktree and submodule operations touch only files gitguard does not watch, so you never hear from it; <code>git --version</code> is never checked at all. When something did change, three cases.</p>
+      <p><b>Auto-accept.</b> The change is one git or your editor made itself: <code>push -u</code>, <code>branch -u</code> and <code>checkout -b</code> write <code>branch.x.remote</code> (a remote already known) and <code>branch.x.merge</code> (a <code>refs/heads/…</code>), VS Code writes <code>branch.x.vscode-merge-base</code> (a ref name) when it opens a repository. If the only file that changed is the config and its semantic difference is limited to those lines, gitguard updates the reference itself, prints one line and runs git. A closed allowlist of three keys that cannot make git execute anything, not a blocklist; a lone comment or a <code>branch.x.rebase</code> still gets the question. Not to be confused with auto-trust, which blesses a <em>new</em> repository after a <code>clone</code> or <code>init</code> through the wrapper.</p>
       <p><b>Anything else.</b> The diff is shown, then a question on the terminal: trust this state and run git, default no. The question goes through <code>/dev/tty</code>, so git's stdin is left alone. No question without a terminal, with stdout or stderr redirected, or with <code>GITGUARD_NO_PROMPT=1</code>.</p>
       <p><b>Never trusted, or structurally wrong.</b> A symlinked <code>.git</code>, a bare gitdir in a subdirectory, an <code>exec</code> line injected into a rebase, a control character in a name. No question is asked. Fix it, or trust it explicitly.</p>
       <p><b>A program ran git.</b> An editor's polling, a build tool, cron: no terminal, nobody reads its stderr. gitguard records what it saw, sends one desktop notification and waits up to <code>GITGUARD_WAIT</code> seconds. In a terminal, <code>gitguard pending</code> lists what waits; <code>gitguard pending &lt;repo&gt;</code> shows the diff and the calling process, then asks. Allowing records what you were shown and lets the waiting git run; refusing makes it fail and clears the record. A decision taken after the timeout applies to the next invocation. A git that has a terminal, such as a prompt's <code>$(git …)</code>, is refused at once instead: blocking it would freeze your shell.</p>
       <p>What you say yes to is exactly what you were shown. gitguard saves the state it diffed, never a fresh scan taken after your answer.</p>
+      <p><b>A change to your global config</b> (<code>git config --global</code>, <code>git lfs install</code>) marks every registered repository modified at once. <code>gitguard retrust</code> shows that diff once and asks once for all the repositories it is the only change of.</p>
+      <p>Tried on Debian with the system-wide install, on a repository modified behind the user's back: starship, oh-my-zsh, fish and <code>__git_ps1</code> prompts go quiet with no delay; powerlevel10k keeps showing branch and status, since <code>gitstatusd</code> reads <code>.git</code> itself and never runs git; lazygit exits with gitguard's message, tig says "Not a git repository"; fugitive's <code>:Git</code> shows the refusal after <code>GITGUARD_WAIT</code>; VS Code's polling waits for your <code>gitguard pending</code>; pre-commit's hook runs with the real git.</p>
     </div>
     <div>
       <p class="cap">A legitimate change, accepted from the terminal</p>
@@ -171,9 +173,10 @@ From github.com:org/api
 <span class="w">!</span> gitguard: changes in ~/work/api/.git:
   <span class="add">added</span>     hooks/pre-commit
 <span class="p">$</span> gitguard restore
+Actions on /home/user/work/api:
   <span class="x">delete</span>    hooks/pre-commit
 <span class="w">Continue? [y/N]</span> y
-<span class="ok">✓</span> gitguard: restored</pre>
+<span class="ok">✓</span> gitguard: 1 file(s) restored, /home/user/work/api matches the trusted state again</pre>
       <p class="cap" style="margin-top:1.4rem">When your editor ran git, not you</p>
 <pre class="term"><span class="p">$</span> gitguard pending
 <span class="mod">changed</span>         4s  1 waiting  /home/user/work/api
