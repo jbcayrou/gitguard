@@ -16,11 +16,9 @@
 <header class="top">
   <a class="brand" href="{{ '/' | relative_url }}"><img src="{{ '/assets/logo.png' | relative_url }}" alt="" width="40" height="40">gitguard</a>
   <nav aria-label="Page">
-    <a href="#pivot">The pivot</a>
-    <a href="#attacks">Five attacks</a>
-    <a href="#fingerprint">What it watches</a>
-    <a href="#install">Install</a>
-    <a href="#commands">Commands</a>
+{%- for n in site.data.nav %}
+    <a href="{{ n.href }}">{{ n.label }}</a>
+{%- endfor %}
     <a href="{{ site.github_url }}">Source</a>
   </nav>
 </header>

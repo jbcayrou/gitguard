@@ -1,0 +1,2 @@
+{% capture nl %}
+{% endcapture %}{% for l in include.lines %}{% unless forloop.first %}{{ nl }}{% endunless %}{% if l.c and l.c != "" %}<span class="{{ l.c }}">{{ l.s | escape }}</span>{% else %}<span>{{ l.s | escape }}</span>{% endif %}{% endfor %}

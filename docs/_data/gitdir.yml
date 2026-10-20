@@ -1,0 +1,16 @@
+# The gitdir as gitguard sees it (section "A fingerprint, not a blocklist").
+# k: the tree line; t: the note on the right; volatile: dimmed, rewritten by git and ignored.
+- { k: ".git/", t: "" }
+- { k: "├── config", t: "hashed, and parsed for paths" }
+- { k: "├── hooks/", t: "every file, every link" }
+- { k: "│   └── pre-commit", t: "" }
+- { k: "├── info/attributes", t: "filters, diff drivers" }
+- { k: "├── info/exclude", t: "unknown, so watched" }
+- { k: "├── description", t: "unknown, so watched" }
+- { k: "├── objects/info/alternates", t: "another object store" }
+- { k: "├── HEAD  index  packed-refs", t: "rewritten constantly", volatile: true }
+- { k: "├── objects/  refs/  logs/  lfs/", t: "volatile", volatile: true }
+- { k: "├── rebase-merge/git-rebase-todo", t: "volatile, scanned for exec", volatile: true }
+- { k: "├── modules/<submodule>/", t: "a gitdir, same rules inside" }
+- { k: "├── worktrees/<worktree>/", t: "same" }
+- { k: "└── anything-else", t: "unknown, so watched" }

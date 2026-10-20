@@ -1,0 +1,5 @@
+- { href: "#pivot", label: "The pivot" }
+- { href: "#attacks", label: "Five attacks" }
+- { href: "#fingerprint", label: "What it watches" }
+- { href: "#install", label: "Install" }
+- { href: "#commands", label: "Commands" }

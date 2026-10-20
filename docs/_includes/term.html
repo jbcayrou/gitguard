@@ -1,0 +1,7 @@
+{%- comment -%}
+A terminal window. Parameters: title (the window title), body (the <pre> content,
+usually a captured block of lines with <span class="…"> colours), sb (true for the
+sandbox colour), label (aria-label).
+{%- endcomment -%}
+<div class="win{% if include.sb %} sb{% endif %}"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="title">{{ include.title }}</span></div>
+<pre class="term"{% if include.label %} aria-label="{{ include.label }}"{% endif %}>{{ include.body | strip }}</pre></div>

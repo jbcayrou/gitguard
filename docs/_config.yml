@@ -8,3 +8,9 @@ plugins:
 exclude:
   - README.md
 github_url: https://github.com/jbcayrou/gitguard
+markdown: kramdown
+kramdown:
+  input: GFM
+  hard_wrap: false
+  syntax_highlighter: rouge
+  auto_ids: false

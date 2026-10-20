@@ -1,0 +1,12 @@
+{%- comment -%} The opening block: title, lede and meta from the page's front matter, the terminal from include.term. {%- endcomment -%}
+<section class="hero" aria-labelledby="h1">
+  <div>
+    <h1 id="h1">{{ page.hero.title }}</h1>
+    <p class="lede">{{ page.hero.lede }}</p>
+    <p class="meta">{{ page.hero.meta }}</p>
+  </div>
+  <div>
+    <p class="cap">{{ page.hero.caption }}</p>
+{% include term.html title=page.hero.term_title body=include.term label="gitguard refusing to run git" %}
+  </div>
+</section>

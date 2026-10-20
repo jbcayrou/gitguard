@@ -1,0 +1,6 @@
+{%- comment -%} The gitdir diagram, from _data/gitdir.yml. {%- endcomment -%}
+<div class="tree" aria-label="Which files of .git are fingerprinted">
+{%- for r in site.data.gitdir %}
+<div class="r{% if r.volatile %} v{% endif %}">{% if r.volatile %}<span>{{ r.k | escape }}</span>{% else %}<span class="k">{{ r.k | escape }}</span>{% endif %}<span class="t">{{ r.t }}</span></div>
+{%- endfor %}
+</div>

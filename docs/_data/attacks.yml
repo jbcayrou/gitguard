@@ -1,0 +1,112 @@
+# The "Five attacks" demo. Each attack: a story, the sandbox terminal, the host
+# terminal without gitguard, the host terminal with gitguard.
+# A line is {c: class, s: text}; class is one of p (prompt), dim, pwn, add, mod,
+# x, w, hint, hr, or empty. `refuse` builds the standard refusal block
+# (rule, "has changed" line, the changes, an optional diff, rule, hints) —
+# see _includes/attacks.html; `with` gives the host lines in full instead.
+- id: hook
+  label: A hook
+  story: "The sandbox drops an executable file into .git/hooks/. git runs pre-commit, pre-push and a dozen others with no prompt, every time."
+  sandbox:
+    - { c: dim, s: "# running as the agent, inside the mounted repo" }
+    - { c: p, s: "$ cat > .git/hooks/pre-commit <<'EOF'" }
+    - { c: "", s: "  #!/bin/sh" }
+    - { c: pwn, s: "  # read credentials from $HOME, send them out, stay quiet" }
+    - { c: "", s: "EOF" }
+    - { c: p, s: "$ chmod +x .git/hooks/pre-commit" }
+  without:
+    - { c: p, s: "$ git commit -m \"fix typo\"" }
+    - { c: pwn, s: "[pre-commit] credentials copied to attacker host" }
+    - { c: "", s: "[main 3f2a9c1] fix typo" }
+    - { c: dim, s: " 1 file changed, 1 insertion(+)" }
+  command: "$ git commit -m \"fix typo\""
+  refuse:
+    changes:
+      - { c: add, s: "  added     hooks/pre-commit" }
+
+- id: config
+  label: A config key
+  story: "No hook needed. A single line in .git/config, core.fsmonitor, names a command git launches on almost every operation."
+  sandbox:
+    - { c: dim, s: "# one key is enough" }
+    - { c: p, s: "$ git config core.fsmonitor 'sh -c \"...\"'" }
+  without:
+    - { c: p, s: "$ git status" }
+    - { c: pwn, s: "[fsmonitor] launched: payload running as you" }
+    - { c: "", s: "On branch main" }
+    - { c: dim, s: "nothing to commit, working tree clean" }
+  command: "$ git status"
+  refuse:
+    changes:
+      - { c: mod, s: "  modified  config" }
+    diff:
+      - { c: "", s: "" }
+      - { c: "", s: "  diff of ~/work/api/.git/config:" }
+      - { c: hint, s: "  @@ -5,3 +5,4 @@" }
+      - { c: "", s: "   \tignorecase = true" }
+      - { c: "", s: "   \tprecomposeunicode = true" }
+      - { c: add, s: "  +\tfsmonitor = sh -c \"...\"" }
+
+- id: hookspath
+  label: hooksPath into the tree
+  story: "If the sandbox can only write the work tree, not .git, it still wins: core.hooksPath points git at a hooks directory that lives in the tree."
+  sandbox:
+    - { c: p, s: "$ mkdir .githooks" }
+    - { c: p, s: "$ printf '...' > .githooks/pre-push" }
+    - { c: p, s: "$ git config core.hooksPath .githooks" }
+  without:
+    - { c: p, s: "$ git push" }
+    - { c: pwn, s: "[pre-push] payload running from .githooks/" }
+    - { c: dim, s: "Everything up-to-date" }
+  command: "$ git push"
+  refuse:
+    changes:
+      - { c: mod, s: "  modified  config" }
+      - { c: add, s: "  added     wt:.githooks/pre-push" }
+    diff:
+      - { c: "", s: "" }
+      - { c: "", s: "  diff of ~/work/api/.git/config:" }
+      - { c: hint, s: "  @@ -5,3 +5,4 @@" }
+      - { c: "", s: "   \tprecomposeunicode = true" }
+      - { c: add, s: "  +\thooksPath = .githooks" }
+
+- id: nested
+  label: A nested repository
+  story: "A second repository planted in a subdirectory. git reads its config the moment a gitlink exists in the index, which an ordinary git add -A creates."
+  sandbox:
+    - { c: p, s: "$ git init vendor/lib" }
+    - { c: p, s: "$ git -C vendor/lib config core.fsmonitor '...'" }
+    - { c: p, s: "$ git -C vendor/lib commit --allow-empty -m x" }
+  without:
+    - { c: p, s: "$ git add -A" }
+    - { c: dim, s: "warning: adding embedded git repository: vendor/lib" }
+    - { c: p, s: "$ git status" }
+    - { c: pwn, s: "[vendor/lib] nested config executed" }
+  with:
+    - { c: p, s: "$ git add -A" }
+    - { c: dim, s: "warning: adding embedded git repository: vendor/lib" }
+    - { c: p, s: "$ git status" }
+    - { c: hr, s: "────────────────────────────────────────────────────────" }
+    - { c: x, s: "✗ gitguard: nested repository: vendor/lib/.git — a gitlink for this" }
+    - { c: x, s: "  directory exists in the index, git will execute its config." }
+    - { c: dim, s: "  If it is your own vendored repository: inspect its config and hooks," }
+    - { c: dim, s: "  declare it in .gitmodules, git submodule absorbgitdirs, gitguard trust." }
+    - { c: dim, s: "  Otherwise delete vendor/lib/.git first, then git rm --cached lib." }
+    - { c: x, s: "✗ gitguard: refusing to run git." }
+
+- id: redirect
+  label: A redirected .git
+  story: "The boldest move: replace .git with a one-line gitdir: file pointing at a directory the sandbox controls, config and hooks included."
+  sandbox:
+    - { c: p, s: "$ cp -r .git evil/repo.git" }
+    - { c: p, s: "$ rm -rf .git" }
+    - { c: p, s: "$ echo 'gitdir: ./evil/repo.git' > .git" }
+  without:
+    - { c: p, s: "$ git log --oneline -1" }
+    - { c: pwn, s: "[evil/repo.git] hooks and config now in control" }
+    - { c: dim, s: "3f2a9c1 fix typo" }
+  with:
+    - { c: p, s: "$ git log --oneline -1" }
+    - { c: x, s: "✗ gitguard: ~/work/api/.git points inside the work tree" }
+    - { c: dim, s: "  (~/work/api/evil/repo.git)" }
+    - { c: x, s: "✗ gitguard: refusing to run git." }

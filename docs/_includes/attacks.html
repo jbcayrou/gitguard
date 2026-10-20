@@ -1,0 +1,44 @@
+{%- comment -%} The "Five attacks" tabs, rendered from _data/attacks.yml; assets/js/demo.js only switches the visible panel. {%- endcomment -%}
+{%- assign rule = "────────────────────────────────────────────────────────" -%}
+<div class="tabs" role="tablist" aria-label="Attack">
+{%- for a in site.data.attacks %}
+  <button role="tab" id="t-{{ a.id }}" aria-selected="{% if forloop.first %}true{% else %}false{% endif %}" aria-controls="demo-{{ a.id }}" data-a="{{ a.id }}">{{ a.label }}</button>
+{%- endfor %}
+</div>
+{%- for a in site.data.attacks %}
+<div class="demo" id="demo-{{ a.id }}" role="tabpanel" aria-labelledby="t-{{ a.id }}"{% unless forloop.first %} hidden{% endunless %}>
+  <p class="story">{{ a.story }}</p>
+  <p class="cap">Inside the sandbox, while you were away</p>
+{%- capture body %}{% include lines.html lines=a.sandbox %}{% endcapture %}
+{% include term.html sb=true title="agent@sandbox — /workspace/api" body=body %}
+  <div class="panes">
+    <div>
+      <p class="cap">Back on the host, without gitguard</p>
+{%- capture body %}{% include lines.html lines=a.without %}{% endcapture %}
+{% include term.html title="you@host — ~/work/api" body=body %}
+    </div>
+    <div>
+      <p class="cap">Back on the host, with gitguard in front of <code>git</code></p>
+{%- capture body -%}
+{%- if a.with -%}
+{% include lines.html lines=a.with %}
+{%- else -%}
+<span class="p">{{ a.command | escape }}</span>
+<span class="hr">{{ rule }}</span>
+<span class="w">! gitguard: ~/work/api/.git has changed since the last trust</span>
+{% include lines.html lines=a.refuse.changes %}
+{%- if a.refuse.diff %}
+{% include lines.html lines=a.refuse.diff %}
+{%- endif %}
+<span></span>
+<span class="hr">{{ rule }}</span>
+<span class="hint">  If legitimate:  gitguard trust   Otherwise:  gitguard restore</span>
+<span class="x">✗ gitguard: refusing to run git.</span>
+{%- endif -%}
+{%- endcapture %}
+{% include term.html title="you@host — ~/work/api — git is gitguard git" body=body %}
+    </div>
+  </div>
+  <p class="note">The demo payloads announce themselves so you can read them. A real one stays silent.</p>
+</div>
+{%- endfor %}
