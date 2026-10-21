@@ -6,7 +6,9 @@ Usage:
   gitguard               check the current repository (exit 1 if suspect or never trusted)
   gitguard trust         record the current state as the reference (+ backup)
   gitguard diff          show what differs from the reference
-  gitguard restore [-y]  put the watched files back into the reference state
+  gitguard restore [-y]  put the watched files of the gitdir and the tree back
+                         into the reference state (a file outside the repository
+                         is named, never written)
   gitguard git <args>    check, then run git; honours -C/--git-dir/--work-tree;
                          successful clone/init → automatic trust; a pure
                          branch-tracking addition (push -u…) is accepted on its
@@ -1952,8 +1954,8 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]] | None = None,
     new.mkdir()
     (new / ".root").write_text(str(repo.label) + "\n")
     for (scope, rel), e in man.items():
-        if _private_ext(e):
-            continue
+        if scope == "ext":
+            continue                     # hashed, never copied: see restore
         src = scope_base(repo, scope) / rel
         dst = new / scope / rel.lstrip("/")
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1978,17 +1980,6 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]] | None = None,
     shutil.rmtree(bak, ignore_errors=True)
     os.rename(new, bak)
     os.replace(tmp, key)
-
-
-def _private_ext(e: Entry) -> bool:
-    """An `ext` file nobody but its owner may read (0600: an ssh or TLS key
-    named by `core.sshCommand -i`, `http.sslKey`, a credentials file) is
-    hashed like any other but never copied into the state directory nor
-    written back by `restore`: a private key was duplicated into every
-    `<key>.d/ext/` and `restore` wrote the old key over a rotated one. Only
-    `ext`: the tree and the gitdir are what `restore` is for, and a 0600
-    `.git/config` (umask 077) must stay restorable. [56]"""
-    return e.scope == "ext" and e.kind == "f" and int(e.mode, 8) & 0o044 == 0
 
 
 def _label(scope: str, path: str) -> str:
@@ -2291,6 +2282,18 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
     # three at once).
     allowed = [repo.gitdir, repo.common] + [p for _, p in trusted_refs]
     kept = []
+    # Outside the repository (scope `ext`: `../shared-hooks`, a program under
+    # $HOME named by the config) gitguard writes nothing and deletes nothing,
+    # and keeps no copy in the state directory. Two of its own flaws were
+    # restore acting there — neighbouring files deleted [25], a rotated ssh
+    # key overwritten with the old one [56] — for files it only watches
+    # because the config names them. They are named here, for the user.
+    for action, (scope, path) in list(plan):
+        if scope == "ext":
+            plan.remove((action, (scope, path)))
+            kept.append((scope, path))
+            warn(f"{_label(scope, path)} is outside the repository: left in place, neither "
+                 f"restored nor deleted by gitguard. Inspect it by hand.")
     for action, (scope, path) in list(plan):
         if action != "delete":
             continue
@@ -2301,14 +2304,13 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
     for scope, path in kept:
         warn(f"{_label(scope, path)} is outside the paths designated by the trusted config: "
              f"left in place, not deleted. Inspect it by hand.")
-    # A private `ext` file has no backup (never copied, [56]): left as is.
-    for action, (scope, path) in list(plan):
+    for action, (scope, path) in list(plan):     # a backup written by an older version
         copy = bak / scope / path.lstrip("/")
         if action == "restore" and not (copy.is_symlink() or copy.is_file()):
             plan.remove((action, (scope, path)))
             kept.append((scope, path))
-            warn(f"{_label(scope, path)}: private file, never backed up: left as is. "
-                 f"Inspect it by hand.")
+            warn(f"{_label(scope, path)}: no backup copy: left as is. Inspect it by hand, "
+                 f"then `gitguard trust`.")
     if not plan:
         if kept:
             raise Refuse("nothing else to restore")

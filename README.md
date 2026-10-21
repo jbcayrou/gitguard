@@ -77,8 +77,8 @@ That silence is the signal.
   `core.hooksPath` pointing into the mounted volume is a bypass otherwise
   (the files themselves are parsed, not hashed: the sandbox cannot write
   them). Files git reads as data — a signing key, `commit.template`,
-  `core.excludesFile` — are not watched, and a private file (0600) named by
-  a program key is never copied into the state directory nor restored.
+  `core.excludesFile` — are not watched; a file outside the repository named
+  by a program key is watched but never copied into the state directory.
 
 Every later `git` invocation is checked against that fingerprint first. Any
 deviation, structural anomaly (symlinked `.git`, bare gitdir planted in a
@@ -329,7 +329,9 @@ refused (git itself reads it against two different directories in one run).
 - It cannot close the race between its check and git's execution if the
   sandbox is still writing. Stop the sandbox before running git on the host.
 - `restore` only cleans the pivot vector: objects, commits and tree files
-  dropped by the sandbox stay there for you to inspect.
+  dropped by the sandbox stay there for you to inspect. It never writes
+  outside the repository: a watched file there (`../shared-hooks`) is named
+  and left for you.
 - Hooks tracked *in the tree* under `core.hooksPath` (husky, `.githooks`)
   are watched, but a `checkout`/`merge`/`pull` of a commit the sandbox
   created rewrites them after the check, and git runs the new version in

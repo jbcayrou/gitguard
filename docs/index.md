@@ -242,7 +242,7 @@ When your editor ran git, not you
 | `gitguard` | Check the current repository. Exit 1 if suspect or never trusted. Reports, never asks. |
 | `gitguard trust` | Record the current state as the reference, with a backup of the watched files. |
 | `gitguard diff` | Show what differs from the reference. |
-| `gitguard restore [-y]` | Put the watched files back into the reference state. Only the pivot vector: commits, objects and tree files the sandbox left stay for you to inspect. |
+| `gitguard restore [-y]` | Put the watched files of the gitdir and the tree back into the reference state. Only the pivot vector: commits, objects and tree files the sandbox left stay for you to inspect; a watched file outside the repository is named, never written. |
 | `gitguard git <args>` | Check, then run the real git. Honours `-C`, `--git-dir`, `--work-tree`. |
 | `gitguard list` | Every registered repository with its status: ok, modified, structure, missing, legacy, unknown. |
 | `gitguard pending [<repo>… \| -a \| -c]` | Decisions waiting for a git blocked by a program: list them, review one (diff and calling process) and allow or refuse, or clear. |
@@ -273,7 +273,7 @@ When your editor ran git, not you
 
 - It only covers git invocations that resolve to the wrapper. A tool with a hardcoded path to the real git, or started with a `PATH` that does not contain the symlink, is not checked. A `-c key=value` given to such a git is invisible too.
 - It cannot close the race between its check and git's execution if the sandbox is still writing. Stop the sandbox before running git on the host.
-- `restore` only cleans the pivot vector. Objects, commits and tree files the sandbox dropped stay there for you to inspect.
+- `restore` only cleans the pivot vector. Objects, commits and tree files the sandbox dropped stay there for you to inspect, and so is a watched file outside the repository: restore never writes there.
 - Hooks tracked *in the tree* under `core.hooksPath` (husky, `.githooks`) are watched, but a `checkout`, `merge` or `pull` of a commit the sandbox created rewrites them after the check, and git runs the new version in the same command. `gitguard trust` warns when that layout is in place; review incoming changes to those files.
 - A trusted hook that calls a program by name depends on your `PATH`. If a `PATH` directory sits in the mounted volume, that is out of reach.
 - The question needs stdout and stderr on a terminal. A prompt's `$(git …)` or a `git log | head` on a changed repository is refused, not asked: rerun without the pipe, or `gitguard trust`.

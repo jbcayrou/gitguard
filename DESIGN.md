@@ -324,10 +324,11 @@ or curl reads and never runs. The generic rule took `user.signingKey =
 every `<key>.d/ext/`, each rotation refused every repository, and `restore`
 wrote the old key over the new one ([56]). Program keys (`gpg.program`,
 `core.sshCommand`, `credential.helper`) stay under the generic rule, so a
-key named as their argument (`ssh -i ~/.ssh/id`) is still watched; for that
-case an **`ext` file without group/other read bits** (`_private_ext`, 0600:
-keys, credentials) is hashed but **never copied into the state directory
-nor written back by `restore`**, which names it and leaves it alone.
+key named as their argument (`ssh -i ~/.ssh/id`) is still watched. The
+first fix kept a 0600 `ext` file out of the state directory; since
+2026-10-21 **no `ext` entry is copied, restored or deleted**: `restore`
+acts on the gitdir and the tree only, names what it leaves outside, and
+the state directory never holds a file from outside the repository.
 Exception, a **local remote** (`remote.*.url`/`pushurl` = a path or `file://` to a
 repository, `_local_remote`): `push` runs its hooks and honours its config,
 so its `config` and `hooks/` are watched (scope `ext` or `wt`) and that
@@ -453,8 +454,9 @@ sha256 of the root's absolute path:
 
 ```
 <key>           reference manifest
-<key>.d/        backup of the watched files (.root, local/…, common/…, wt/…, ext/…;
-                an ext file without group/other read bits — a key — is never copied [56])
+<key>.d/        backup of the watched files (.root, local/…, common/…, wt/…); an
+                `ext` file is hashed but never copied: restore never writes
+                outside the repository [25] [56]
 <key>.idx       cache of the index parse: version, then one record per index file
                 of the repository (its own, modules/<x>, worktrees/<x>: sha256 of the
                 file + gitlinks), rewritten by any check when an index changes; a
@@ -863,13 +865,14 @@ content; fail closed on anything the parser cannot make sense of.
   the common case of a mounted parent directory. Stop the sandbox before
   running git on the host.
 - `restore` only cleans the pivot vector; objects, commits and tree files
-  dropped by the sandbox remain, to be inspected by hand. It never deletes
-  outside the gitdir and the roots the **trusted** config designates (an
-  `ext:` path that appeared after the trust pointed into `$HOME`, found in
-  review): such a file (`include.path = ../evil.inc` planted with the hook)
-  is left in place and named in a warning, and the rest is restored — a
-  container planting hook, config and include at once left all three in
-  place when the whole restore was refused.
+  dropped by the sandbox remain, to be inspected by hand. It never acts
+  outside the repository: an `ext` entry (`../shared-hooks`, a program
+  under `$HOME`) is named and left as is, whatever its state — two flaws
+  were restore writing there ([25] deleted neighbours, [56] overwrote a
+  rotated key). In the tree it never deletes outside the roots the
+  **trusted** config designates (an `include.path = ../evil.inc` planted
+  with the hook is left in place and named, the rest is restored — refusing
+  the whole restore left hook, config and include in place).
 - A trusted hook that invokes a program by name (`node`, `python`) depends on
   the user's `PATH`; if a `PATH` directory is in the mounted volume, that is
   out of gitguard's reach.

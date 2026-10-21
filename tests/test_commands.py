@@ -130,14 +130,24 @@ def test_restore_worktree_hook(gg: GG, repo: Path) -> None:
     assert not gg.check(repo).blocked
 
 
-def test_restore_ext_path(gg: GG, repo: Path, tmp_path: Path) -> None:
+def test_restore_leaves_ext_paths_alone(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """A hooks directory outside the tree (`../shared-hooks`, scope `ext`) is
+    watched, but restore neither writes nor deletes there and the state
+    directory holds no copy of it: the planted hook is named and left, the
+    repository stays refused until the user has looked at it."""
     shared = tmp_path / "shared-hooks"
     shared.mkdir()
     gg.git("config", "core.hooksPath", "../shared-hooks", cwd=repo)
     gg.trust(repo)
-    write_exec(shared / "pre-commit")
+    assert not (Path(str(gg.key_for(repo)) + ".d") / "ext").exists()
+    write_exec(shared / "pre-commit", "#!/bin/sh\nevil\n")
     assert gg.check(repo).blocked
-    assert gg.run("restore", "-y", cwd=repo).rc == 0
+    r = gg.run("restore", "-y", cwd=repo)
+    assert r.rc != 0 and "nothing else to restore" in r.err, r.text
+    assert f"ext:{shared}/pre-commit" in r.err and "left in place" in r.err, r.err
+    assert (shared / "pre-commit").read_text() == "#!/bin/sh\nevil\n"
+    assert gg.check(repo).blocked
+    (shared / "pre-commit").unlink()                 # the user's repair
     assert not gg.check(repo).blocked
 
 
@@ -248,10 +258,11 @@ def test_failed_clone_propagates_rc(gg: GG, tmp_path: Path) -> None:
 def test_private_ext_file_is_watched_but_never_copied_nor_restored(gg: GG, repo: Path, tmp_path: Path) -> None:
     """[56] A file outside the tree named by a program key (`core.sshCommand =
     ssh -i <key>`) is watched — the generic rule cannot tell a key from a
-    script — but a private one (no read bit for group/other) is never copied
-    into the state directory, and `restore` leaves it alone: it used to write
-    the old private key over a rotated one. Positive control: an ext hook
-    (0755) is still backed up and restored."""
+    script — but never copied into the state directory, and `restore` leaves
+    it alone: it used to write the old private key over a rotated one. Since
+    restore stopped acting outside the repository, the same holds for every
+    `ext` entry, an ext hook included; a modified one keeps the repository
+    refused until the user has dealt with it."""
     key = tmp_path / "sshkey"
     key.write_text("SECRET\n")
     key.chmod(0o600)
@@ -261,20 +272,20 @@ def test_private_ext_file_is_watched_but_never_copied_nor_restored(gg: GG, repo:
     assert gg.git("config", "core.hooksPath", str(hooks), cwd=repo).rc == 0
     r = gg.trust(repo)
     assert f"ext:{key}" in r.text and f"ext:{hooks}" in r.text, r.text
-    bak = Path(str(gg.key_for(repo)) + ".d") / "ext"
-    assert (bak / str(hooks).lstrip("/") / "pre-commit").is_file()
-    assert not (bak / str(key).lstrip("/")).exists(), "the private key was copied"
+    bak = Path(str(gg.key_for(repo)) + ".d")
+    assert not (bak / "ext").exists(), "an ext file was copied into the state directory"
+    assert (bak / "local/config").is_file()
     key.write_text("ROTATED\n")
     (hooks / "pre-commit").write_text("#!/bin/sh\nevil\n")
     r = gg.check(repo)
     assert r.blocked and f"modified  ext:{key}" in r.err and f"modified  ext:{hooks}/pre-commit" in r.err, r.err
     r = gg.run("restore", "-y", cwd=repo)
-    assert r.rc == 0, r.text
-    assert "private file" in r.text and str(key) in r.text, r.text
+    assert r.rc != 0 and "nothing else to restore" in r.err, r.text
+    assert str(key) in r.err and str(hooks) in r.err and "left in place" in r.err, r.err
     assert key.read_text() == "ROTATED\n", "restore wrote the old private key back"
-    assert (hooks / "pre-commit").read_text() == "#!/bin/sh\nid\n", "the ext hook was not restored"
-    r = gg.check(repo)                   # only the rotated key still differs
-    assert r.blocked and f"ext:{key}" in r.err and "pre-commit" not in r.err, r.err
+    assert (hooks / "pre-commit").read_text() == "#!/bin/sh\nevil\n", "restore wrote outside the repository"
+    r = gg.check(repo)
+    assert r.blocked and f"ext:{key}" in r.err and f"ext:{hooks}/pre-commit" in r.err, r.err
 
 
 # ----------------------------------------------------------- global options
