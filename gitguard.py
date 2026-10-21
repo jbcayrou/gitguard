@@ -2939,28 +2939,45 @@ def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
     raise Refuse("refusing to run git.")
 
 
-# `/usr/bin/git-receive-pack`, `git-upload-pack` and `git-upload-archive` are
-# symlinks to `/usr/bin/git` (Debian): with the system-wide install they land
-# on gitguard, invoked under those names by sshd for every push and fetch
-# *to* the machine. They serve a repository named by argument (a bare one,
-# which gitguard does not handle) and run nothing of the caller's; a local
-# push already reaches them unwrapped through the real git's exec path. So
-# they pass through, like `--version`, which reads no repository at all.
+# ----------------------------------------------------------- passthroughs
+# Invocations handed to the real git before any check. A closed list: every
+# entry is an exception to "check, then run" and carries its proof that git
+# opens no repository of the cwd there. Never add a subcommand on the ground
+# that it "only reads": `git log` reads the config (pager, diff drivers).
+#
+# - `--version`, `version` as the first argument: git.c maps `--version` to
+#   the `version` command, which has no RUN_SETUP flag — no
+#   setup_git_directory, hence no repository config, no `pager.version`,
+#   no alias. lazygit and fugitive probe it first and took gitguard's
+#   refusal for an old git. `git -p version` or `git -C x version` is not
+#   on the list: a global option first means the full check.
+# - `git-receive-pack`, `git-upload-pack`, `git-upload-archive` as the
+#   invoked name: on Debian they are symlinks to `/usr/bin/git`, so with the
+#   system-wide install sshd runs gitguard under those names for every push
+#   and fetch *to* the machine. They serve a repository named by argument
+#   (a bare one, which gitguard does not handle) and run nothing of the
+#   cwd's; a local push already reaches them unwrapped through the real
+#   git's exec path. Every ssh push to the VM failed before this entry.
 TRANSPORT = {"git-receive-pack": "receive-pack", "git-upload-pack": "upload-pack",
              "git-upload-archive": "upload-archive"}
+VERSION_ARGS = (["--version"], ["version"])
+
+
+def passthrough(name: str, args: list[str]) -> list[str] | None:
+    """The real git's arguments when the invocation (`name` = argv[0]'s
+    basename, `args` = the git arguments) is on the list above; else None."""
+    if name in TRANSPORT:
+        return [TRANSPORT[name], *args]
+    if args[:1] in VERSION_ARGS:
+        return args
+    return None
 
 
 def main(argv: list[str]) -> int:
     mode, yes = "check", False
     name = Path(argv[0]).name
-    if name in TRANSPORT:
-        git = real_git()
-        os.execv(git, [git, TRANSPORT[name], *argv[1:]])
-    if name == "git":
+    if name == "git" or name in TRANSPORT:
         mode, argv = "exec", argv[1:]    # invoked through a symlink named git
-        if argv[:1] in (["--version"], ["version"]):
-            git = real_git()             # reads no repository: lazygit, fugitive and
-            os.execv(git, [git, *argv])  # co. probe it first and misread a refusal
     else:
         argv = argv[1:]
         cmd = argv[0] if argv else ""
@@ -2974,9 +2991,6 @@ def main(argv: list[str]) -> int:
                 yes, argv = True, argv[1:]
         elif cmd == "git":
             mode, argv = "exec", argv[1:]
-            if argv[:1] in (["--version"], ["version"]):
-                git = real_git()
-                os.execv(git, [git, *argv])
         elif cmd == "list":
             cmd_list(); argv = argv[1:]
         elif cmd == "forget":
@@ -3001,6 +3015,10 @@ def main(argv: list[str]) -> int:
     orig = Path.cwd()
     newrepo, git = None, ""
     if mode == "exec":
+        direct = passthrough(name, argv)
+        if direct is not None:
+            git = real_git()
+            os.execv(git, [git, *direct])
         newrepo = parse_new_repo(argv)
         orig = apply_global_options(argv)
     # A refusal that nobody will read (exec mode, no controlling terminal) is

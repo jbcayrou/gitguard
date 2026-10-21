@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from tests.attacks._helpers import make_source
-from tests.conftest import GG, write_exec
+from tests.conftest import GG, REAL_GIT, write_exec
 
 
 # ------------------------------------------------------------ trust / diff
@@ -377,6 +377,25 @@ def test_version_passes_on_a_modified_repository(gg: GG, repo: Path) -> None:
     import subprocess
     r = subprocess.run([str(link), "--version"], cwd=repo, env=gg.env, capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout.startswith("git version"), r.stderr
+
+
+def test_version_runs_nothing_of_the_repository(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """The proof behind the passthrough: `git version` has no RUN_SETUP, so a
+    `pager.version` or `core.pager` planted in the repository is not read.
+    Positive control: `git -p version` is not on the list and is checked."""
+    import subprocess
+    marker = tmp_path / "PWNED"
+    pager = tmp_path / "pager.sh"
+    pager.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n")
+    pager.chmod(0o755)
+    cfg = repo / ".git/config"
+    cfg.write_text(cfg.read_text() + f"[core]\n\tpager = {pager}\n[pager]\n\tversion = true\n")
+    assert gg.run("git", "status", cwd=repo).blocked           # the repository is modified
+    r = subprocess.run([REAL_GIT, "version"], cwd=repo, env=gg.env, capture_output=True, text=True)
+    assert r.returncode == 0 and not marker.exists()          # git itself reads nothing
+    r = gg.run("git", "version", cwd=repo)
+    assert r.rc == 0 and r.out.startswith("git version") and not marker.exists()
+    assert gg.run("git", "-p", "version", cwd=repo).blocked    # a global option first: checked
 
 
 def test_symlink_named_git_ahead_in_path_finds_the_real_git(gg: GG, repo: Path, tmp_path: Path) -> None:

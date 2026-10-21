@@ -111,15 +111,19 @@ changes the fingerprint (one `trust`). Hooks and `rebase --exec` run by the
 real git call `<exec-path>/git`, unwrapped by design (no recursion; their
 todo files are read instead, [36]). `/usr/bin/git-receive-pack`,
 `git-upload-pack` and `git-upload-archive` are symlinks to `/usr/bin/git`
-(Debian): diverted, they land on gitguard, which `main` recognises by
-`argv[0]` (`TRANSPORT`) and passes to the real git — sshd runs them for
+(Debian): diverted, they land on gitguard, which recognises them by
+`argv[0]` (`passthrough`, the one closed list of invocations run without a
+check, each with its proof in the code) and passes to the real git — sshd runs them for
 every push and fetch *to* the machine, they serve a repository named by
 argument (a bare one, not handled) and run nothing of the caller's; a
 local push already reaches them unwrapped through the exec path. Found on
 the Debian VM: every ssh push to the host failed with "unknown command
 '/home/user/srv.git'". `git --version` / `git version` pass through as
-well: they read no repository, and lazygit and fugitive run them first and
-took the refusal for an old git.
+well: `version` has no `RUN_SETUP` in git.c, so no repository config,
+pager or alias is read (`test_version_runs_nothing_of_the_repository`,
+with `git -p version` as the checked control), and lazygit and fugitive
+run them first and took the refusal for an old git. Nothing else is on
+that list: a subcommand that "only reads" still reads the config.
 
 ### Environment variables
 
