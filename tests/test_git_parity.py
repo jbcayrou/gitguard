@@ -327,16 +327,19 @@ def explicit(gg: GG) -> GG:
     return gg
 
 
+@pytest.mark.discovery
 def test_discovery_subdir(explicit: GG, repo: Path, monkeypatch) -> None:
     (repo / "a/b").mkdir(parents=True)
     _assert_same_repo(explicit, repo / "a/b", monkeypatch)
 
 
+@pytest.mark.discovery
 def test_discovery_linked_worktree(explicit: GG, repo: Path, tmp_path: Path, monkeypatch) -> None:
     assert explicit.git("worktree", "add", "-q", str(tmp_path / "wt"), cwd=repo).rc == 0
     _assert_same_repo(explicit, tmp_path / "wt", monkeypatch)
 
 
+@pytest.mark.discovery
 def test_discovery_invalid_dotgit_dir_skipped_by_git(explicit: GG, repo: Path, monkeypatch) -> None:
     """[49] `.git` directory invalid for git (no HEAD/objects/refs): git
     ignores it and walks up to the parent; gitguard stopped on it."""
@@ -347,6 +350,7 @@ def test_discovery_invalid_dotgit_dir_skipped_by_git(explicit: GG, repo: Path, m
 
 @pytest.mark.parametrize("layout", ["head_symlink", "commondir", "commondir_nul", "head_sha",
                                     "head_ref_tab"])
+@pytest.mark.discovery
 def test_discovery_gitdir_variants_match_git(explicit: GG, repo: Path, tmp_path: Path,
                                              monkeypatch, layout: str) -> None:
     """[49] is_git_directory as git has it: HEAD may be a symlink to refs/…,
@@ -392,6 +396,7 @@ def _same_verdict(gg: GG, cwd: Path, monkeypatch, git_accepts: bool) -> None:
 
 @pytest.mark.parametrize("fmt,git_accepts", [c[1:] for c in PATH_FILE_VARIANTS],
                          ids=[c[0] for c in PATH_FILE_VARIANTS])
+@pytest.mark.discovery
 def test_gitfile_read_like_git(explicit: GG, repo: Path, tmp_path: Path, monkeypatch,
                                fmt: bytes, git_accepts: bool) -> None:
     wt = tmp_path / "wt"
@@ -403,6 +408,7 @@ def test_gitfile_read_like_git(explicit: GG, repo: Path, tmp_path: Path, monkeyp
 
 @pytest.mark.parametrize("fmt,git_accepts", [c[1:] for c in PATH_FILE_VARIANTS],
                          ids=[c[0] for c in PATH_FILE_VARIANTS])
+@pytest.mark.discovery
 def test_commondir_read_like_git(explicit: GG, repo: Path, tmp_path: Path, monkeypatch,
                                  fmt: bytes, git_accepts: bool) -> None:
     wt = tmp_path / "wt"
@@ -453,6 +459,7 @@ def test_todo_exec_seen_whenever_git_runs_it(gg: GG, repo: Path, tmp_path: Path,
 
 
 @pytest.mark.parametrize("layout", ["commondir", "head_symlink_unborn", "full_bare"])
+@pytest.mark.discovery
 def test_planted_gitdir_refused_by_git_with_explicit(explicit: GG, repo: Path, layout: str) -> None:
     """Bare-gitdir variants that is_bare_gitdir does not recognise (commondir,
     dangling HEAD symlink): the safe.bareRepository=explicit assumption must
@@ -473,6 +480,7 @@ def test_planted_gitdir_refused_by_git_with_explicit(explicit: GG, repo: Path, l
     assert r.rc != 0 or Path(r.out.strip()).resolve() == (repo / ".git").resolve(), r.text
 
 
+@pytest.mark.discovery
 def test_core_worktree_hookspath(explicit: GG, repo: Path, tmp_path: Path) -> None:
     """[47] core.worktree in .git/config: git takes that directory as the root
     and resolves a relative core.hooksPath there."""
@@ -602,6 +610,7 @@ def _with_env(gg: GG, **extra: str) -> GG:
     return GG(env={**gg.env, **extra}, state=gg.state)
 
 
+@pytest.mark.discovery
 def test_ceiling_directories_stop_gitguard_where_git_stops(gg: GG, repo: Path) -> None:
     """GIT_CEILING_DIRECTORIES=<repo>: from <repo>/sub git does not enter <repo>
     and finds nothing. gitguard used to walk up anyway, check the repository
@@ -625,6 +634,7 @@ def test_ceiling_directories_stop_gitguard_where_git_stops(gg: GG, repo: Path) -
     assert g2.run("git", "status", cwd=repo).blocked
 
 
+@pytest.mark.discovery
 def test_ceiling_entries_are_resolved_unless_after_an_empty_one(gg: GG, repo: Path, tmp_path: Path) -> None:
     sub = repo / "sub"
     sub.mkdir()
@@ -664,6 +674,7 @@ def _other_gitdir(repo: Path, tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize("where", ["root", "subdir", "linked_worktree"])
+@pytest.mark.discovery
 def test_env_common_dir_is_the_common_dir(explicit: GG, repo: Path, tmp_path: Path,
                                           monkeypatch, where: str) -> None:
     """GIT_COMMON_DIR (absolute): git reads config and hooks there, in a
@@ -690,6 +701,7 @@ def test_env_common_dir_is_the_common_dir(explicit: GG, repo: Path, tmp_path: Pa
     assert r.blocked and "common" in r.text, r.text
 
 
+@pytest.mark.discovery
 def test_env_common_dir_relative_refused(explicit: GG, repo: Path, tmp_path: Path,
                                          monkeypatch) -> None:
     """Deliberate divergence, fail closed: git reads a relative GIT_COMMON_DIR
@@ -709,6 +721,7 @@ def test_env_common_dir_relative_refused(explicit: GG, repo: Path, tmp_path: Pat
         assert r.blocked and "GIT_COMMON_DIR" in r.err, (rel, r.text)
 
 
+@pytest.mark.discovery
 def test_env_common_dir_discovery_head_only(gg: GG, repo: Path, tmp_path: Path,
                                             monkeypatch) -> None:
     """With GIT_COMMON_DIR, is_git_directory looks for objects/ and refs/ in

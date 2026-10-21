@@ -511,6 +511,29 @@ class Repo:
         return sorted(out)
 
 
+# --------------------------------------------------------------- discovery
+# Port of git's repository discovery (setup.c, path.c), the one part of
+# gitguard that must agree with git *before* anything is read: a
+# divergence here checks a repository git does not open, or lets through
+# one it does ([23] [28] [47] [49] [53] [54]). Each function names the git
+# function it mirrors. The ports were written against git 2.50 and are
+# checked by `pytest -m discovery` (tests/test_git_parity.py, git as the
+# oracle; the header of every run names the git used): run it after a git
+# upgrade, and re-read the git function when it fails.
+#
+#   _validate_headref   validate_headref        (setup.c)
+#   is_bare_gitdir      is_git_directory        (setup.c)
+#   find_root           setup_git_directory_gently_1 (setup.c): `.git` file or
+#                       directory first, the directory itself second, the
+#                       ceiling and the device boundary where git stops
+#   _ceiling_offset     longest_ancestor_length (path.c) + canonicalize_ceiling_entry
+#   _env_bool           git_env_bool            (config.c)
+#   _read_path_file     read_gitfile_gently / get_common_dir_noenv (setup.c):
+#                       one path, trailing CR/LF trimmed, nothing else
+#   read_gitfile        read_gitfile_gently     (setup.c)
+#   open_repo           setup_discovered_git_dir + get_common_dir_noenv +
+#                       core.worktree (setup.c)
+#   env_common_dir      GIT_COMMON_DIR as environment.c and setup.c take it
 def _validate_headref(p: Path) -> bool:
     """git's validate_headref: a symlink to `refs/…`, or a file holding
     `ref: refs/…` (any git whitespace after the colon) or a hex object id."""

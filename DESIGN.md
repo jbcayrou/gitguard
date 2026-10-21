@@ -734,7 +734,11 @@ to run before any change:
 - `tests/test_git_parity.py` — **git as the oracle**: everything git reads
   (config parser, path expansion, includes, alias tokens, discovery — ceiling
   directories included —, index gitlinks, config file origins) gitguard must
-  read too. Known divergences
+  read too. The discovery tests carry the `discovery` marker: `pytest -m
+  discovery` after a git upgrade re-checks the ports of setup.c (the
+  section header in gitguard.py maps each function to its git original;
+  the suite's header names the git used as the oracle). Checked so far
+  against git 2.47.3 (Debian 13) and 2.50.0 (Homebrew). Known divergences
   are marked `xfail(strict=True)`: the suite stays green, a fix makes the
   test XPASS so the mark gets removed and the scenario promoted to
   `tests/attacks/`. See "Known limitations" for the list.

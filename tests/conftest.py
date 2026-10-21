@@ -44,6 +44,13 @@ def _real_git() -> str:
 REAL_GIT = _real_git()
 
 
+def pytest_report_header(config) -> str:
+    """Which git the parity tests took as the oracle: the discovery ports
+    (`-m discovery`) and the byte-variant tables were checked against it."""
+    r = subprocess.run([REAL_GIT, "--version"], capture_output=True, text=True)
+    return f"git oracle: {REAL_GIT} ({r.stdout.strip() or 'version unknown'})"
+
+
 @dataclass
 class Result:
     rc: int
