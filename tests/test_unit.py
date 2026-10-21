@@ -431,9 +431,10 @@ def test_real_git_skips_itself(tmp_path: Path, monkeypatch) -> None:
 
 # ------------------------------------------------------------------ pending
 def test_notify_pending_calls_once_with_sanitized_text(monkeypatch, tmp_path: Path) -> None:
+    import subprocess
     import sys
     calls = []
-    monkeypatch.setattr(gg_mod.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: calls.append(cmd))
     monkeypatch.setattr(gg_mod, "NOTIFY_SEND", sys.executable)        # "exists": that branch is taken
     monkeypatch.delenv("GITGUARD_NO_NOTIFY", raising=False)
     gg_mod.notify_pending(Path("/r/\x1b[2Kevil"), "x" * 500)
@@ -446,11 +447,12 @@ def test_notify_pending_calls_once_with_sanitized_text(monkeypatch, tmp_path: Pa
 
 
 def test_notify_pending_swallows_failures(monkeypatch) -> None:
+    import subprocess
     import sys
 
     def boom(*a, **k):
         raise OSError("no bus")
-    monkeypatch.setattr(gg_mod.subprocess, "run", boom)
+    monkeypatch.setattr(subprocess, "run", boom)
     monkeypatch.setattr(gg_mod, "NOTIFY_SEND", sys.executable)
     monkeypatch.delenv("GITGUARD_NO_NOTIFY", raising=False)
     gg_mod.notify_pending(Path("/r"), "y")          # no exception

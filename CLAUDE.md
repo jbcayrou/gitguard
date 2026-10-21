@@ -660,9 +660,14 @@ hatch `GITGUARD_PRUNE` was also misleading: the gitlink detection never
 depended on it, so a vendored repository stayed refused after adding it —
 the real way out is a submodule (`absorbgitdirs`), now named by the message.
 
-Performance (M4 Pro, see PERF.md for the full tables): ~45 ms overhead per
-command, constant whatever the tree (Python startup + stdlib imports 32 ms,
-gitguard ~13 ms). The one size-dependent cost was the Python parse of the
+Performance (M4 Pro, see PERF.md for the full tables): ~33 ms overhead per
+command, constant whatever the tree: interpreter 16 ms, stdlib imports 6 ms,
+**compiling the script 15 ms** (a script run by path is never cached as
+`.pyc`; only an `import` is), gitguard's own work ~2 ms. The imports are
+kept to what every command needs; `subprocess`, `shutil`, `difflib`,
+`termios`, `fcntl` and `dataclasses` were 12 ms of imports paid by every
+check and are now imported where used (trust, restore, pending, the
+prompt). The one size-dependent cost was the Python parse of the
 index (40 ms for 96k entries): it is cached in `<key>.idx` keyed by the
 file's sha256 (4 ms for 10 MB; a byte-pattern shortcut "no 0160000 mode
 present" was tried and dropped: in 10 MB of SHAs it appears ~800 times).

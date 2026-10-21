@@ -34,23 +34,21 @@ Threat model, design choices and vulnerability history: see CLAUDE.md.
 """
 from __future__ import annotations
 
-import difflib
-import fcntl
+# Only what every command needs: each `gitguard git …` pays these imports
+# (about 12 ms of the 45 ms overhead before this trim). `subprocess`, `shutil`,
+# `difflib`, `termios`, `fcntl` and `dataclasses` are imported where used —
+# trust, restore, pending, a prompt — never on the check-then-exec path.
 import hashlib
 import json
 import os
 import re
 import shlex
-import shutil
 import stat
-import subprocess
 import sys
-import termios
 import time
-from dataclasses import dataclass, field
+from collections.abc import Iterator
 from functools import cached_property
 from pathlib import Path
-from typing import Iterator
 
 FORMAT_VERSION = 4   # 4: symlink hashes include the target's content
 
@@ -465,7 +463,6 @@ def key_for(root: Path) -> Path:
     return STATE / hashlib.sha256(str(root).encode()).hexdigest()[:16]
 
 
-@dataclass
 class Repo:
     root: Path        # work tree root, canonical (core.worktree honoured)
     gitdir: Path      # real gitdir (resolved if gitfile)
@@ -473,7 +470,14 @@ class Repo:
     # Directory whose `.git` was discovered: the state key and `.root` are
     # derived from it, not from a `core.worktree` the config may redirect
     # the tree to (that redirection is itself a config change). [47]
-    anchor: Path | None = None
+    anchor: Path | None
+
+    def __init__(self, root: Path, gitdir: Path, common: Path,
+                 anchor: Path | None = None) -> None:
+        self.root, self.gitdir, self.common, self.anchor = root, gitdir, common, anchor
+
+    def __repr__(self) -> str:
+        return f"Repo({self.root!r}, {self.gitdir!r}, {self.common!r}, {self.anchor!r})"
 
     @property
     def key(self) -> Path:
@@ -1657,13 +1661,29 @@ def _expand2(value: str, base: Path) -> tuple[Path, Path]:
 
 
 # -------------------------------------------------------------- fingerprint
-@dataclass(frozen=True)
 class Entry:
+    """One watched file. Value semantics: equal when all five fields are,
+    hashable, serialised through `__dict__` (field order = constructor order)."""
     scope: str        # local | common | wt | ext
     path: str         # relative to the scope base (ext: absolute)
     kind: str         # f | l
     mode: str
     sha: str
+
+    def __init__(self, scope: str, path: str, kind: str, mode: str, sha: str) -> None:
+        self.scope, self.path, self.kind, self.mode, self.sha = scope, path, kind, mode, sha
+
+    def _key(self) -> tuple[str, str, str, str, str]:
+        return (self.scope, self.path, self.kind, self.mode, self.sha)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Entry) and self._key() == other._key()
+
+    def __hash__(self) -> int:
+        return hash(self._key())
+
+    def __repr__(self) -> str:
+        return "Entry" + repr(self._key())
 
 
 def _hash_into(h: "hashlib._Hash", p: Path) -> None:
@@ -1843,7 +1863,6 @@ def scope_base(repo: Repo, scope: str) -> Path:
     return {"local": repo.gitdir, "common": repo.common, "wt": repo.root}.get(scope, Path("/"))
 
 
-@dataclass
 class Manifest:
     """Recorded trust state. `current` false = written by an earlier version:
     to be re-validated (`retrust`), never compared."""
@@ -1851,6 +1870,10 @@ class Manifest:
     root: str | None
     refs: list[tuple[str, Path]]            # roots designated by the trusted config
     entries: dict[tuple[str, str], Entry]
+
+    def __init__(self, version: int, root: str | None, refs: list[tuple[str, Path]],
+                 entries: dict[tuple[str, str], Entry]) -> None:
+        self.version, self.root, self.refs, self.entries = version, root, refs, entries
 
     @property
     def current(self) -> bool:
@@ -1899,6 +1922,7 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]] | None = None,
     }, indent=1, ensure_ascii=False))
     # The backup is built alongside then swapped in: a crash midway leaves the
     # old state intact, never a manifest without its backup.
+    import shutil
     bak = Path(str(key) + ".d")
     new = Path(str(key) + ".d.tmp")
     shutil.rmtree(new, ignore_errors=True)
@@ -1951,6 +1975,7 @@ def _label(scope: str, path: str) -> str:
 
 def _copy_entry(src: Path, dst: Path) -> None:
     """Copy without ever following a link: a symlink is recreated as is."""
+    import shutil
     if src.is_symlink():
         os.symlink(os.readlink(src), dst)
     else:
@@ -1987,6 +2012,7 @@ def update_pending(key: Path, fn) -> dict | None:
     `<key>.pending.lock` file could never be removed (unlinking a lock file
     under a holder lets a third process take a second "exclusive" lock on a
     fresh inode), so every `trust` left one behind for ever. [57]"""
+    import fcntl
     STATE.mkdir(parents=True, exist_ok=True)
     STATE.chmod(0o700)
     fd = os.open(str(STATE), os.O_RDONLY)
@@ -2022,6 +2048,7 @@ def _alive(pid) -> bool:
 
 def _proc_info(pid: int) -> tuple[int, str, str] | None:
     """(ppid, name, args) of a process: /proc on Linux, /bin/ps elsewhere."""
+    import subprocess
     proc = Path(f"/proc/{pid}")
     try:
         if proc.is_dir():
@@ -2079,6 +2106,7 @@ def notify_pending(label, text: str) -> None:
                "-e", "end run", title, body]
     else:
         return
+    import subprocess
     try:
         subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=3)
@@ -2212,6 +2240,7 @@ def _config_lines(p: Path) -> list[str]:
 
 
 def _print_diff(old_cfg: Path, cfg: Path) -> None:
+    import difflib
     a = _config_lines(old_cfg)
     b = _config_lines(cfg)
     for line in list(difflib.unified_diff(a, b, lineterm=""))[2:]:   # without ---/+++
@@ -2352,6 +2381,7 @@ def forget_key(key: Path) -> None:
         p = Path(str(key) + suffix)
         if p.exists():
             p.unlink()
+    import shutil
     shutil.rmtree(str(key) + ".d", ignore_errors=True)
     shutil.rmtree(str(key) + ".d.tmp", ignore_errors=True)
 
@@ -2550,14 +2580,24 @@ GLOBAL_FLAGS = {"-p", "--paginate", "-P", "--no-pager", "--no-replace-objects", 
 GLOBAL_STOP = {"-h", "--help", "-v", "--version"}   # git turns them into a command
 
 
-@dataclass
 class GlobalOpts:
     cwd: Path                 # effective cwd after the -C options (not canonicalised)
     gitdir: Path | None       # --git-dir, relative to that cwd
     worktree: Path | None     # --work-tree, relative to that cwd
     rest: list[str]           # from the subcommand onwards
-    config: list[str] = field(default_factory=list)      # -c arguments (`key=value`)
-    config_env: list[str] = field(default_factory=list)  # --config-env arguments (`key=VAR`)
+    config: list[str]         # -c arguments (`key=value`)
+    config_env: list[str]     # --config-env arguments (`key=VAR`)
+
+    def __init__(self, cwd: Path, gitdir: Path | None, worktree: Path | None,
+                 rest: list[str], config: list[str] | None = None,
+                 config_env: list[str] | None = None) -> None:
+        self.cwd, self.gitdir, self.worktree, self.rest = cwd, gitdir, worktree, rest
+        self.config = [] if config is None else config
+        self.config_env = [] if config_env is None else config_env
+
+    def __repr__(self) -> str:
+        return (f"GlobalOpts({self.cwd!r}, {self.gitdir!r}, {self.worktree!r}, "
+                f"{self.rest!r}, {self.config!r}, {self.config_env!r})")
 
 
 def split_global_options(args: list[str], cwd: Path) -> GlobalOpts:
@@ -2712,6 +2752,7 @@ def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None, git: 
     os.chdir(orig)
     if newrepo is None:
         os.execv(git, [git, *args])
+    import subprocess
     sub, d = newrepo
     preexisting = (d / ".git").exists() or (d / ".git").is_symlink()
     rc = subprocess.call([git, *args])
@@ -2803,6 +2844,7 @@ def ask_on_tty(question: str) -> bool:
     asked) or when GITGUARD_NO_PROMPT is set."""
     if not can_ask():
         return False
+    import termios
     try:
         # Two opens: "r+" in text mode requires a seekable stream.
         with open("/dev/tty", "w") as out, open("/dev/tty") as inp:
@@ -2830,6 +2872,7 @@ def has_tty() -> bool:
         return int(st[st.rindex(")") + 2:].split()[4]) != 0        # tty_nr
     except (OSError, ValueError, IndexError):
         pass
+    import subprocess
     try:
         r = subprocess.run(["/bin/ps", "-o", "tty=", "-p", str(os.getpid())],
                            capture_output=True, text=True, timeout=3)

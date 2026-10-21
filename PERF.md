@@ -70,7 +70,24 @@ git at `git.real`). Small repository, N = 20, 2026-10-19.
 `gitguard` alone: 29 ms; Python floor 16 ms. Same shape as macOS: the
 interpreter's startup is most of it, Linux starts it twice as fast.
 
-## Where the time goes
+## 2026-10-21: imports trimmed
+
+Same machine, small repository, N = 60, `rev-parse HEAD`: overhead 44 ms →
+33 ms. The modules only `trust`, `restore`, `pending` and the prompt need
+(`subprocess`, `shutil`, `difflib`, `termios`, `fcntl`, `dataclasses` — the
+last one pulls `inspect`) are imported where used; the four former
+dataclasses are written out. Import floor of the top-level modules 34 → 22
+ms (bare interpreter 16.5 ms).
+
+What remains, measured apart: bare interpreter 16 ms, imports 6 ms,
+**compiling gitguard.py 15 ms** — a script run by path is compiled on every
+run, only an imported module gets a cached `.pyc` —, gitguard's own work
+~2 ms. A two-file layout (a three-line launcher importing the module, whose
+`.pyc` is cached) measured 25.6 ms against 37.3 ms for the script, i.e.
+overhead 21 ms. `python3 -S` (no `site`) saves 5 ms on `python3 -c pass`
+but under 1 ms on a gitguard command: not worth an `env -S` shebang.
+
+## Where the time goes (2026-10-17 figures)
 
 | component                                             | cost            |
 |-------------------------------------------------------|----------------:|

@@ -54,8 +54,8 @@ to the gitguard symlink to remove the doubt. Tools built on libgit2 rather
 than the git binary do not run hooks or config commands and are outside this
 picture.
 
-Cost: one check per invocation, ~45 ms, whatever the size of the tree
-(see `PERF.md`). A prompt that calls git three times pays ~150 ms. In a
+Cost: one check per invocation, ~33 ms, whatever the size of the tree
+(see `PERF.md`). A prompt that calls git three times pays ~100 ms. In a
 repository you have not trusted, or whose trusted files changed, those calls
 are refused: the prompt shows no git information until you have decided.
 That silence is the signal.
