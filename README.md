@@ -73,8 +73,12 @@ That silence is the signal.
   `include.path` chains, scripts named in aliases, filters, drivers,
   `credential.helper`… — in the tree or outside it, as long as you could
   write there;
-- the system and global configs, parsed and hashed: a global
-  `core.hooksPath` pointing into the mounted volume is a bypass otherwise.
+- the paths named by the system and global configs: a global
+  `core.hooksPath` pointing into the mounted volume is a bypass otherwise
+  (the files themselves are parsed, not hashed: the sandbox cannot write
+  them). Files git reads as data — a signing key, `commit.template`,
+  `core.excludesFile` — are not watched, and a private file (0600) named by
+  a program key is never copied into the state directory nor restored.
 
 Every later `git` invocation is checked against that fingerprint first. Any
 deviation, structural anomaly (symlinked `.git`, bare gitdir planted in a
@@ -279,11 +283,6 @@ A new version may change what the fingerprint contains; `gitguard list`
 then shows the repositories as "legacy". `gitguard retrust` re-validates in
 bulk the ones that are unchanged and skips the modified ones.
 
-The same command handles a change to your **global** config (`git config
---global`, `git lfs install`), which marks every registered repository
-modified at once: `retrust` shows that diff once and, on a terminal, asks
-once for all the repositories it is the only change of.
-
 ## Commands
 
 | Command | What it does |
@@ -297,7 +296,7 @@ once for all the repositories it is the only change of.
 | `gitguard pending [<repo>… \| -a \| -c <repo>…]` | Decisions waiting for a git blocked by a program: list, review and allow/refuse, or clear. |
 | `gitguard forget <repo>…` / `--missing` | Remove entries; the repository becomes "never trusted" again. |
 | `gitguard prune` | Same as `forget --missing`. |
-| `gitguard retrust` | Re-validate unchanged repositories after an upgrade; review a global config change once for all. |
+| `gitguard retrust` | Re-validate unchanged repositories after an upgrade. |
 
 Management commands write to stdout (`gitguard list | grep modified`
 works); refusals and diagnostics go to stderr.
@@ -342,6 +341,9 @@ refused (git itself reads it against two different directories in one run).
 - No desktop notification without a session (ssh, cron, systemd): the
   pending record is still written and the wait still times out; check
   `gitguard pending` by hand.
+- Your global config is read for the paths it names, not fingerprinted: a
+  `git config --global` that names no file (an alias, a pager) is not seen.
+  Whoever could write it could write gitguard's state directory too.
 - Bare repositories are refused, not managed. `core.splitIndex` is refused
   (the gitlinks it needs to read live in `sharedindex.*`).
 - Parity with git is checked against git itself in `tests/test_git_parity.py`;
@@ -350,7 +352,7 @@ refused (git itself reads it against two different directories in one run).
   git dies on in a config file is refused.
 
 `CLAUDE.md` holds the design notes, the review method and the catalogue of
-the 50 bypasses and false positives found so far (`tests/attacks/`).
+the 56 bypasses and false positives found so far (`tests/attacks/`).
 
 ## Tests
 

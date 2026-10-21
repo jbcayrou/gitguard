@@ -67,25 +67,6 @@ def test_vscode_merge_base_accepted_without_prompt(gg: GG, repo: Path, subsrc: P
     assert gg.check(repo).blocked
 
 
-def test_retrust_accepts_a_global_change_once_for_all(gg: GG, repo: Path, tmp_path: Path) -> None:
-    """One review of the global diff on the terminal, one answer, applied to
-    every repository whose only deviation it is."""
-    other = tmp_path / "other"
-    assert gg.git("init", "-q", str(other)).rc == 0
-    gg.trust(other)
-    cfg = Path(gg.env.get("GIT_CONFIG_GLOBAL") or Path(gg.env["HOME"]) / ".gitconfig")
-    with cfg.open("a") as f:
-        f.write("[alias]\n\tst = status\n")
-    assert gg.run("list").out.count("modified") == 2
-    rc, out, tty = run_with_tty(gg, ["retrust"], repo, "n")
-    assert rc == 0 and "Accept this global change for these 2" in tty, tty
-    assert gg.run("list").out.count("modified") == 2
-    rc, out, tty = run_with_tty(gg, ["retrust"], repo, "y")
-    assert rc == 0 and "2 repository(ies) re-trusted" in tty, tty
-    assert gg.run("list").out.count("modified") == 0 and gg.run("list").out.count("ok") == 2
-    assert not gg.check(repo).blocked and not gg.check(other).blocked
-
-
 def test_branch_u_from_linked_worktree(gg: GG, repo: Path, subsrc: Path, tmp_path: Path) -> None:
     """From a linked worktree, git writes into the main repository's config
     (scope `common`): same shortcut."""

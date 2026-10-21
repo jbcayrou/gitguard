@@ -41,24 +41,6 @@ def attack_rebase_todo_exec(gg: GG, repo: Path, tmp_path: Path) -> None:
     todo.write_text("exec /tmp/evil\n" + todo.read_text())
 
 
-def attack_global_gitconfig(gg: GG, repo: Path, tmp_path: Path) -> None:
-    """~/.gitconfig modified ($HOME mounted in the container)"""
-    gg.git("config", "--global", "core.sshCommand", "/tmp/evil", cwd=repo)
-
-
-def attack_global_gitconfig_symlink_target(gg: GG, repo: Path, tmp_path: Path) -> None:
-    """[22] ~/.gitconfig is a symlink (dotfiles): the target's content changes,
-    the link string does not → the global scope fingerprint did not move"""
-    import os
-    home = Path(gg.env["HOME"])
-    dot = tmp_path / "dotfiles" / "gitconfig"
-    dot.parent.mkdir()
-    (home / ".gitconfig").rename(dot)
-    os.symlink(dot, home / ".gitconfig")
-    gg.trust(repo)
-    dot.write_text(dot.read_text() + "[core]\n\tsshCommand = /tmp/evil\n")
-
-
 def _interrupted_rebase(gg: GG, wt: Path, tmp_path: Path) -> Path:
     """Three commits in `wt`, then `rebase -i HEAD~2` stopped on a `break`.
     Returns the todo file (in the gitdir git resolves from `wt`)."""

@@ -65,9 +65,8 @@ gitguard pending [<repo>... | -a | -c <repo>...]   decisions waiting for a git b
                        list; review (diff + calling process) and allow/refuse; clear
 gitguard forget <repo>... | --missing   remove entries (the repository becomes "never trusted" again)
 gitguard prune         = forget --missing
-gitguard retrust       re-validate in bulk the "ok" or "legacy" repositories; a change to the
-                       global config is shown once and, on a terminal, accepted once for every
-                       repository it is the only deviation of; anything else modified is skipped
+gitguard retrust       re-validate in bulk the "ok" or "legacy" repositories; anything
+                       modified is skipped
 gitguard help
 ```
 
@@ -310,8 +309,22 @@ other variables are expanded from gitguard's environment, which git inherits
 ([37]). **A directory is only retained for the keys that read its content**
 (`DIR_KEYS`: `core.hooksPath`, `init.templateDir`): git executes files, and a
 directory in any other value is a program argument (`safe.directory =
-~/projects`, `remote.origin.url = /local/repo`, `!make -C src`). Exception,
-a **local remote** (`remote.*.url`/`pushurl` = a path or `file://` to a
+~/projects`, `remote.origin.url = /local/repo`, `!make -C src`). **A file
+is not retained for the keys whose value git reads as data** (`DATA_KEYS`,
+the mirror of `DIR_KEYS`: `user.signingKey`, `gpg.ssh.allowedSignersFile`,
+`core.excludesFile`, `core.attributesFile`, `commit.template`,
+`blame.ignoreRevsFile`, `mailmap.file`, `diff.orderFile`, `http.sslKey`…):
+a closed list, each key documented by git as a path to a file it, ssh-keygen
+or curl reads and never runs. The generic rule took `user.signingKey =
+~/.ssh/id` (ssh signing) for a program: hashed on every command, copied into
+every `<key>.d/ext/`, each rotation refused every repository, and `restore`
+wrote the old key over the new one ([56]). Program keys (`gpg.program`,
+`core.sshCommand`, `credential.helper`) stay under the generic rule, so a
+key named as their argument (`ssh -i ~/.ssh/id`) is still watched; for that
+case an **`ext` file without group/other read bits** (`_private_ext`, 0600:
+keys, credentials) is hashed but **never copied into the state directory
+nor written back by `restore`**, which names it and leaves it alone.
+Exception, a **local remote** (`remote.*.url`/`pushurl` = a path or `file://` to a
 repository, `_local_remote`): `push` runs its hooks and honours its config,
 so its `config` and `hooks/` are watched (scope `ext` or `wt`) and that
 config is parsed like the others — but its own remotes are not followed
@@ -352,9 +365,12 @@ not watched ([39]), then `/etc/gitconfig` (or
 `GIT_CONFIG_SYSTEM`), `~/.gitconfig`, `GIT_CONFIG_GLOBAL`,
 `$XDG_CONFIG_HOME/git/config`. Their values name paths the sandbox can write
 — a **global** `core.hooksPath` or `include.path` pointing into the mounted
-volume was a complete bypass ([16]). The global config is also hashed as is
-(scope `global`) and backed up so that its diff can be shown, but never
-restored. Last, the **config git takes from its
+volume was a complete bypass ([16]). These files are **parsed, never
+hashed**: the sandbox cannot write them, whoever can (`$HOME` mounted) can
+write the state directory too, and hashing them turned every registered
+repository "modified" at each `git config --global` or `git lfs install`
+([56]; a former scope `global`, with a grouped review in `retrust`, is
+gone). Last, the **config git takes from its
 environment and command line** (`env_config`: `GIT_CONFIG_PARAMETERS` in
 both of git's quoting syntaxes, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
 `VALUE_n`, and in exec mode the `-c`/`--config-env` of the command,
@@ -423,8 +439,7 @@ one version: the symlink path went to git, exec mode unusable — tested
 since). Every user error is a `Refuse` exception caught in `__main__`
 (exit 1); an unknown subcommand or a stray argument is one too (a typo used
 to fall through to a silent check, exit 0). The scopes: `local` (gitdir), `common` (commondir of a worktree),
-`wt` (tree), `ext` (outside the tree, writable), `global` (global config,
-never restored).
+`wt` (tree), `ext` (outside the tree, writable).
 
 ## Storage
 
@@ -434,8 +449,8 @@ sha256 of the root's absolute path:
 
 ```
 <key>           reference manifest
-<key>.d/        backup of the watched files (.root, local/…, common/…, wt/…, ext/…,
-                global/… — the last one only for the diff, never restored)
+<key>.d/        backup of the watched files (.root, local/…, common/…, wt/…, ext/…;
+                an ext file without group/other read bits — a key — is never copied [56])
 <key>.idx       cache of the index parse: version, then one record per index file
                 of the repository (its own, modules/<x>, worktrees/<x>: sha256 of the
                 file + gitlinks), rewritten by any check when an index changes; a
@@ -589,13 +604,11 @@ four wrapped calls seen came from `pre-commit install`, before the hook
 existed. cron: `PATH=/usr/bin:/bin`, no tty, waits the default 60 s,
 records `sh ← cron ← cron`; the `%` of a `date +%s` in a crontab is a
 newline, not a gitguard matter. `git lfs install` writes four
-`filter.lfs.*` keys into the global config: every registered repository
-turned "modified" at once, each with one unreadable line (`modified
-global:~/.gitconfig`, no backup of the global files, hence no diff) and
-`retrust` skipped them all: one `trust` per repository. Now the global
-files are backed up too (never restored), the diff is shown, and `retrust`
-groups the repositories whose only deviation is the same global diff: one
-review on the terminal, one answer, applied to the group. root running git in a user's repository
+`filter.lfs.*` keys into the global config: while that file was hashed,
+every registered repository turned "modified" at once (first with one
+unreadable line, then with a diff and a grouped review in `retrust`); since
+[56] the global config is parsed, not hashed, and the command is silent.
+root running git in a user's repository
 gets "suspicious owner/permissions" on `config` (the file is not root's)
 and an empty state of its own. A rootless podman container writing as its
 root (= the user's uid) plants hook, config and include in one go; as uid
@@ -744,7 +757,7 @@ Rule: any new vector or false positive discovered must first become a test.
 ## Adversarial review playbook
 
 gitguard has been through nine adversarial review passes (the numbered
-catalogue in `tests/attacks/__init__.py` is their output: 54 bypasses and
+catalogue in `tests/attacks/__init__.py` is their output: 56 bypasses and
 false positives, two of them RCEs found after the tool was believed solid;
 [44] is still open, see "Known limitations"; the ninth pass was the
 promotion of the git-parity `xfail`s [46]–[50]).
@@ -881,6 +894,10 @@ content; fail closed on anything the parser cannot make sense of.
   `GIT_EXTERNAL_DIFF`, `GIT_SEQUENCE_EDITOR`, `GIT_EXEC_PATH`) are not
   read: a value naming a script of the volume is the same class as a
   `PATH` directory in it (above), not fingerprinted.
+- The system and global config files are parsed for the paths they name,
+  not hashed ([56]): a global change that names no file of the volume
+  (`alias.x = !curl …`, `core.pager`) is not seen. Writing `~/.gitconfig`
+  takes the same access as writing the state directory: out of the model.
 - gitguard.py has no dependency outside the stdlib (diff via `difflib`); the
   tests need `pytest` and `git`.
 - A context without a terminal and without a desktop session (ssh, cron,

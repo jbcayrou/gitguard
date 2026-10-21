@@ -362,3 +362,45 @@ def test_index_names_close_to_git_rules(gg: GG, repo: Path, name: str) -> None:
     assert gg.git("commit", "-qm", name, cwd=repo).rc == 0
     assert not gg.check(repo).blocked
     assert not gg.run("git", "checkout", "--", ".", cwd=repo).blocked
+
+
+def test_global_config_change_without_a_path_is_silent(gg: GG, repo: Path) -> None:
+    """[56] The global config is parsed for the paths it names, never hashed:
+    whoever can write ~/.gitconfig can write the state directory, and every
+    `git config --global` / `git lfs install` turned every repository
+    "modified" at once."""
+    for k, v in [("user.email", "x@y"), ("alias.st", "status"),
+                 ("filter.lfs.clean", "git-lfs clean -- %f"), ("filter.lfs.smudge", "git-lfs smudge -- %f"),
+                 ("filter.lfs.process", "git-lfs filter-process"), ("filter.lfs.required", "true")]:
+        assert gg.git("config", "--global", k, v).rc == 0
+    assert not gg.check(repo).blocked
+    assert not gg.run("git", "status", cwd=repo).blocked
+    assert "ok" in gg.run("list").out and "modified" not in gg.run("list").out
+    assert not (gg.key_for(repo).with_name(gg.key_for(repo).name + ".d") / "global").exists()
+
+
+@pytest.mark.parametrize("key, extra", [
+    ("user.signingKey", ("gpg.format", "ssh")),
+    ("gpg.ssh.allowedSignersFile", None),
+    ("commit.template", None),
+    ("core.excludesFile", None),
+    ("http.https://x.example.sslKey", None),
+])
+def test_data_key_file_rotation_is_silent(gg: GG, repo: Path, tmp_path: Path, key: str, extra) -> None:
+    """[56] A file git reads as data (DATA_KEYS: a signing key, a template, an
+    excludes file…) is not watched: rewriting it — a key rotation — is not a
+    change of the repository, and a private key is never copied into the
+    state directory."""
+    f = tmp_path / "home" / "datafile"
+    f.write_text("SECRET\n")
+    f.chmod(0o600)
+    if extra:
+        assert gg.git("config", "--global", *extra).rc == 0
+    assert gg.git("config", "--global", key, str(f)).rc == 0
+    r = gg.trust(repo)
+    assert "ext:" not in r.text, r.text
+    bak = gg.key_for(repo).with_name(gg.key_for(repo).name + ".d")
+    assert not any(p.name == "datafile" for p in bak.rglob("*")), "the data file was copied"
+    f.write_text("ROTATED\n")
+    assert not gg.check(repo).blocked
+    assert not gg.run("git", "status", cwd=repo).blocked

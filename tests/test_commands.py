@@ -95,10 +95,6 @@ def test_restore_never_deletes_outside_the_trusted_roots(gg: GG, repo: Path, tmp
     assert not gg.check(repo).blocked
 
 
-def _global_config(gg: GG) -> Path:
-    return Path(gg.env.get("GIT_CONFIG_GLOBAL") or Path(gg.env["HOME"]) / ".gitconfig")
-
-
 def test_config_diff_keeps_a_lone_cr_inside_its_line(gg: GG, repo: Path) -> None:
     """[53] The diff shown before [y/N] split lines in text mode: a lone CR became
     a line break, so `hooksPath = .githooks<CR>x = y` showed as two clean lines,
@@ -111,36 +107,6 @@ def test_config_diff_keeps_a_lone_cr_inside_its_line(gg: GG, repo: Path) -> None
     assert any("+?hooksPath = .githooks?x = y" in l for l in lines), r.out
     assert not any(l.strip() in ("+x = y", "x = y") for l in lines), r.out
     assert any(l.strip() == "+[core]" for l in lines), "CRLF must read as a plain line end"
-
-
-def test_global_config_change_shows_its_diff(gg: GG, repo: Path) -> None:
-    """`git lfs install` turned every repository "modified" with one line,
-    `modified global:~/.gitconfig`, and nothing to read: the global files are
-    backed up too (never restored) so the diff can be shown."""
-    cfg = _global_config(gg)
-    with cfg.open("a") as f:
-        f.write("[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n")
-    r = gg.run("diff", cwd=repo)
-    assert r.rc == 0 and "global:" in r.out, r.text
-    assert f"diff of {cfg}" in r.out and "+?clean = git-lfs clean -- %f" in r.out, r.out
-    assert gg.run("restore", "-y", cwd=repo).rc == 0
-    assert "git-lfs" in cfg.read_text(), "the global config is never restored"
-
-
-def test_retrust_groups_a_global_only_change_but_needs_a_terminal(gg: GG, repo: Path, tmp_path: Path) -> None:
-    other = tmp_path / "other"
-    assert gg.git("init", "-q", str(other)).rc == 0
-    gg.trust(other)
-    with _global_config(gg).open("a") as f:
-        f.write("[alias]\n\tst = status\n")
-    write_exec(other / ".git/hooks/pre-commit")            # global + local: not groupable
-    assert gg.run("list").out.count("modified") == 2
-    r = gg.run("retrust")                                  # no terminal: shown, not accepted
-    assert r.rc == 0, r.text
-    assert "global config changed" in r.text and str(repo) in r.text and "+?st = status" in r.text
-    assert "from a terminal" in r.text
-    assert f"skipped (modified): {other}" in r.text
-    assert gg.run("list").out.count("modified") == 2
 
 
 def test_restore_noop(gg: GG, repo: Path) -> None:
@@ -277,6 +243,38 @@ def test_clone_bare_runs_without_trust(gg: GG, tmp_path: Path) -> None:
 def test_failed_clone_propagates_rc(gg: GG, tmp_path: Path) -> None:
     r = gg.run("git", "clone", "-q", str(tmp_path / "nope"), "c3", cwd=tmp_path)
     assert r.rc != 0 and "trusted" not in r.err
+
+
+def test_private_ext_file_is_watched_but_never_copied_nor_restored(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[56] A file outside the tree named by a program key (`core.sshCommand =
+    ssh -i <key>`) is watched — the generic rule cannot tell a key from a
+    script — but a private one (no read bit for group/other) is never copied
+    into the state directory, and `restore` leaves it alone: it used to write
+    the old private key over a rotated one. Positive control: an ext hook
+    (0755) is still backed up and restored."""
+    key = tmp_path / "sshkey"
+    key.write_text("SECRET\n")
+    key.chmod(0o600)
+    hooks = tmp_path / "hooks"
+    write_exec(hooks / "pre-commit")
+    assert gg.git("config", "core.sshCommand", f"ssh -i {key}", cwd=repo).rc == 0
+    assert gg.git("config", "core.hooksPath", str(hooks), cwd=repo).rc == 0
+    r = gg.trust(repo)
+    assert f"ext:{key}" in r.text and f"ext:{hooks}" in r.text, r.text
+    bak = Path(str(gg.key_for(repo)) + ".d") / "ext"
+    assert (bak / str(hooks).lstrip("/") / "pre-commit").is_file()
+    assert not (bak / str(key).lstrip("/")).exists(), "the private key was copied"
+    key.write_text("ROTATED\n")
+    (hooks / "pre-commit").write_text("#!/bin/sh\nevil\n")
+    r = gg.check(repo)
+    assert r.blocked and f"modified  ext:{key}" in r.err and f"modified  ext:{hooks}/pre-commit" in r.err, r.err
+    r = gg.run("restore", "-y", cwd=repo)
+    assert r.rc == 0, r.text
+    assert "private file" in r.text and str(key) in r.text, r.text
+    assert key.read_text() == "ROTATED\n", "restore wrote the old private key back"
+    assert (hooks / "pre-commit").read_text() == "#!/bin/sh\nid\n", "the ext hook was not restored"
+    r = gg.check(repo)                   # only the rotated key still differs
+    assert r.blocked and f"ext:{key}" in r.err and "pre-commit" not in r.err, r.err
 
 
 # ----------------------------------------------------------- global options
@@ -758,7 +756,6 @@ def test_safe_bare_warning_at_trust_retrust_list(gg: GG, repo: Path) -> None:
     assert NEEDLE not in gg.check(repo).err, "not on every command"
     assert NEEDLE not in gg.run("git", "status", cwd=repo).err
     assert gg.git("config", "--global", "safe.bareRepository", "explicit").rc == 0
-    gg.trust(repo)                               # the global config changed
     for r in (gg.run("trust", cwd=repo), gg.run("list"), gg.run("retrust")):
         assert r.rc == 0 and NEEDLE not in r.err, r.text
 

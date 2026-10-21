@@ -1522,6 +1522,8 @@ def config_refs(repo: Repo) -> list[tuple[str, Path]]:
                 add(gd / "config", gd / "config")
                 add(gd / "hooks", gd / "hooks", allow_dir=True)
                 nxt.append((gd / "config", rbase, False))
+        elif _data_key(section, key):
+            return                       # a file read as data, never run [56]
         else:
             for tok in _value_tokens(value):
                 if tok and tok not in (".", "..") and not tok.startswith("-"):
@@ -1594,6 +1596,27 @@ def _submodule_configs(repo: Repo) -> list[tuple[Path, Path]]:
 # count.
 DIR_KEYS = {("core", "hookspath"), ("init", "templatedir")}
 
+# Keys whose value is a path to a file git (or ssh-keygen, curl) reads as
+# data and never runs: a signing key, a template, patterns. Not watched. The
+# generic rule below (any token that exists as a file) took a `user.signingkey
+# = ~/.ssh/id` for a program: hashed on every command, copied into every
+# `<key>.d/ext/`, each rotation refused every repository, and `restore` wrote
+# the old key back. Mirror of DIR_KEYS: a closed list for a false positive,
+# not a blocklist — `gpg.program`, `core.sshCommand`, `credential.helper` name
+# programs and stay under the generic rule. `http.<url>.*` matched on the
+# section head. [56]
+DATA_KEYS = {("user", "signingkey"), ("gpg.ssh", "allowedsignersfile"), ("gpg.ssh", "revocationfile"),
+             ("core", "excludesfile"), ("core", "attributesfile"), ("commit", "template"),
+             ("blame", "ignorerevsfile"), ("mailmap", "file"), ("diff", "orderfile"),
+             ("format", "signaturefile"), ("sendemail", "aliasesfile"),
+             ("http", "sslcert"), ("http", "sslkey"), ("http", "sslcainfo"),
+             ("http", "cookiefile"), ("http", "pinnedpubkey")}
+
+
+def _data_key(section: str, key: str) -> bool:
+    head = section.split(".", 1)[0]
+    return (section, key) in DATA_KEYS or (head == "http" and (head, key) in DATA_KEYS)
+
 
 _SH_SPLIT = re.compile(r"[\s;&|()<>{}=`'\"]+")
 _SH_TOPLEVEL = re.compile(r"\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)"
@@ -1636,8 +1659,8 @@ def _expand2(value: str, base: Path) -> tuple[Path, Path]:
 # -------------------------------------------------------------- fingerprint
 @dataclass(frozen=True)
 class Entry:
-    scope: str        # local | common | wt | ext | global
-    path: str         # relative to the scope base (ext/global: absolute)
+    scope: str        # local | common | wt | ext
+    path: str         # relative to the scope base (ext: absolute)
     kind: str         # f | l
     mode: str
     sha: str
@@ -1807,11 +1830,11 @@ def manifest(repo: Repo, refs: list[tuple[str, Path]]) -> dict[tuple[str, str], 
         entries += walk_gitdir(repo.common, "common")
     for scope, p in refs:
         entries += walk_tree(scope, repo.root, p)
-    for f in [*global_config_files(), xdg_config_home() / "git/attributes"]:
-        if f.is_file():
-            e = _mk("global", str(f), f)
-            if e:
-                entries.append(e)
+    # The system and global config files are parsed (config_refs) for the
+    # paths they name, never hashed: the sandbox cannot write them, and
+    # whoever can (HOME mounted) can write the state directory too. Hashing
+    # them turned every registered repository "modified" at each
+    # `git config --global` / `git lfs install`. [56]
     return {(e.scope, e.path): e for e in entries}
 
 
@@ -1882,10 +1905,8 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]] | None = None,
     new.mkdir()
     (new / ".root").write_text(str(repo.label) + "\n")
     for (scope, rel), e in man.items():
-        # `global` is copied too — never restored (the restore plan excludes
-        # the scope), kept so that a change there can be *shown*: without it
-        # a `git lfs install` turned every repository "modified" with one
-        # unreadable line, `modified global:~/.gitconfig`.
+        if _private_ext(e):
+            continue
         src = scope_base(repo, scope) / rel
         dst = new / scope / rel.lstrip("/")
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1910,6 +1931,17 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]] | None = None,
     shutil.rmtree(bak, ignore_errors=True)
     os.rename(new, bak)
     os.replace(tmp, key)
+
+
+def _private_ext(e: Entry) -> bool:
+    """An `ext` file nobody but its owner may read (0600: an ssh or TLS key
+    named by `core.sshCommand -i`, `http.sslKey`, a credentials file) is
+    hashed like any other but never copied into the state directory nor
+    written back by `restore`: a private key was duplicated into every
+    `<key>.d/ext/` and `restore` wrote the old key over a rotated one. Only
+    `ext`: the tree and the gitdir are what `restore` is for, and a 0600
+    `.git/config` (umask 077) must stay restorable. [56]"""
+    return e.scope == "ext" and e.kind == "f" and int(e.mode, 8) & 0o044 == 0
 
 
 def _label(scope: str, path: str) -> str:
@@ -2159,12 +2191,6 @@ def show_changes(repo: Repo, old: dict, new: dict, key: Path) -> None:
         if old_cfg.is_file() and cfg.is_file() and old_cfg.read_bytes() != cfg.read_bytes():
             err("\n  " + STYLE.bold(f"diff of {san(cfg)}:"))
             _print_diff(old_cfg, cfg)
-    for action, (scope, path) in changes(old, new):
-        if scope == "global" and action == "modified":
-            old_cfg = Path(str(key) + ".d") / "global" / path.lstrip("/")
-            if old_cfg.is_file() and Path(path).is_file():
-                err("\n  " + STYLE.bold(f"diff of {san(path)}:"))
-                _print_diff(old_cfg, Path(path))
 
 
 def _config_lines(p: Path) -> list[str]:
@@ -2195,8 +2221,7 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
     bak = Path(str(key) + ".d")
     if not bak.is_dir():
         raise Refuse(f"no backup for {repo.label} (run 'gitguard trust' again when the repository is clean)")
-    plan = [(("delete" if a == "added" else "restore"), k)
-            for a, k in changes(old, new) if k[0] != "global"]
+    plan = [(("delete" if a == "added" else "restore"), k) for a, k in changes(old, new)]
     # A deletion may only target the inside of the gitdir or of a root that the
     # **trusted** config designated. Without this, an `ext:` path that appeared
     # after the trust (hooksPath turned into a symlink to $HOME, say) made
@@ -2219,6 +2244,14 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
     for scope, path in kept:
         warn(f"{_label(scope, path)} is outside the paths designated by the trusted config: "
              f"left in place, not deleted. Inspect it by hand.")
+    # A private `ext` file has no backup (never copied, [56]): left as is.
+    for action, (scope, path) in list(plan):
+        copy = bak / scope / path.lstrip("/")
+        if action == "restore" and not (copy.is_symlink() or copy.is_file()):
+            plan.remove((action, (scope, path)))
+            kept.append((scope, path))
+            warn(f"{_label(scope, path)}: private file, never backed up: left as is. "
+                 f"Inspect it by hand.")
     if not plan:
         if kept:
             raise Refuse("nothing else to restore")
@@ -2343,57 +2376,15 @@ def cmd_forget(args: list[str]) -> None:
 
 def cmd_retrust() -> None:
     n = skipped = 0
-    # A change to the global/system config (`git lfs install`, `git config
-    # --global …`) turns every registered repository "modified" at once, with
-    # the same diff; trusting them one by one showed it N times. Repositories
-    # whose only deviation is that diff are grouped: one review on the
-    # terminal, one answer, applied to the group. Anything local on top keeps
-    # the repository out of the group (skipped, as before).
-    groups: dict[tuple, list] = {}
     for key, root, st in entries():
         if st in ("ok", "legacy") and root:
             save_trust(open_repo(root))
             clear_pending(key)
             n += 1
             info(f"re-trusted: {root}")
-        elif st == "modified" and root:
-            repo = open_repo(root)
-            refs = config_refs(repo)
-            new = manifest(repo, refs)
-            old = load_manifest(key)
-            diff = changes(old.entries, new) if old else []
-            if diff and all(k[0] == "global" for _, k in diff):
-                sig = tuple((a, k, old.entries[k].sha if k in old.entries else None,
-                             new[k].sha if k in new else None) for a, k in diff)
-                groups.setdefault(sig, []).append((key, repo, refs, old.entries, new))
-            else:
-                skipped += 1
-                warn(f"skipped ({st}): {root}")
         else:
             skipped += 1
             warn(f"skipped ({st}): {root or key.name}")
-    for members in groups.values():
-        key, repo, refs, old_entries, new = members[0]
-        rule()
-        warn(STYLE.bold(f"global config changed since the last trust of {len(members)} "
-                        f"repository(ies): {', '.join(san(str(m[1].label)) for m in members)}"))
-        show_changes(repo, old_entries, new, key)
-        err("")
-        rule()
-        if not can_ask():
-            skipped += len(members)
-            hint("run `gitguard retrust` from a terminal to accept this change for them, "
-                 "or `gitguard trust` in each")
-            continue
-        if not ask_on_tty(STYLE.yellow(f"Accept this global change for these {len(members)} "
-                                       f"repository(ies)? [y/N] ")):
-            skipped += len(members)
-            continue
-        for key, repo, refs, old_entries, new in members:
-            save_trust(repo, refs, new)      # the state shown, not a fresh scan
-            clear_pending(key)
-            n += 1
-            info(f"re-trusted: {repo.label}")
     info(f"{n} repository(ies) re-trusted, {skipped} skipped")
     check_safe_bare()
 

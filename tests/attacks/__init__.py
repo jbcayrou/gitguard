@@ -207,6 +207,20 @@ gitguard.py refer to this list (how the project reviews itself: CLAUDE.md,
      cache is versioned so that a record written before the check vouches
      for nothing. The refusal names the way out: delete the index, `git
      reset` rebuilds it from the commits, which git validates.
+[56] Global config hashed as a whole (scope `global`) and a private key
+     watched as a program. Every `git config --global` and `git lfs install`
+     turned every registered repository "modified" at once, for a file the
+     sandbox cannot write (whoever writes ~/.gitconfig writes the state
+     directory too); what the global config *names* in the volume is the
+     parse ([16]), kept. And the generic "any token that is a file" rule
+     watched `user.signingkey = ~/.ssh/id` (ssh signing: a file ssh-keygen
+     reads, never run): the private key was hashed on every command, copied
+     into every `<key>.d/ext/`, each rotation refused every repository, and
+     `gitguard restore` wrote the old private key over the new one. Fix: no
+     `global` scope; `DATA_KEYS` (files git reads as data, mirror of
+     DIR_KEYS) not watched; an `ext` file without group/other read bits is
+     hashed but never copied nor restored (same trap through
+     `core.sshCommand = ssh -i …`, `http.sslKey`…).
 """
 from __future__ import annotations
 
