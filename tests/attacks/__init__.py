@@ -12,7 +12,7 @@ refuses to run git. To add an attack: write the function in the module of the
 right family (or a new module), nothing else.
 
 Vulnerability catalogue — the ``# [n]`` comments in the tests and in
-gitguard.py refer to this list (how the project reviews itself: CLAUDE.md,
+gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
 "Adversarial review playbook"). Numbers 32–33 are unused.
 
  [1] core.hooksPath pointing into the work tree (husky, lefthook): hooks there

@@ -351,7 +351,7 @@ refused (git itself reads it against two different directories in one run).
   at the moment). Deliberate, fail-closed divergences: a NUL byte or a line
   git dies on in a config file is refused.
 
-`CLAUDE.md` holds the design notes, the review method and the catalogue of
+`DESIGN.md` holds the design notes, the review method and the catalogue of
 the 57 bypasses and false positives found so far (`tests/attacks/`).
 
 ## Tests

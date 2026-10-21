@@ -109,7 +109,7 @@ Conclusions:
   were taken: +210 ms on the kernel, +165 ms of it in `readdir` (APFS
   serialises it; a C `find` was slower, 8 threads 3× slower), for an early
   warning the gitlink check already gives. It was removed on 2026-10-18;
-  see CLAUDE.md, "Nested repositories".
+  see DESIGN.md, "Nested repositories".
 
 ## Reproducing
 

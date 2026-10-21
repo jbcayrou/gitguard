@@ -30,7 +30,7 @@ Env:      GITGUARD_STATE, GITGUARD_REAL_GIT, GITGUARD_ALLOW_REBASE_EXEC,
           for `gitguard pending`, 0 = never, default 60), GITGUARD_NO_NOTIFY,
           GITGUARD_DEBUG, NO_COLOR
 
-Threat model, design choices and vulnerability history: see CLAUDE.md.
+Threat model, design choices and vulnerability history: see DESIGN.md.
 """
 from __future__ import annotations
 
@@ -121,10 +121,10 @@ INCLUDE_DEPTH = 10      # git: MAX_INCLUDE_DEPTH = 10
 # refused. A walk (`GITGUARD_SCAN_TREE`, removed 2026-10-18) only closed the
 # window between that `add` and the next wrapped command — a window only a
 # git outside the wrapper can exploit, which is out of scope by design — for
-# +0.2 s per command on the Linux kernel. See CLAUDE.md, "Nested repositories".
+# +0.2 s per command on the Linux kernel. See DESIGN.md, "Nested repositories".
 
 # Volatile: what git rewrites during normal operation. Everything else in the
-# gitdir is watched (deny-by-default inversion, see CLAUDE.md).
+# gitdir is watched (deny-by-default inversion, see DESIGN.md).
 #
 # These names are **anchored**: they only count directly under a gitdir root
 # (the gitdir itself, or `modules/<x>/`, `worktrees/<x>/`, recognised by the
