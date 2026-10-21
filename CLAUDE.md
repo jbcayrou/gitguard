@@ -426,7 +426,7 @@ gitdir (volatile pruned): the fingerprint and the control-character scan of
 `_child_root` / `_zone` / `_volatile_dir` / `_volatile_file`, shared by
 `walk_gitdir` and `gitdir_excluded` (two copies had drifted apart: flaw [22]).
 `Manifest` (version/root/refs/entries, `current`) ← `load_manifest`;
-`load_pending` / `update_pending` (flock) / `record_pending` / `caller_chain` /
+`load_pending` / `update_pending` (flock on the state directory) / `record_pending` / `caller_chain` /
 `notify_pending` / `wait_for_decision`; `changes` / `show_changes` / `restore`;
 `entries` / `cmd_list` / `cmd_forget` / `cmd_retrust`; `review` / `review_pending` /
 `cmd_pending`; exec mode: `split_global_options` (pure, tested; knows every
@@ -459,10 +459,17 @@ sha256 of the root's absolute path:
 <key>.pending   a refusal nobody read (exec mode, no controlling terminal): kind
                 (changed/never/structural), message, the state seen (changed),
                 the waiting pids and their calling processes; read by `pending`
-<key>.pending.lock   flock for the read-modify-write of the record (never removed
-                except by forget: unlinking it under a holder would allow two locks)
 <key>.tmp, <key>.d.tmp, <key>.idx.tmp, <key>.pending.tmp   being written (swapped in by rename)
 ```
+
+The read-modify-write of a `.pending` record is serialised by a flock on
+the state directory itself (an fd of it), not on a `<key>.pending.lock`
+file: such a file can never be removed (unlinking it under a holder lets a
+third process take a second "exclusive" lock on a fresh inode) and every
+`trust` left one behind for ever ([57]). `prune` also removes the
+`.pending` record of a never-trusted repository that no longer exists
+(it has no manifest, so `list` and `entries()` do not see it) and the
+lock files of earlier versions.
 
 The root is canonicalised (`readlink -f`): accessing the repository through
 a symlinked path gives the same key. A moved repository becomes "never
@@ -757,7 +764,7 @@ Rule: any new vector or false positive discovered must first become a test.
 ## Adversarial review playbook
 
 gitguard has been through nine adversarial review passes (the numbered
-catalogue in `tests/attacks/__init__.py` is their output: 56 bypasses and
+catalogue in `tests/attacks/__init__.py` is their output: 57 bypasses and
 false positives, two of them RCEs found after the tool was believed solid;
 [44] is still open, see "Known limitations"; the ninth pass was the
 promotion of the git-parity `xfail`s [46]–[50]).

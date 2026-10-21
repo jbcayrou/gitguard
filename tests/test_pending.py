@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -211,3 +212,42 @@ def test_nothing_pending(gg: GG, repo: Path) -> None:
     assert r.rc == 0 and "nothing pending" in r.out
     r = gg.run("pending", str(repo))
     assert r.rc == 0 and "nothing pending" in r.err
+
+
+# ------------------------------------------------------------ state directory
+def state_files(gg: GG) -> set[str]:
+    return {p.name for p in gg.state.iterdir()}
+
+
+def test_no_lock_file_litter(gg: GG, repo: Path) -> None:
+    """[57] `<key>.pending.lock` was created by every `trust` (clear_pending
+    took the lock with nothing pending) and never removed: one file per
+    repository, for ever. The lock is taken on the state directory itself:
+    nothing to create, nothing to delete."""
+    k = gg.key_for(repo).name
+    assert state_files(gg) <= {k, k + ".d", k + ".idx"}, state_files(gg)
+    modify(gg, repo)
+    start_waiter(gg, repo, "0").communicate(timeout=15)
+    assert pending(gg, repo) is not None
+    assert gg.run("pending", "-c", str(repo)).rc == 0
+    assert state_files(gg) <= {k, k + ".d", k + ".idx"}, state_files(gg)
+
+
+def test_prune_removes_orphan_records_and_legacy_locks(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[57] The record of a never-trusted repository has no manifest, so
+    `prune` never saw it: once the repository was deleted, `<key>.pending`
+    (and the lock file of earlier versions) stayed for ever."""
+    gone, kept = tmp_path / "gone", tmp_path / "kept"
+    for r in (gone, kept):
+        assert gg.git("init", "-q", str(r)).rc == 0
+        start_waiter(gg, r, "0").communicate(timeout=15)
+        assert pending(gg, r) is not None and pending(gg, r)["kind"] == "never"
+    legacy = [Path(str(gg.key_for(r)) + ".pending.lock") for r in (gone, kept, repo)]
+    for p in legacy:
+        p.touch()
+    shutil.rmtree(gone)
+    r = gg.run("prune")
+    assert r.rc == 0 and str(gone) in r.out, r.text
+    assert pending(gg, gone) is None and pending(gg, kept) is not None
+    assert not any(p.exists() for p in legacy), "lock files of earlier versions are removed"
+    assert gg.key_for(repo).is_file() and not gg.check(repo).blocked

@@ -221,6 +221,16 @@ gitguard.py refer to this list (how the project reviews itself: CLAUDE.md,
      DIR_KEYS) not watched; an `ext` file without group/other read bits is
      hashed but never copied nor restored (same trap through
      `core.sshCommand = ssh -i …`, `http.sslKey`…).
+[57] State directory litter. The flock for `<key>.pending` lived in a
+     `<key>.pending.lock` file that `clear_pending` created on every
+     `trust` (nothing pending or not) and that nothing removed, by design
+     (unlinking a lock file under a holder lets a third process take a
+     second "exclusive" lock on a fresh inode): one file per repository,
+     for ever. And the record of a never-trusted repository has no
+     manifest, so `prune` never saw it: a deleted repository left its
+     `.pending` and its lock behind. Fix: the lock is taken on the state
+     directory itself (an fd of it, no file); `prune` removes the records
+     whose repository is gone and the lock files of earlier versions.
 """
 from __future__ import annotations
 

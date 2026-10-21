@@ -1982,11 +1982,16 @@ def load_pending(key: Path) -> dict | None:
 def update_pending(key: Path, fn) -> dict | None:
     """Read-modify-write of `<key>.pending` under a lock (several waiters at
     once). `fn(current or None)` returns the record to write, or None to
-    remove it."""
+    remove it. The flock is taken on the state directory itself, one lock
+    for every record: the critical section is a JSON read and write, and a
+    `<key>.pending.lock` file could never be removed (unlinking a lock file
+    under a holder lets a third process take a second "exclusive" lock on a
+    fresh inode), so every `trust` left one behind for ever. [57]"""
     STATE.mkdir(parents=True, exist_ok=True)
     STATE.chmod(0o700)
-    with open(str(key) + ".pending.lock", "w") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
+    fd = os.open(str(STATE), os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         new = fn(load_pending(key))
         p = pending_path(key)
         if new is None:
@@ -1996,11 +2001,11 @@ def update_pending(key: Path, fn) -> dict | None:
             tmp.write_text(json.dumps(new, indent=1, ensure_ascii=False))
             os.replace(tmp, p)
         return new
+    finally:
+        os.close(fd)                     # releases the lock
 
 
 def clear_pending(key: Path) -> None:
-    # The lock file stays: unlinking it under a holder would let a third
-    # process take a second "exclusive" lock on a fresh inode.
     update_pending(key, lambda _cur: None)
     Path(str(key) + ".pending.tmp").unlink(missing_ok=True)
 
@@ -2361,6 +2366,21 @@ def cmd_forget(args: list[str]) -> None:
                 forget_key(key)
                 n += 1
                 info(f"forgotten: {root or key.name}")
+        # A never-trusted repository has a record but no manifest, so
+        # entries() does not list it: once deleted, its record stayed. [57]
+        for p in sorted(STATE.glob("????????????????.pending")):
+            key = Path(str(p)[:-len(".pending")])
+            if key.is_file():
+                continue
+            d = load_pending(key)
+            root = d.get("root") if d else None
+            if root is None or not Path(root).is_dir():
+                forget_key(key)
+                n += 1
+                info(f"forgotten: {root or key.name}")
+        # Lock files of earlier versions, nothing takes them any more. [57]
+        for p in STATE.glob("????????????????.pending.lock"):
+            p.unlink(missing_ok=True)
         if n == 0:
             info("nothing to clean up")
         return

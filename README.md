@@ -352,7 +352,7 @@ refused (git itself reads it against two different directories in one run).
   git dies on in a config file is refused.
 
 `CLAUDE.md` holds the design notes, the review method and the catalogue of
-the 56 bypasses and false positives found so far (`tests/attacks/`).
+the 57 bypasses and false positives found so far (`tests/attacks/`).
 
 ## Tests
 
