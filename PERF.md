@@ -87,6 +87,16 @@ run, only an imported module gets a cached `.pyc` —, gitguard's own work
 overhead 21 ms. `python3 -S` (no `site`) saves 5 ms on `python3 -c pass`
 but under 1 ms on a gitguard command: not worth an `env -S` shebang.
 
+Re-measured on 2026-10-22, both versions head to head, small repository,
+N = 30, all five commands within 0.5 ms of each other:
+
+| machine                          | before  | after   | `python3 -c pass` |
+|----------------------------------|--------:|--------:|------------------:|
+| macOS, M4 Pro, Python 3.14.6     | +46 ms  | +35 ms  | 15 ms             |
+| Debian 13 VM, aarch64, Python 3.13.5 | +27 ms | +20 ms | 4 ms             |
+
+`gitguard` alone: 50 → 37 ms on macOS, 30 → 22 ms on the VM.
+
 ## Where the time goes (2026-10-17 figures)
 
 | component                                             | cost            |
