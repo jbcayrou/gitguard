@@ -132,8 +132,11 @@ INCLUDE_DEPTH = 10      # git: MAX_INCLUDE_DEPTH = 10
 # (the gitdir itself, or `modules/<x>/`, `worktrees/<x>/`, recognised by the
 # presence of a HEAD or commondir file). Otherwise a submodule named `lfs` or
 # `refs` would make its whole gitdir invisible — bypass found in review.
+# `reftable`: the refs of a `--ref-format=reftable` repository (tables and
+# tables.list, rewritten on every ref update, like refs/ and packed-refs;
+# nothing git runs). Fingerprinted, every commit alerted. [64]
 VOLATILE_DIRS = {"refs", "logs", "lfs", "rr-cache", "rebase-merge", "rebase-apply",
-                 "sequencer", "filter-repo"}
+                 "sequencer", "filter-repo", "reftable"}
 VOLATILE_UNDER_OBJECTS = {"pack"}
 VOLATILE_UNDER_OBJECTS_INFO = {"commit-graphs"}
 VOLATILE_FILES = {"index", "HEAD", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "MERGE_MSG",
@@ -506,7 +509,8 @@ class Repo:
         those referenced by an index gitlink, wherever they are
         (`node_modules/pkg` included). [6] [14] [24]"""
         out = set(gitmodules_gits(self.root))
-        for rel in index_gitlinks(self.index, Path(str(self.key) + ".idx")):
+        for rel in index_gitlinks(self.index, Path(str(self.key) + ".idx"),
+                                  object_id_size(self.common)):
             g = self.root / rel / ".git"
             if g.exists() or g.is_symlink():
                 out.add(g)
@@ -576,24 +580,27 @@ def env_common_dir() -> Path | None:
     return Path(v)
 
 
-def is_bare_gitdir(d: Path) -> bool:
+def is_bare_gitdir(d: Path, env: bool = True) -> bool:
     """git's is_git_directory, the test behind its discovery: a valid HEAD,
     then `objects` and `refs` reachable (access X_OK) in the common dir — the
     directory itself, or what its `commondir` file names. This is how git
     recognises a bare repository, or any directory a container has stuffed
     with these names. The former "HEAD file + objects/ + refs/ here" missed a
-    `HEAD` symlink and a `commondir` redirection git accepts. [49]"""
+    `HEAD` symlink and a `commondir` redirection git accepts. [49]
+    `env=False` for another repository git enters as a transport (a local
+    remote, [61]): git clears GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY… for that
+    child (local_repo_env)."""
     if not _validate_headref(d / "HEAD"):
         return False
-    common = env_common_dir() or d
+    common = (env_common_dir() if env else None) or d
     cd = d / "commondir"
     if common == d and cd.is_file():
         try:
             common = d / _read_path_file(cd)     # a Refuse (NUL) propagates: git
         except OSError:                          # truncates and opens the dir,
             return False                         # "not a gitdir" would walk past it
-    objects = Path(os.environ["GIT_OBJECT_DIRECTORY"]) if os.environ.get("GIT_OBJECT_DIRECTORY") \
-        else common / "objects"
+    objects = Path(os.environ["GIT_OBJECT_DIRECTORY"]) \
+        if env and os.environ.get("GIT_OBJECT_DIRECTORY") else common / "objects"
     return os.access(objects, os.X_OK) and os.access(common / "refs", os.X_OK)
 
 
@@ -790,7 +797,7 @@ def gitmodules_gits(root: Path) -> list[Path]:
     return sorted(found)
 
 
-def index_gitlinks(index: Path, cache: Path | None = None) -> list[str]:
+def index_gitlinks(index: Path, cache: Path | None = None, oid_size: int = 20) -> list[str]:
     """Paths recorded as gitlinks (mode 160000) in the index file (`Repo.index`:
     `.git/index`, or `GIT_INDEX_FILE`), read by parsing it — never via `git`,
     which would read the config we judge.
@@ -808,7 +815,12 @@ def index_gitlinks(index: Path, cache: Path | None = None) -> list[str]:
     modified — or forged — index has another sha256 and is re-parsed; an
     unreadable, inconsistent or older-version cache is ignored (a cache
     written before the name check would vouch for a forged index). Nothing
-    is cached when the parser refuses."""
+    is cached when the parser refuses.
+
+    `oid_size`: bytes of an object id in the entries, from the repository's
+    object format (`object_id_size`): 20 for SHA-1, 32 for SHA-256. A record
+    without it was written for SHA-1 (a SHA-256 index was always refused,
+    never cached). [63]"""
     p = index
     try:
         data = p.read_bytes()
@@ -826,17 +838,18 @@ def index_gitlinks(index: Path, cache: Path | None = None) -> list[str]:
                 records = c["indexes"]
                 hit = records.get(str(p))
                 if (isinstance(hit, dict) and hit.get("sha256") == digest
+                        and hit.get("oid", 20) == oid_size
                         and isinstance(hit.get("gitlinks"), list)
                         and all(isinstance(x, str) for x in hit["gitlinks"])):
                     return list(hit["gitlinks"])
         except (OSError, ValueError):
             records = {}
-    out = _parse_index_gitlinks(data, p)
+    out = _parse_index_gitlinks(data, p, oid_size)
     if cache is not None:
         try:
             keep = {k: v for k, v in records.items()
                     if isinstance(k, str) and k != str(p) and os.path.exists(k)}
-            keep[str(p)] = {"sha256": digest, "gitlinks": out}
+            keep[str(p)] = {"sha256": digest, "oid": oid_size, "gitlinks": out}
             tmp = Path(str(cache) + ".tmp")
             tmp.write_text(json.dumps({"v": INDEX_CACHE_VERSION, "indexes": keep}))
             os.replace(tmp, cache)
@@ -1056,7 +1069,57 @@ def forged_index_hint(p: Path, name: bytes) -> str:
             f"left. [55]")
 
 
-def _parse_index_gitlinks(data: bytes, p: Path) -> list[str]:
+# core.repositoryformatversion as git_parse_signed reads it: strtoimax with
+# base 0 (`0x1`, `01`), then an optional unit; anything else makes git die.
+_GIT_INT = re.compile(r"[ \t\n\v\f\r]*([+-]?)(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)([kKmMgG]?)")
+
+
+def object_id_size(gitdir: Path) -> int:
+    """Bytes of an object id in the indexes of the repository whose config
+    is `gitdir/config` (the common dir; a submodule's own gitdir). As git's
+    check_repository_format reads it, checked against git 2.50 and 2.47:
+    only that file (no include, no config.worktree), the last value wins;
+    no `core.repositoryformatversion` (or -1, git's "unset") → the
+    extension is ignored, SHA-1; another negative version keeps it;
+    version 0 with `extensions.objectFormat`, a version above 1 → git dies.
+    A value other than exactly `sha1`/`sha256`, wherever it stands and
+    whatever the version, makes git die as it reads it (handle_extension):
+    refused too. [63]"""
+    version = fmt = None
+    cfg = gitdir / "config"
+    if not cfg.is_file():
+        return 20
+    for section, key, value in parse_git_config(cfg):
+        if section == "core" and key == "repositoryformatversion":
+            version = value
+        elif section == "extensions" and key == "objectformat":
+            if value not in ("sha1", "sha256"):
+                raise Refuse(f"unknown extensions.objectFormat {value!r} in {cfg}: git refuses it too")
+            fmt = value
+    if version is None:
+        return 20
+    m = _GIT_INT.fullmatch(version)
+    if m is None:
+        raise Refuse(f"bad core.repositoryformatversion {version!r} in {cfg}: git refuses it too")
+    sign, digits, unit = m.groups()
+    n = int(digits, 16 if digits[:2] in ("0x", "0X") else 8 if digits.startswith("0") else 10)
+    n *= {"": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[unit.lower()]
+    if sign == "-":
+        n = -n
+    if n == -1:
+        return 20                 # git's "unset": read_repository_format clears the format
+    if n > 1 or (n == 0 and fmt is not None):
+        raise Refuse(f"unsupported repository format (core.repositoryformatversion = "
+                     f"{version!r}{', extensions.objectFormat' if fmt is not None else ''}) "
+                     f"in {cfg}: git refuses it too")
+    return 32 if fmt == "sha256" else 20
+
+
+def _parse_index_gitlinks(data: bytes, p: Path, oid_size: int = 20) -> list[str]:
+    # Fixed part of an entry: ctime, mtime, dev, ino, mode, uid, gid, size
+    # (40 bytes), the object id (20 or 32), the flags (2). It was fixed at 62:
+    # every SHA-256 index was refused as forged. [63]
+    fixed = 40 + oid_size + 2
     version = int.from_bytes(data[4:8], "big")
     count = int.from_bytes(data[8:12], "big")
     if version not in (2, 3, 4):
@@ -1065,11 +1128,11 @@ def _parse_index_gitlinks(data: bytes, p: Path) -> list[str]:
     out, off, prev = [], 12, b""
     entries: list[tuple[bytes, int]] = []
     for _ in range(count):
-        if off + 62 > len(data):
+        if off + fixed > len(data):
             break
         mode = int.from_bytes(data[off + 24:off + 28], "big")
-        flags = int.from_bytes(data[off + 60:off + 62], "big")
-        cur = off + 62
+        flags = int.from_bytes(data[off + fixed - 2:off + fixed], "big")
+        cur = off + fixed
         if flags & 0x4000:               # extended entry (v3+)
             cur += 2
         # Name length: git reads `flags & 0xFFF` and only looks for the NUL
@@ -1225,32 +1288,63 @@ def check_indexes(repo: Repo) -> None:
     submodules` or `submodule foreach` run an unwrapped git there) and the
     other worktrees' (`worktrees/<x>/index`, and the main one seen from a
     linked worktree). The repository's own index (`Repo.index`) is read by
-    `Repo.gitfiles`. Same parser and cache: a few small files. [55]"""
+    `Repo.gitfiles`. Same parser and cache: a few small files. [55]
+
+    A submodule's gitlinks and `.gitmodules` name nested repositories of its
+    tree, which get the rule of the superproject's (check_nested_git) with
+    the submodule's gitdir as the root they must point under. They were
+    parsed and dropped: `git status` in the superproject recurses into the
+    submodule, then into a nested repository its index names, and runs that
+    repository's core.fsmonitor. [60] A linked worktree's gitlinks are not
+    followed: nothing recurses into another worktree, and git run there is
+    checked there."""
     cache = Path(str(repo.key) + ".idx")
+    trees = dict(submodule_trees(repo))
     for r in dict.fromkeys([*gitdir_roots(repo.gitdir), *gitdir_roots(repo.common)]):
-        if r != repo.gitdir:
-            index_gitlinks(r / "index", cache)
+        if r == repo.gitdir:
+            continue
+        # The object format of the repository this index belongs to: a
+        # linked worktree's (`worktrees/<x>`, of the main repository or of a
+        # submodule) is in the gitdir its `commondir` names, a submodule's in
+        # its own `modules/<x>/config`.
+        cd = r / "commondir"
+        fmt_dir = _resolve_existing(r / _read_path_file(cd), cd) if cd.is_file() else r
+        links = index_gitlinks(r / "index", cache, object_id_size(fmt_dir))
+        tree = trees.get(r)
+        if tree is None:
+            continue
+        nested = set(gitmodules_gits(tree))
+        for rel in links:
+            g = tree / rel / ".git"
+            if g.exists() or g.is_symlink():
+                nested.add(g)
+        for n in sorted(nested):
+            check_nested_git(n, r)
+
+
+def check_nested_git(n: Path, common: Path) -> None:
+    """A nested `.git` — declared in .gitmodules or referenced by an index
+    gitlink, wherever it is (node_modules/, build/…) — must be a file pointing
+    under `common`/modules (submodule) or `common`/worktrees (linked worktree
+    stored inside the tree, e.g. `.worktrees/x`)."""
+    if n.is_symlink():
+        raise Refuse(f"nested .git is a symlink: {n}")
+    if n.is_dir():
+        # Declared in .gitmodules or not: a nested .git directory is never
+        # a real submodule (that one has a .git file pointing under
+        # .git/modules), and git reads its config as soon as a gitlink
+        # references it in the index.
+        raise Refuse(nested_repo_hint(n))
+    target = read_gitfile(n)
+    if not any(common / d in target.parents for d in ("modules", "worktrees")):
+        raise Refuse(f"{n} points outside {common}/modules and {common}/worktrees: {target}")
 
 
 def check_structure(repo: Repo, refs: list[tuple[str, Path]]) -> None:
     check_split_index(repo)
     check_indexes(repo)
-    # Every nested .git — declared in .gitmodules or referenced by an index
-    # gitlink, wherever it is (node_modules/, build/…) — must be
-    # a file pointing under .git/modules (submodule) or under .git/worktrees
-    # (linked worktree stored inside the tree, e.g. `.worktrees/x`).
     for n in repo.gitfiles:
-        if n.is_symlink():
-            raise Refuse(f"nested .git is a symlink: {n}")
-        if n.is_dir():
-            # Declared in .gitmodules or not: a nested .git directory is never
-            # a real submodule (that one has a .git file pointing under
-            # .git/modules), and git reads its config as soon as a gitlink
-            # references it in the index.
-            raise Refuse(nested_repo_hint(n))
-        target = read_gitfile(n)
-        if not any(repo.common / d in target.parents for d in ("modules", "worktrees")):
-            raise Refuse(f"{n} points outside .git/modules and .git/worktrees: {target}")
+        check_nested_git(n, repo.common)
     check_rebase_todo(repo)
     # Control characters in a name: fake line / spoofed display. Only names
     # that enter the fingerprint (hence get displayed) matter: the non-volatile
@@ -1266,7 +1360,7 @@ def check_structure(repo: Repo, refs: list[tuple[str, Path]]) -> None:
             if bad(rel):
                 raise Refuse(f"control character in a file name: {p}")
     for _, root in refs:
-        for p in walk_all(root):
+        for p in walk_all(root, repo):
             if bad(str(p)):
                 raise Refuse(f"control character in a file name: {p}")
     # Symlinks in the first two levels of the gitdir (refs → ~/.config…)
@@ -1289,16 +1383,48 @@ def check_structure(repo: Repo, refs: list[tuple[str, Path]]) -> None:
             raise Refuse(f"suspicious owner/permissions: {p}")
 
 
-def walk_all(base: Path) -> Iterator[Path]:
+def walk_all(base: Path, repo: Repo | None = None) -> Iterator[Path]:
+    """What a path named by the config holds for git: the file or symlink
+    itself, or for a directory (DIR_KEYS, a local remote's hooks/) its files
+    and symlinks at any depth — a hook sources `lib/common.sh` next to it —
+    **except when the directory contains the repository** (`core.hooksPath
+    = ..`, `~`): there git runs `<hooksPath>/<hook>` and nothing of the
+    tree, so depth 1. Walked recursively, such a directory fingerprinted the
+    whole volume (the work tree, the gitdir without its volatile exclusions,
+    gitguard's own state: every commit, then every `trust`, alerted). The
+    state directory is never entered (a template directory adds its `hooks/`
+    as a ref of its own, config_refs). [65]"""
     if base.is_symlink() or base.is_file():
         yield base
         return
+    state = STATE.resolve()
+    def inside(p: Path, d: Path) -> bool:
+        return p == d or d in p.parents
+    if inside(base, state):
+        return                             # add() refuses it first; belt and braces
+    if repo is not None and any(inside(t, base) for t in (repo.root, repo.gitdir, repo.common)):
+        try:
+            children = sorted(base.iterdir())
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            _walk_error(e)
+            return
+        for c in children:
+            if c.is_symlink() or not c.is_dir():
+                yield c
+        return
     for dirpath, dirnames, filenames in os.walk(base, onerror=_walk_error):
+        d = Path(dirpath)
+        keep = []
         for name in dirnames:
-            if (Path(dirpath) / name).is_symlink():
-                yield Path(dirpath) / name
+            if (d / name).is_symlink():
+                yield d / name
+            elif not inside(d / name, state):
+                keep.append(name)
+        dirnames[:] = keep
         for name in filenames:
-            yield Path(dirpath) / name
+            yield d / name
 
 
 # ------------------------------------------------ paths referenced by config
@@ -1461,12 +1587,14 @@ def check_safe_bare() -> None:
              f"recommended: {SAFE_BARE_HINT}")
 
 
-def config_refs(repo: Repo) -> list[tuple[str, Path]]:
+def config_refs(repo: Repo, remote_names: set[str] | None = None) -> list[tuple[str, Path]]:
     """Paths outside the gitdir that the config makes git execute or read:
     core.hooksPath, include.path (recursive), and any token of a value that
     exists as a path. Returns [(scope, path)] with scope 'wt' (under the root)
     or 'ext' (elsewhere, writable). Plus the tree files that drive git: root
-    gitfile, .gitmodules, each submodule's gitfile."""
+    gitfile, .gitmodules, each submodule's gitfile. `remote_names`, if given,
+    receives the name of every remote the repository's config defines (not a
+    remote's own config): what `git push <name>` resolves through config. [62]"""
     out: dict[Path, str] = {}
 
     def add(literal: Path, p: Path, allow_dir: bool = False) -> None:
@@ -1479,6 +1607,12 @@ def config_refs(repo: Repo) -> list[tuple[str, Path]]:
         # file — and `restore` deleted there. [25]
         if p.is_dir() and not allow_dir:
             return
+        # The config naming gitguard's own state: the reference would watch
+        # itself (every `trust` rewrites it). Structurally abnormal. [65]
+        state = STATE.resolve()
+        if p == state or state in p.parents:
+            raise Refuse(f"path referenced by the config lies in gitguard's state "
+                         f"directory ({state}): {literal}")
         # A referenced path reached through a symlink is refused: resolving the
         # link would pull its target (e.g. $HOME) into the fingerprint, and
         # `restore` would delete "what was added" over there.
@@ -1525,12 +1659,34 @@ def config_refs(repo: Repo) -> list[tuple[str, Path]]:
                                             *global_config_files())]
     queue += [(f, b, True) for f, b in _submodule_configs(repo)]
     seen: set[Path] = set()
+    tokens_seen: set[tuple[str, Path]] = set()
     nxt: list[tuple[Path, Path, bool]] = []
 
     def consider(section: str, key: str, value: str, base: Path, cfdir: Path | None,
                  remotes: bool) -> None:
+        # `git push <name>` resolves <name> through the repository's config
+        # (local, global, environment: those whose base is the root), not a
+        # submodule's: there, `<name>` is a path.
+        if remote_names is not None and base == repo.root and section.startswith("remote."):
+            remote_names.add(section[len("remote."):])
         if (section, key) in DIR_KEYS:
-            add(*_expand2(value, base), allow_dir=True)
+            literal, p = _expand2(value, base)
+            if p == repo.root:
+                # A hooks directory at the root of the tree: every top-level
+                # file is a hook git runs, and add() drops the root (it is
+                # not fingerprinted as a whole). `.` and `./` included: git
+                # then searches the PATH, a broken setup anyway. [59]
+                raise Refuse(f"{section}.{key} = {value!r} resolves to the root of the "
+                             f"work tree ({p}): every file at the top of the tree would be "
+                             f"a hook, gitguard cannot watch that. Move the hooks to a "
+                             f"subdirectory (e.g. `.githooks`, then `git config "
+                             f"{section}.{key} .githooks`) and retry.")
+            add(literal, p, allow_dir=True)
+            if key == "templatedir":
+                # git copies the whole template; what it can run is hooks/.
+                # Named on its own: still watched if the template directory
+                # contains the repository (then walked at depth 1). [65]
+                add(literal / "hooks", p / "hooks", allow_dir=True)
         elif section.startswith("include") and key == "path":
             # Relative to the including file; from the command line or the
             # environment git only accepts an absolute path ("relative config
@@ -1544,18 +1700,29 @@ def config_refs(repo: Repo) -> list[tuple[str, Path]]:
         elif remotes and section.startswith("remote.") and key in ("url", "pushurl"):
             # A local remote: `push` runs its hooks and honours its
             # config (hooksPath…). Only those, never the whole
-            # directory ([25]): its config and its hooks/. [45]
+            # directory ([25]): its config and its hooks/ [45], from the
+            # common dir git opens, the gitfile and `commondir` that lead
+            # there, and config.worktree (read with extensions.worktreeConfig;
+            # watched and parsed in any case, a superset). [61]
             r = _local_remote(value, base)
             if r is not None:
-                gd, rbase = r
-                add(gd / "config", gd / "config")
-                add(gd / "hooks", gd / "hooks", allow_dir=True)
-                nxt.append((gd / "config", rbase, False))
+                gd, common, rbase, files = r
+                for f in files:
+                    add(f, f)
+                for f in (common / "config", gd / "config.worktree"):
+                    add(f, f)
+                    nxt.append((f, rbase, False))
+                add(common / "hooks", common / "hooks", allow_dir=True)
         elif _data_key(section, key):
             return                       # a file read as data, never run [56]
         else:
             for tok in _value_tokens(value):
-                if tok and tok not in (".", "..") and not tok.startswith("-"):
+                # The same token comes back from value to value (aliases
+                # share their words): each one costs a resolve(). Once per
+                # base is enough, add() is idempotent.
+                if (tok and tok not in (".", "..") and not tok.startswith("-")
+                        and (tok, base) not in tokens_seen):
+                    tokens_seen.add((tok, base))
                     add(*_expand2(tok, base))
 
     # Config git takes from its environment and command line (GIT_CONFIG_*,
@@ -1586,24 +1753,52 @@ def _replaceable(p: Path) -> bool:
     return os.access(p, os.W_OK) or any(os.access(q, os.W_OK) for q in p.parents)
 
 
-def _local_remote(url: str, base: Path) -> tuple[Path, Path] | None:
-    """(gitdir, base for its relative values) if the remote URL designates a
-    local repository (path or file://), else None. Like git: a `host:path`
-    without a `/` before the colon is ssh; `<path>.git` is tried too."""
+def _local_remote(url: str, base: Path) -> tuple[Path, Path, Path, list[Path]] | None:
+    """(gitdir, common dir, base for its relative values, files that redirect
+    it) if the remote URL designates a local repository (path or file://),
+    else None. Like git: a `host:path` without a `/` before the colon is ssh.
+    Opened as receive-pack opens it, a port of enter_repo (path.c, strict
+    off): `<p>/.git`, `<p>`, `<p>.git/.git`, `<p>.git`, the first that is a
+    regular file (a gitfile) or a directory is_git_directory accepts; the
+    gitfile followed, then the gitdir's `commondir`, without the environment
+    (git clears it for the transport child). The former reading took
+    `<p>/.git` or a bare `<p>` and watched their config and hooks/: a
+    planted `commondir`, a gitfile remote (`init --separate-git-dir`) moved
+    the config and hooks git runs elsewhere. [61] A regular file that is no
+    gitfile (a bundle) is not a repository: git dies on a push there."""
     v = url[len("file://"):] if url.startswith("file://") else url
     if "://" in v or (":" in v.split("/", 1)[0] and not v.startswith(("/", ".", "~"))):
         return None
     p = _expand2(v, base)[1]
-    for cand in (p, p.with_name(p.name + ".git")):
-        if (cand / ".git").is_dir():
-            return cand / ".git", cand
-        if is_bare_gitdir(cand):
-            return cand, cand
-    return None
+    dotgit = p.with_name(p.name + ".git")
+    for cand, rbase in ((p / ".git", p), (p, p), (dotgit / ".git", dotgit), (dotgit, dotgit)):
+        if cand.is_file() or (cand.is_dir() and is_bare_gitdir(cand, env=False)):
+            break
+    else:
+        return None
+    files: list[Path] = []
+    gd = cand
+    if cand.is_file():
+        try:
+            with open(cand, "rb") as fh:
+                if fh.read(8) != b"gitdir: ":
+                    return None
+        except OSError:
+            return None
+        gd = read_gitfile(cand)              # git dies on a broken one: refused
+        if not (gd.is_dir() and is_bare_gitdir(gd, env=False)):
+            return None
+        files.append(cand)
+    common = gd
+    cd = gd / "commondir"
+    if cd.is_file():
+        files.append(cd)
+        common = _resolve_existing(gd / _read_path_file(cd), cd)
+    return gd, common, rbase, files
 
 
-def _submodule_configs(repo: Repo) -> list[tuple[Path, Path]]:
-    """(config file, submodule tree) for every nested gitdir that has a
+def submodule_trees(repo: Repo) -> list[tuple[Path, Path]]:
+    """(gitdir root, submodule tree) for every nested gitdir that has a
     `core.worktree` (submodules; a linked worktree's gitdir has none and is
     checked when git runs there). A few small files: no measurable cost."""
     out = []
@@ -1615,9 +1810,13 @@ def _submodule_configs(repo: Repo) -> list[tuple[Path, Path]]:
             if section == "core" and key == "worktree":
                 wt = value
         if wt:
-            base = _expand2(wt, r)[1]
-            out += [(r / "config", base), (r / "config.worktree", base)]
+            out.append((r, _expand2(wt, r)[1]))
     return out
+
+
+def _submodule_configs(repo: Repo) -> list[tuple[Path, Path]]:
+    """(config file, submodule tree): its relative values resolve there. [39]"""
+    return [(r / f, base) for r, base in submodule_trees(repo) for f in ("config", "config.worktree")]
 
 
 # Keys whose designated directory git reads the content of (hooks executed,
@@ -1653,18 +1852,60 @@ _SH_TOPLEVEL = re.compile(r"\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)"
 _SH_PWD = re.compile(r"\$(?:PWD\b|\{PWD\})")
 
 
+# `${NAME<op>WORD}`: default, assign, alternate, error (`:-` `-` `:=` `=` `:+`
+# `+` `:?` `?`) and the pattern removals (`#` `##` `%` `%%`). WORD holds no
+# brace: nested forms are reduced from the inside, one round at a time.
+_SH_PARAM = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:?[-=+?]|##?|%%?)([^{}]*)\}")
+# `$(…)` (not `$((…))`, arithmetic) and `` `…` ``, innermost first.
+_SH_SUBST = re.compile(r"\$\((?!\()([^()]*)\)|`([^`]*)`")
+# A plain parameter: `$NAME`, `${NAME}`, a positional or special one.
+_SH_VAR = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\}|[0-9@*#?$!-])")
+
+
+def _sh_readings(value: str) -> set[str]:
+    """Two readings of `value` that, between them, contain every path sh can
+    build from it without running anything gitguard cannot know [58]:
+    - `word`: each `${NAME<op>WORD}` gives its WORD (the default, the
+      alternate…) and each command substitution gives `.` — `$(pwd)`,
+      `` `pwd` ``, `$(dirname …)` glued before `/x` designate the top of
+      the tree where git runs the command, and so does a variable gitguard's
+      environment does not hold (`x=$(pwd); $x/t.sh`, an alias's `$1`);
+    - `var`: each `${NAME…}` gives $NAME's value in gitguard's environment
+      (git's), a substitution gives nothing (`$(cmd)/x` = `/x`).
+    A superset, like the condition-blind reading of includeIf: hashing a
+    file the shell would not reach costs a hash, missing one let a planted
+    script run. Then `$VAR`/`${VAR}` through expandvars."""
+    def reduce(v: str, word: bool) -> str:
+        for _ in range(8):                 # nesting depth; each round strips one level
+            w = _SH_PARAM.sub(lambda m: (m.group(3) if m.group(2)[-1] in "-=+?" else "")
+                              if word else "" if m.group(2)[-1] == "+"
+                              else os.environ.get(m.group(1), ""), v)
+            w = _SH_SUBST.sub("." if word else "", w)
+            if w == v:
+                break
+            v = w
+        return v
+    def unset_as_top(v: str) -> str:
+        name = lambda m: m.group(1) or m.group(2)
+        return _SH_VAR.sub(lambda m: os.environ.get(name(m), ".") if name(m) else ".", v)
+    base = _SH_PWD.sub(".", _SH_TOPLEVEL.sub(".", value))
+    return {unset_as_top(reduce(base, True)), os.path.expandvars(reduce(base, False)),
+            os.path.expandvars(base)}
+
+
 def _value_tokens(value: str) -> set[str]:
     """Path candidates of a config value: whitespace split, sh-style split (a
     quoted path, `!"./my tool.sh"`, is a single word for git, which hands the
     value to the shell), the whole value (programs run without a shell), and
     a split on sh operators and `=` (`./t.sh&&x`, `(./t.sh)`, `f() { ./t.sh; }`,
-    `T=./t.sh`, `--rcfile=./t`). Done on the value and on its sh-expanded
-    form: `$PWD`, `${PWD}` and `$(git rev-parse --show-toplevel)` are the top
-    of the tree (where a `!` alias runs), other variables come from the
-    environment git inherits from gitguard. [37]"""
-    expanded = os.path.expandvars(_SH_PWD.sub(".", _SH_TOPLEVEL.sub(".", value)))
+    `T=./t.sh`, `--rcfile=./t`). Done on the value and on its sh readings
+    (_sh_readings): `$PWD`, `${PWD}` and `$(git rev-parse --show-toplevel)`
+    are the top of the tree (where a `!` alias runs) [37]; `${X:-./t.sh}`,
+    `${X:+…}`, `$(pwd)/t.sh`, `` `pwd`/t.sh `` were left as text that names
+    no file [58]; other variables come from the environment git inherits
+    from gitguard."""
     toks: set[str] = set()
-    for v in {value, expanded}:
+    for v in {value, *_sh_readings(value)}:
         toks |= set(v.split()) | set(_SH_SPLIT.split(v))
         try:
             toks |= set(shlex.split(v))
@@ -1861,8 +2102,8 @@ def _walk_error(exc: OSError) -> None:
     raise Refuse(f"unreadable directory, cannot check: {exc.filename} ({exc.strerror})")
 
 
-def walk_tree(scope: str, base: Path, start: Path) -> Iterator[Entry]:
-    for p in walk_all(start):
+def walk_tree(scope: str, base: Path, start: Path, repo: Repo | None = None) -> Iterator[Entry]:
+    for p in walk_all(start, repo):
         rel = str(p.relative_to(base)) if scope == "wt" else str(p)
         e = _mk(scope, rel, p)
         if e:
@@ -1874,7 +2115,7 @@ def manifest(repo: Repo, refs: list[tuple[str, Path]]) -> dict[tuple[str, str], 
     if repo.common != repo.gitdir:
         entries += walk_gitdir(repo.common, "common")
     for scope, p in refs:
-        entries += walk_tree(scope, repo.root, p)
+        entries += walk_tree(scope, repo.root, p, repo)
     # The system and global config files are parsed (config_refs) for the
     # paths they name, never hashed: the sandbox cannot write them, and
     # whoever can (HOME mounted) can write the state directory too. Hashing
@@ -2773,6 +3014,90 @@ def parse_new_repo(args: list[str]) -> tuple[str, Path] | None:
     return sub, (cwd / d)
 
 
+# `git push` options taking a separate value (git 2.47 and 2.50, `git push
+# -h`): their value is not the repository. Long options may be abbreviated
+# (parse-options): a unique prefix of any long option counts as it.
+PUSH_WITH_ARG = {"--repo", "--receive-pack", "--exec", "--push-option", "--recurse-submodules"}
+PUSH_LONG = PUSH_WITH_ARG | {
+    "--verbose", "--quiet", "--all", "--branches", "--mirror", "--delete", "--tags",
+    "--dry-run", "--porcelain", "--force", "--force-with-lease", "--force-if-includes",
+    "--thin", "--set-upstream", "--progress", "--prune", "--no-verify", "--verify",
+    "--follow-tags", "--signed", "--atomic", "--ipv4", "--ipv6"}
+
+
+def _push_destination(args: list[str]) -> str | None:
+    """The <repository> of `git push [<options>] [<repository> [<refspec>…]]`,
+    or `--repo`'s value when no positional one is given; None: the default
+    remote, from the config."""
+    repo_opt, i = None, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return args[i + 1] if i + 1 < len(args) else repo_opt
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            bare = name[len("--no-"):] if name.startswith("--no-") else None
+            full = [o for o in PUSH_LONG if o == name] or [o for o in PUSH_LONG if o.startswith(name)]
+            opt = full[0] if len(full) == 1 else None
+            if bare is None and opt in PUSH_WITH_ARG and not eq:
+                if opt == "--repo" and i + 1 < len(args):
+                    repo_opt = args[i + 1]
+                i += 2
+                continue
+            if opt == "--repo" and eq:
+                repo_opt = val
+        elif a.startswith("-") and len(a) > 1:
+            j = a.find("o", 1)                   # `-o` takes a value: attached or next
+            if j != -1 and j == len(a) - 1:
+                i += 2
+                continue
+        else:
+            return a
+        i += 1
+    return repo_opt
+
+
+def _legacy_remote_urls(repo: Repo, name: str) -> list[str]:
+    """URLs of a remote defined the old way, `.git/remotes/<name>` (`URL:`
+    lines) or `.git/branches/<name>` (`<url>#<branch>`): git still reads them."""
+    out = []
+    p = repo.common / "remotes" / name
+    if "/" not in name and p.is_file():
+        out += [ln[4:].strip() for ln in p.read_text(errors="replace").split("\n")
+                if ln.startswith("URL:")]
+    p = repo.common / "branches" / name
+    if "/" not in name and p.is_file():
+        out += [p.read_text(errors="replace").split("\n", 1)[0].split("#", 1)[0].strip()]
+    return out
+
+
+def check_push_destination(repo: Repo, rest: list[str], remote_names: set[str],
+                           refs: list[tuple[str, Path]]) -> None:
+    """`git push <path>` to a local repository that no trusted config names:
+    receive-pack runs that repository's hooks and honours its config, and
+    nothing of it is in the fingerprint (only configured remotes are, [45]
+    [61]). Refused, the way out named: make it a remote, then trust. A
+    relative path is relative to the root of the tree (git chdirs there).
+    Not seen: a push through an alias, `url.<base>.insteadOf` rewriting a
+    URL into a local path, `send-pack`. Allowed: the repository itself
+    (`git push . main:x`) and a repository a configured remote already
+    designates (its config is in `refs`, watched). [62]"""
+    if not rest or rest[0] != "push":
+        return
+    dest = _push_destination(rest[1:])
+    if dest is None or dest in remote_names:
+        return
+    urls = _legacy_remote_urls(repo, dest) or [dest]
+    for url in urls:
+        r = _local_remote(url, repo.root)
+        watched = {p for _, p in refs}
+        if r is not None and r[1] != repo.common and (r[1] / "config") not in watched:
+            raise Refuse(f"`git push {dest}`: a local repository no trusted config names "
+                         f"({r[0]}); git would run its hooks, which gitguard does not watch. "
+                         f"Make it a remote (`git remote add <name> {url}`), run `gitguard "
+                         f"trust`, then `git push <name>`. [62]")
+
+
 def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None, git: str) -> int:
     os.chdir(orig)
     if newrepo is None:
@@ -3065,8 +3390,11 @@ def main(argv: list[str]) -> int:
             return 0
         repo = open_repo(root)
         label, key = repo.label, repo.key
-        refs = config_refs(repo)
+        remote_names: set[str] = set()
+        refs = config_refs(repo, remote_names)
         check_structure(repo, refs)
+        if mode == "exec":
+            check_push_destination(repo, split_global_options(argv, orig).rest, remote_names, refs)
         new = manifest(repo, refs)
         old = load_manifest(key)
         fingerprinted = True

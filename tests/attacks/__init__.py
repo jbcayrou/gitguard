@@ -231,6 +231,82 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      `.pending` and its lock behind. Fix: the lock is taken on the state
      directory itself (an fd of it, no file); `prune` removes the records
      whose repository is gone and the lock files of earlier versions.
+[58] sh expansions `os.path.expandvars` does not perform, in any value git
+     hands to sh (`core.fsmonitor`, `!` aliases, `sequence.editor`, and
+     the same values from `-c` or GIT_CONFIG_PARAMETERS [48]):
+     `${VAR:-./p.sh}`, `${VAR-…}`, `${VAR:+…}` (also glued,
+     `./p.sh${O:+ x}`), `$(pwd)/p.sh`, `` `pwd`/p.sh ``, `x=$(pwd); $x/p.sh`. The value
+     named no existing file for _value_tokens, sh resolved it to a tree
+     script; `$(pwd)` needs no variable and resolves on any machine. Found
+     by an adversarial review, replayed against git 2.50 (macOS) and
+     2.47.3 (Debian VM). Fix: two sh readings (_sh_readings), the WORDs
+     and `.` for substitutions and unknown variables, then the variables'
+     values and nothing; a superset (`SHELL_EXPANSIONS` in
+     test_git_parity.py, git as the oracle).
+[59] core.hooksPath resolving to the root of the tree (absolute root,
+     `.git/..`, `./.`, `root/`): config_refs' add() returned on a path
+     equal to the root (meant to avoid fingerprinting the whole tree), so
+     no hook was watched and `trust` did not warn about hooks in the tree;
+     `<root>/pre-commit` rewritten, `git commit` ran it. `.` and `./` are
+     not executed (git searches the PATH and fails with "cannot run
+     pre-commit"). Found by an adversarial review. Fix: refused, also from
+     the global config, the way out named (a subdirectory such as
+     `.githooks`).
+[60] Gitlink in a submodule's index (`.git/modules/<x>/index`) naming a
+     nested repository inside the submodule's tree: check_indexes parsed
+     that index for forged names [55] and dropped its gitlinks; `git status`
+     in the superproject recurses into the submodule, then into the nested
+     repository, whose core.fsmonitor runs. Same for a nested `.git`
+     declared in the submodule's own .gitmodules. Found by an adversarial
+     review, replayed against git 2.50 and 2.47.3. Fix: the rule of the
+     superproject's nested `.git` (check_nested_git) inside every
+     submodule, its gitdir as the root the gitfiles must point under.
+[61] Local remote [45] redirected: a `commondir` planted in its gitdir
+     (receive-pack takes config and hooks/ from there), a remote whose
+     `.git` is a gitfile at trust time (`--separate-git-dir`, a linked
+     worktree: _local_remote did not recognise it, nothing was watched),
+     `config.worktree` of a remote with extensions.worktreeConfig. Found
+     by an adversarial review, replayed; a gitfile planted after trust was
+     already refused. Fix: the remote opened by a port of enter_repo
+     (suffixes, gitfile, commondir, no environment); the common dir's
+     config and hooks/, the gitfile, commondir and config.worktree watched
+     (`test_local_remote_hooks_git_runs_are_watched`: git says which hook
+     it runs).
+[62] `git push <path>` to a repository of the volume not configured as a
+     remote: receive-pack ran its hooks; only configured remotes were
+     watched [45]. Found by an adversarial review, replayed. Fix: in exec
+     mode the push destination is read as parse-options reads it
+     (`--repo`, abbreviated long options, `-o` values, relative to the
+     root) and a local repository no trusted config names is refused, the
+     way out named (`git remote add`, `trust`); the repository itself and
+     a configured remote's path pass.
+[63] False positive: a `--object-format=sha256` repository could not be
+     trusted; _parse_index_gitlinks sized an entry for a 20-byte id and
+     refused the index as forged ("inconsistent name length"). Fails
+     closed. Found by an adversarial review. Fix: the id width from the
+     repository's format, read like git's check_repository_format
+     (object_id_size, OBJECT_FORMAT_VARIANTS against git: `config` alone,
+     the extension ignored without a version or with -1, kept with -2, an
+     invalid value refused wherever it stands, git's integer syntax
+     `01`/`0x1`/`1k`); per gitdir: a submodule has its own, a linked
+     worktree takes its `commondir`'s.
+[64] False positive: `--ref-format=reftable`. `reftable/` (tables and
+     tables.list, rewritten on every ref update) was not volatile: every
+     commit alerted. Found while replaying [63]. Fix: anchored volatile
+     directory, like refs/.
+[65] False positive: core.hooksPath naming a directory that contains the
+     repository (`..`, `~`). git only runs `<hooksPath>/<hook>`, but
+     DIR_KEYS walked the directory recursively: the work tree, its
+     neighbours and the gitdir without its volatile exclusions were
+     fingerprinted as `ext`, so any commit alerted; with the state
+     directory under it (`~` with `~/.local/state/gitguard`), the manifest
+     `trust` writes was watched too and the repository alerted again after
+     every `trust`. Reported as converging after three trusts; the replay
+     showed it did not. Fix: a directory that contains the repository is
+     walked at depth 1, the others at any depth as before (a first
+     depth-1-everywhere fix stopped watching `.githooks/lib/common.sh`,
+     sourced by the hook: caught in review); the state directory is never
+     entered, a config path inside it refused.
 """
 from __future__ import annotations
 

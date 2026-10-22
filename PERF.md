@@ -97,6 +97,25 @@ N = 30, all five commands within 0.5 ms of each other:
 
 `gitguard` alone: 50 → 37 ms on macOS, 30 → 22 ms on the VM.
 
+## 2026-10-22: fixes [58]–[65]
+
+`gitguard` alone (plain check), before and after the fixes of [58]–[65],
+head to head, N = 30, median; the A/B script is under "Reproducing":
+
+| machine, repository                        | before  | after   |
+|--------------------------------------------|--------:|--------:|
+| macOS, small repository (gitguard itself)  | 38.0 ms | 39.5 ms |
+| macOS, 40 shell aliases in the config      | 47.9 ms | 41.8 ms |
+| Debian VM, small repository                | 22.0 ms | 23.1 ms |
+| Debian VM, 40 shell aliases in the config  | 28.5 ms | 26.1 ms |
+
+The +1 ms on a small repository: a longer script to compile, the
+repository format read once more for the index (`object_id_size`, [63]),
+the submodules' trees ([60]). The sh readings of [58] add tokens, and
+every token cost a `resolve()`: an alias-heavy config produced 1248
+tokens for 35 distinct ones. Resolved once per base now, which more than
+pays for the readings.
+
 ## Where the time goes (2026-10-17 figures)
 
 | component                                             | cost            |
@@ -154,7 +173,27 @@ floor = run([sys.executable, "-c", "import difflib,hashlib,json,os,re,shlex,shut
 print(f"{'python floor':16} {'':>10} {floor:12.0f}ms")
 ```
 
-Run from the gitguard checkout: `python3 bench.py <repo> [N]`. For the
+Run from the gitguard checkout: `python3 bench.py <repo> [N]`. A/B of two copies of the script (the "before
+and after" tables), from the repository to measure:
+
+```python
+"""A/B of `gitguard` (plain check) for two copies of gitguard.py, in the cwd's
+repository, isolated state. usage: ab.py old.py new.py [N]"""
+import os, statistics, subprocess, sys, tempfile, time
+old, new = sys.argv[1], sys.argv[2]
+n = int(sys.argv[3]) if len(sys.argv) > 3 else 30
+env = {**os.environ, "GITGUARD_STATE": tempfile.mkdtemp(), "GITGUARD_NO_NOTIFY": "1"}
+for name, path in [("before", old), ("after", new)] * 2:
+    subprocess.run([sys.executable, path, "trust"], env=env, capture_output=True)
+    ts = []
+    for _ in range(n):
+        t = time.perf_counter()
+        r = subprocess.run([sys.executable, path], env=env, capture_output=True)
+        ts.append(time.perf_counter() - t)
+    print(f"{name:7} rc={r.returncode} median {statistics.median(ts) * 1000:.1f} ms")
+```
+
+`old.py` from `git show <commit>:gitguard.py`. For the
 kernel: `git clone --depth 1
 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git`
 (a few minutes, 2 GB; the GitHub mirror may hang on `info/refs`).

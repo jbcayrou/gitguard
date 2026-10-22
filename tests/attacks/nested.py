@@ -163,3 +163,49 @@ def attack_gitfile_in_pruned_dir_redirected(gg: GG, repo: Path, tmp_path: Path) 
     (sub / ".git").write_text(f"gitdir: {evil}\n")
     gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=sub)
     gg.git("add", "-A", cwd=repo)        # creates the gitlink
+
+
+def attack_gitlink_in_submodule_index(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[60] nested repository inside a submodule's tree, referenced by a
+    gitlink of the submodule's index (`.git/modules/sub/index`): that index
+    was parsed for forged names [55] but its gitlinks were dropped, and
+    `git status` in the superproject recurses into sub, then into the nested
+    repository, whose core.fsmonitor runs"""
+    sub = add_submodule(gg, repo, tmp_path)
+    gg.trust(repo)
+    inner = sub / "inner"
+    gg.git("init", "-q", str(inner))
+    (inner / "i").write_text("i\n")
+    gg.git("add", "i", cwd=inner)
+    gg.git("commit", "-qm", "i", cwd=inner)
+    gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=inner)
+    assert gg.git("add", "inner", cwd=sub).rc == 0          # the gitlink, in sub's index
+
+
+def attack_nested_git_declared_in_submodule_gitmodules(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[60] a nested .git directory declared in the submodule's own
+    .gitmodules (no gitlink needed for the declaration to be read)"""
+    sub = add_submodule(gg, repo, tmp_path)
+    gg.trust(repo)
+    inner = sub / "inner"
+    gg.git("init", "-q", str(inner))
+    gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=inner)
+    (sub / ".gitmodules").write_text('[submodule "inner"]\n\tpath = inner\n\turl = ./x\n')
+
+
+def attack_gitlink_in_submodule_index_gitfile_outside(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[60] the nested entry of the submodule's index is a gitfile pointing
+    outside the submodule's modules/ (a gitdir the container controls)"""
+    sub = add_submodule(gg, repo, tmp_path)
+    gg.trust(repo)
+    evil = tmp_path / "vol-evil"
+    gg.git("init", "-q", str(evil))
+    (evil / "e").write_text("e\n")
+    gg.git("add", "e", cwd=evil)
+    gg.git("commit", "-qm", "e", cwd=evil)
+    gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=evil)
+    # only the volatile index and the tree: no watched file of .git changes
+    sha = gg.git("rev-parse", "HEAD", cwd=evil).out.strip()
+    assert gg.git("update-index", "--add", "--cacheinfo", f"160000,{sha},inner", cwd=sub).rc == 0
+    (sub / "inner").mkdir()
+    (sub / "inner/.git").write_text(f"gitdir: {evil / '.git'}\n")

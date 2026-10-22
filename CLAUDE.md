@@ -41,6 +41,7 @@ paid for by a bypass.
 - **Exclusions are anchored** to a position under a gitdir root, never to a
   bare name (`_child_root`, `_zone`).
 - **A directory is watched only for keys git reads it from** (`DIR_KEYS`);
+  one that contains the repository, at depth 1 only;
   a file is not watched for keys git reads as data (`DATA_KEYS`).
 - Only what every command needs is imported at the top of `gitguard.py`
   (each import is paid by every `git`); trust/restore/pending modules are
@@ -84,7 +85,7 @@ are honoured as git honours them.
 
 ## Tests
 
-`python3 -m pytest` (~420 tests, 1 expected failure — [44] —, ~100 s), before
+`python3 -m pytest` (~660 tests, 1 expected failure — [44] —, ~130 s), before
 any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
 && venv/bin/pip install pytest`.
 

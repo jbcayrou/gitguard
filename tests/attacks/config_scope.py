@@ -266,3 +266,146 @@ def attack_env_config_include(gg: GG, repo: Path, tmp_path: Path) -> None:
     gg.env["GIT_CONFIG_PARAMETERS"] = f"'include.path'='{inc}'"
     gg.trust(repo)
     inc.write_text("[core]\n\tfsmonitor = /tmp/evil\n")
+
+
+# [58] sh expansions that os.path.expandvars does not perform: the value
+# names no existing file for gitguard, sh resolves it to a tree script.
+def _fsmonitor_script(gg: GG, repo: Path, value: str) -> None:
+    write_exec(repo / "p.sh", "#!/bin/sh\nexit 0\n")
+    gg.git("config", "core.fsmonitor", value, cwd=repo)
+    gg.trust(repo)
+    write_exec(repo / "p.sh", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_fsmonitor_script_via_pwd(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[37] control for [58]: `core.fsmonitor = $PWD/p.sh` (`git status` runs it)"""
+    _fsmonitor_script(gg, repo, "$PWD/p.sh")
+
+
+def attack_fsmonitor_script_via_default_expansion(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[58] `core.fsmonitor = ${TOOL:-./p.sh}`: sh substitutes the default,
+    expandvars leaves the text as is"""
+    _fsmonitor_script(gg, repo, "${TOOL:-./p.sh}")
+
+
+def attack_fsmonitor_script_via_subshell_pwd(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[58] `core.fsmonitor = $(pwd)/p.sh`: no variable involved, resolves on
+    any machine"""
+    _fsmonitor_script(gg, repo, "$(pwd)/p.sh")
+
+
+def attack_fsmonitor_script_via_backtick_pwd(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[58] core.fsmonitor = `pwd`/p.sh"""
+    _fsmonitor_script(gg, repo, "`pwd`/p.sh")
+
+
+def attack_alias_script_via_default_expansion(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[58] `!${X:-./tool.sh}`"""
+    _alias_script(gg, repo, "!${X:-./tool.sh}")
+
+
+def attack_alias_script_with_alternate_suffix(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[58] `!./tool.sh${OPT:+ x}`: the path is glued to the expansion"""
+    _alias_script(gg, repo, "!./tool.sh${OPT:+ x}")
+
+
+def attack_env_config_fsmonitor_default_expansion(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[58] GIT_CONFIG_PARAMETERS `core.fsmonitor=${X:-./p.sh}` in the user's
+    environment: nothing in .git names the script"""
+    write_exec(repo / "p.sh", "#!/bin/sh\nexit 0\n")
+    gg.env["GIT_CONFIG_PARAMETERS"] = "'core.fsmonitor=${X:-./p.sh}'"
+    gg.trust(repo)
+    write_exec(repo / "p.sh", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+# [59] core.hooksPath resolving to the root of the tree: add() drops a path
+# equal to the root, and no walk of the tree covers its top level.
+def _hooks_at_root(gg: GG, repo: Path, value: str) -> None:
+    write_exec(repo / "pre-commit", "#!/bin/sh\nexit 0\n")
+    gg.git("config", "core.hooksPath", value, cwd=repo)
+    gg.run("trust", cwd=repo)           # refused at trust time: the expected outcome
+    write_exec(repo / "pre-commit", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_hookspath_root_absolute(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[59] `git config core.hooksPath "$(git rev-parse --show-toplevel)"`"""
+    _hooks_at_root(gg, repo, str(repo))
+
+
+def attack_hookspath_root_via_gitdir_parent(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[59] core.hooksPath = .git/.."""
+    _hooks_at_root(gg, repo, ".git/..")
+
+
+def attack_hookspath_root_dot_slash_dot(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[59] core.hooksPath = ./. (`.` and `./` alone make git search the
+    PATH for `pre-commit`: nothing of the tree runs)"""
+    _hooks_at_root(gg, repo, "./.")
+
+
+# [61] a local remote [45] redirected the way git redirects any gitdir:
+# `commondir`, a gitfile, `config.worktree`. _local_remote watched only
+# `<remote>/.git/config` and `hooks/`, not the files git actually opens.
+def attack_local_remote_commondir(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[61] `commondir` planted in the local remote's gitdir: receive-pack
+    takes config and hooks/ from the directory it names"""
+    sib = tmp_path / "vol-remote.git"
+    gg.git("init", "-q", "--bare", str(sib))
+    gg.git("remote", "add", "origin", str(sib), cwd=repo)
+    gg.trust(repo)
+    evil = tmp_path / "vol-evil.git"
+    gg.git("init", "-q", "--bare", str(evil))
+    write_exec(evil / "hooks/pre-receive", "#!/bin/sh\ntouch /tmp/evil\n")
+    (sib / "commondir").write_text(f"{evil}\n")
+
+
+def attack_local_remote_gitfile(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[61] local remote whose `.git` is a gitfile (`init --separate-git-dir`),
+    trusted as such: _local_remote did not recognise it, nothing was watched"""
+    other, gd = tmp_path / "vol-other", tmp_path / "vol-other-gitdir"
+    gg.git("init", "-q", "--separate-git-dir", str(gd), str(other))
+    gg.git("remote", "add", "origin", str(other), cwd=repo)
+    gg.trust(repo)
+    write_exec(gd / "hooks/pre-receive", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_local_remote_worktree_config(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[61] local remote with extensions.worktreeConfig: its config.worktree
+    (read by receive-pack) was not watched"""
+    sib = tmp_path / "vol-remote.git"
+    gg.git("init", "-q", "--bare", str(sib))
+    gg.git("config", "extensions.worktreeConfig", "true", cwd=sib)
+    gg.git("remote", "add", "origin", str(sib), cwd=repo)
+    gg.trust(repo)
+    write_exec(tmp_path / "vol-h/pre-receive", "#!/bin/sh\ntouch /tmp/evil\n")
+    (sib / "config.worktree").write_text(f"[core]\n\thooksPath = {tmp_path / 'vol-h'}\n")
+
+
+def attack_hookspath_sourced_lib_rewritten(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[65] control: a hooks directory inside the tree stays watched at any
+    depth — `.githooks/pre-commit` sources `.githooks/lib/common.sh`, the
+    sandbox rewrites the library (the first depth-1 fix let it run)"""
+    write_exec(repo / ".githooks/pre-commit", '#!/bin/sh\n. "$(dirname "$0")/lib/common.sh"\n')
+    (repo / ".githooks/lib").mkdir()
+    (repo / ".githooks/lib/common.sh").write_text("true\n")
+    gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
+    gg.trust(repo)
+    (repo / ".githooks/lib/common.sh").write_text("touch /tmp/evil\n")
+
+
+def attack_hookspath_parent_hook_planted(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[65] control: core.hooksPath = .. is watched at depth 1 — a hook
+    planted next to the repository is seen (git runs `../pre-commit`)"""
+    gg.git("config", "core.hooksPath", "..", cwd=repo)
+    gg.trust(repo)
+    write_exec(tmp_path / "pre-commit", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_template_dir_hook_rewritten(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[65] control: init.templateDir keeps its hooks/ watched once walks
+    stop at depth 1 (a re-run `git init` copies them into .git/hooks)"""
+    tpl = tmp_path / "vol-tpl"
+    write_exec(tpl / "hooks/post-checkout", "#!/bin/sh\nexit 0\n")
+    gg.git("config", "init.templateDir", str(tpl), cwd=repo)
+    gg.trust(repo)
+    write_exec(tpl / "hooks/post-checkout", "#!/bin/sh\ntouch /tmp/evil\n")

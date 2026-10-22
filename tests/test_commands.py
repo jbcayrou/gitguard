@@ -527,6 +527,18 @@ def test_retrust_skips_modified(gg: GG, tmp_path: Path) -> None:
     assert "modified" in gg.run("list").out, "m2 must not be re-trusted"
 
 
+def test_retrust_skips_a_refused_repository(gg: GG, tmp_path: Path) -> None:
+    """[59] one repository whose config is refused (hooksPath at its root)
+    must not abort `retrust`: `entries()` reports it as `structure`, it is
+    skipped and named, the others are re-trusted."""
+    m1, m2 = _mk(gg, tmp_path, "m1"), _mk(gg, tmp_path, "m2")
+    gg.git("config", "core.hooksPath", ".", cwd=m1)
+    r = gg.run("retrust")
+    assert r.rc == 0 and f"skipped (structure): {m1}" in r.err, r.text
+    assert f"re-trusted: {m2}" in r.out and "1 repository(ies) re-trusted, 1 skipped" in r.out, r.text
+    assert gg.check(m1).blocked and not gg.check(m2).blocked
+
+
 def test_help(gg: GG) -> None:
     r = gg.run("help")
     assert r.rc == 0 and "retrust" in r.out
@@ -874,3 +886,112 @@ def test_trust_of_an_unchanged_repo_asks_nothing(gg: GG, repo: Path) -> None:
     from tests.test_prompt import run_with_tty
     rc, _, tty = run_with_tty(gg, ["trust"], repo, None)
     assert rc == 0 and "[y/N]" not in tty, tty
+
+
+# ------------------------------- exec-mode carriers [58] [62]
+def test_dash_c_fsmonitor_default_expansion_is_refused(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[58] OPEN — `git -c 'core.fsmonitor=${X:-./p.sh}' status` with p.sh planted
+    in the tree: the `-c` value goes through the same tokenizer as the
+    files; `-c core.fsmonitor=./p.sh` is refused (control)."""
+    mark = tmp_path / "RAN"
+    write_exec(repo / "p.sh", f"#!/bin/sh\ntouch '{mark}'\n")
+    r = gg.run("git", "-c", "core.fsmonitor=./p.sh", "status", cwd=repo)
+    assert r.blocked and not mark.exists(), r.text
+    r = gg.run("git", "-c", "core.fsmonitor=${X:-./p.sh}", "status", cwd=repo)
+    assert r.blocked and not mark.exists(), r.text
+
+
+def test_push_to_a_path_in_the_volume_is_checked(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[62] OPEN — `git push ../other main`: receive-pack runs the destination's
+    hooks and honours its config. Watched for a configured local remote
+    [45], not for a destination named on the command line."""
+    mark = tmp_path / "RAN"
+    other = tmp_path / "vol-other.git"
+    gg.git("init", "-q", "--bare", str(other))
+    write_exec(other / "hooks/pre-receive", f"#!/bin/sh\ntouch '{mark}'\n")
+    gg.run("git", "push", "-q", str(other), "main", cwd=repo)
+    assert not mark.exists(), "the destination's pre-receive was executed"
+
+
+@pytest.mark.parametrize("value", ["{root}", "{root}/", "./.", ".git/..", ".", "./"])
+def test_hookspath_at_the_root_is_refused_with_the_way_out(gg: GG, repo: Path, value: str) -> None:
+    """[59] core.hooksPath resolving to the root of the tree: refused at
+    `trust` and on every command, the message names the way out."""
+    gg.git("config", "core.hooksPath", value.format(root=repo), cwd=repo)
+    for r in (gg.run("trust", cwd=repo), gg.check(repo), gg.run("git", "status", cwd=repo)):
+        assert r.blocked and "root of the work tree" in r.err and ".githooks" in r.err, r.text
+
+
+def test_hookspath_at_the_root_from_the_global_config(gg: GG, repo: Path) -> None:
+    """[59] the same from ~/.gitconfig (a repository of global hooks)"""
+    gg.git("config", "--global", "core.hooksPath", str(repo))
+    r = gg.check(repo)
+    assert r.blocked and "root of the work tree" in r.err, r.text
+
+
+def test_config_naming_the_state_directory_is_refused(gg: GG, repo: Path) -> None:
+    """[65] a config path inside gitguard's state directory: refused, the
+    reference would watch itself."""
+    gg.git("config", "core.hooksPath", str(gg.state), cwd=repo)
+    r = gg.run("trust", cwd=repo)
+    assert r.blocked and "state directory" in r.err, r.text
+
+
+# `--repo` only counts without a positional <repository> (git: "the
+# command-line argument takes precedence"); push.default=current gives it a
+# refspec. `-o` needs a receiving end that advertises push options.
+PUSH_FORMS = ["{d} main", "-u {d} main", "--repo {d}", "--repo={d}", "--rep {d}", "--rep={d}",
+              "-o x {d} main", "-qo x {d} main", "-ox {d} main", "--push-option x {d} main",
+              "--push x {d} main", "--push-option=x {d} main",
+              "--receive-pack git-receive-pack {d} main", "-f -- {d} main", "file://{d} main",
+              "../vol-other.git main", "--force-with-lease {d} main", "--no-repo {d} main",
+              "--repo origin {d} main"]
+
+
+@pytest.mark.parametrize("form", PUSH_FORMS)
+def test_push_destination_forms_are_read(gg: GG, repo: Path, tmp_path: Path, form: str) -> None:
+    """[62] every way of naming the destination on the command line, the
+    abbreviated options parse-options accepts included: refused, and the
+    destination's hook does not run. Control: the real git does run it."""
+    mark = tmp_path / "RAN"
+    other = tmp_path / "vol-other.git"
+    gg.git("init", "-q", "--bare", str(other))
+    gg.git("config", "receive.advertisePushOptions", "true", cwd=other)
+    gg.git("config", "--global", "push.default", "current")
+    write_exec(other / "hooks/pre-receive", f"#!/bin/sh\ntouch '{mark}'\n")
+    args = form.format(d=other).split()
+    r = gg.run("git", "push", "-q", *args, cwd=repo)
+    assert r.blocked and "[62]" in r.err and not mark.exists(), r.text
+    gg.git("push", "-q", *args, cwd=repo)
+    assert mark.exists(), "control: git runs the destination's pre-receive"
+
+
+def test_push_to_self_and_to_a_configured_remote_path(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[62] allowed: `git push . main:x` (the repository itself), and the
+    path of a configured — hence watched — local remote."""
+    assert gg.run("git", "push", "-q", ".", "main:x", cwd=repo).rc == 0
+    other = tmp_path / "vol-other.git"
+    gg.git("init", "-q", "--bare", str(other))
+    gg.git("remote", "add", "origin", str(other), cwd=repo)
+    gg.trust(repo)
+    r = gg.run("git", "push", "-q", str(other), "main", cwd=repo)
+    assert r.rc == 0, r.text
+    r = gg.run("git", "push", "-q", "origin", "main:y", cwd=repo)
+    assert r.rc == 0, r.text
+
+
+def test_push_to_a_name_only_a_submodule_configures(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[62] `git push foo` where only a submodule's config defines remote
+    `foo`: for the superproject's git, `foo` is a path (here a repository
+    in the tree). Refused: a submodule's remotes are not the repository's."""
+    from tests.attacks._helpers import add_submodule
+    mark = tmp_path / "RAN"
+    sub = add_submodule(gg, repo, tmp_path)
+    gg.git("init", "-q", "--bare", str(repo / "foo"))
+    write_exec(repo / "foo/hooks/pre-receive", f"#!/bin/sh\ntouch '{mark}'\n")
+    gg.git("remote", "add", "foo", str(tmp_path / "elsewhere.git"), cwd=sub)
+    gg.trust(repo)
+    r = gg.run("git", "push", "-q", "foo", "main", cwd=repo)
+    assert r.blocked and "[62]" in r.err and not mark.exists(), r.text
+    gg.git("push", "-q", "foo", "main", cwd=repo)
+    assert mark.exists(), "control: git takes `foo` as a path and runs its pre-receive"

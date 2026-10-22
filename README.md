@@ -72,7 +72,11 @@ That silence is the signal.
 - every path the config makes git execute or read: `core.hooksPath`,
   `include.path` chains, scripts named in aliases, filters, drivers,
   `credential.helper`… — in the tree or outside it, as long as you could
-  write there;
+  write there (a `core.hooksPath` resolving to the root of the tree is
+  refused: every top-level file would be a hook);
+- a local remote (`remote.*.url` = a path in the volume): the config and
+  hooks of the repository `push` enters, opened as git opens it; `git push
+  <path>` to a repository no remote names is refused;
 - the paths named by the system and global configs: a global
   `core.hooksPath` pointing into the mounted volume is a bypass otherwise
   (the files themselves are parsed, not hashed: the sandbox cannot write

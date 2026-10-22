@@ -202,7 +202,14 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    - **`Repo.gitfiles`** = nested `.git` declared in `.gitmodules`
      (`gitmodules_gits`) ∪ targeted by an **index gitlink** (`index_gitlinks`,
      a DIRC v2/3/4 parser, never calling git; a gitlink names its directory
-     wherever it is, `node_modules/pkg` included). **No walk of the tree**
+     wherever it is, `node_modules/pkg` included). The width of an object id
+     in the entries comes from the repository's format, read as git's
+     check_repository_format reads it (`object_id_size`: `config` alone, no
+     include; `extensions.objectFormat` only under
+     `core.repositoryformatversion`; a value other than `sha1`/`sha256`
+     anywhere, or a format git dies on, is refused): a
+     SHA-256 index was parsed with 20-byte ids and refused as forged ([63],
+     `OBJECT_FORMAT_VARIANTS` with git as the oracle). **No walk of the tree**
      (see "Nested repositories"). Same rule for all ([24]): a `gitdir:`
      **file** must point under `.git/modules/` (submodule) or
      `.git/worktrees/` (linked worktree stored in the tree, [27]); a
@@ -213,7 +220,14 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
      deliberately vendored repository, inspect its `config` and `hooks`,
      declare it in `.gitmodules`, `git submodule absorbgitdirs` (gitfile under
      `.git/modules/`), `trust`; otherwise delete `<dir>/.git` **before** `git
-     rm --cached <dir>`.
+     rm --cached <dir>`. **The same rule inside every submodule**
+     (`check_indexes`, `check_nested_git`): the gitlinks of
+     `modules/<x>/index` and the `.gitmodules` of the submodule's tree
+     (from its `core.worktree`) name nested repositories that must have a
+     gitfile under `modules/<x>/modules/` — `git status` of the
+     superproject recurses into the submodule, then into what its index
+     names, and runs that repository's config ([60]). Not for a linked
+     worktree's index: nothing recurses into another worktree.
    - **Index entry names** (`forged_entry`, `verify_path`, run by the index
      parser on every index of the repository: its own, `modules/<x>/index`,
      `worktrees/<x>/index` — `check_indexes`): git validates a name when it
@@ -260,8 +274,9 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
 `walk_gitdir` does not list what it watches: it hashes **everything** in the
 gitdir (files and symlinks, at any depth, including `modules/` and
 `worktrees/`) and excludes only what git rewrites in normal operation —
-directories `objects/??`, `pack`, `refs`, `logs`, `lfs`, `rr-cache`,
-`rebase-*`, `sequencer`, `commit-graphs`; files `index`, `*.lock`, `HEAD`,
+directories `objects/??`, `pack`, `refs`, `reftable` ([64]), `logs`,
+`lfs`, `rr-cache`, `rebase-*`, `sequencer`, `commit-graphs`; files `index`,
+`*.lock`, `HEAD`,
 `*_HEAD`, `MERGE_*`, `BISECT_*`, `COMMIT_EDITMSG`, `packed-refs`, `shallow`,
 `gc.*`, `info/refs`, `objects/info/packs`… An unknown file or directory is
 therefore watched. Accepted consequence: `remote add`, `worktree add`,
@@ -310,8 +325,29 @@ value and a split on sh operators and `=` (`&&`, `|`, `(…)`, `f() { …; }`,
 `T=./t.sh`), on the value and on its expanded form: `$PWD`, `${PWD}` and
 `$(git rev-parse --show-toplevel)` are the root (where a `!` alias runs),
 other variables are expanded from gitguard's environment, which git inherits
-([37]). **A directory is only retained for the keys that read its content**
-(`DIR_KEYS`: `core.hooksPath`, `init.templateDir`): git executes files, and a
+([37]). Plus two **sh readings** (`_sh_readings`) that, between them,
+contain every path sh can build without running something gitguard cannot
+know: one takes the WORD of each `${X:-WORD}`/`${X:+WORD}`/`${X=WORD}`…
+and `.` for each `$(…)`/`` `…` `` and each variable the environment does
+not hold (`$(pwd)/t.sh`, `x=$(pwd); $x/t.sh`, an alias's `$1`); the other
+takes the variables' values and nothing for a substitution ([58]: these
+forms were left as text naming no file, and `$(pwd)` resolves on any
+machine). A superset, like includeIf followed whatever its condition: an
+extra hash costs nothing, a missed path ran a planted script
+(`SHELL_EXPANSIONS`, git as the oracle). **A directory is only retained for
+the keys that read its content** (`DIR_KEYS`: `core.hooksPath`,
+`init.templateDir`, plus a local remote's `hooks/`), at any depth (a hook
+sources `lib/common.sh` next to it) **except a directory that contains the
+repository** (`..`, `~`), walked at depth 1: git runs `<hooksPath>/<hook>`
+and nothing of the tree from there. Walked recursively, `core.hooksPath =
+..` fingerprinted the whole volume — the work tree, the gitdir without its
+volatile exclusions, gitguard's own state — and every commit, then every
+`trust`, alerted ([65]); the state directory is never entered, and a config
+path inside it is refused. A `core.hooksPath` (or `init.templateDir`) **resolving to the root
+of the tree** is refused, the way out named (a subdirectory): every
+top-level file would be a hook, and the root is never fingerprinted as a
+whole ([59]: `$(git rev-parse --show-toplevel)` as hooksPath left
+`<root>/pre-commit` unwatched). git executes files, and a
 directory in any other value is a program argument (`safe.directory =
 ~/projects`, `remote.origin.url = /local/repo`, `!make -C src`). **A file
 is not retained for the keys whose value git reads as data** (`DATA_KEYS`,
@@ -329,11 +365,24 @@ first fix kept a 0600 `ext` file out of the state directory; since
 2026-10-21 **no `ext` entry is copied, restored or deleted**: `restore`
 acts on the gitdir and the tree only, names what it leaves outside, and
 the state directory never holds a file from outside the repository.
-Exception, a **local remote** (`remote.*.url`/`pushurl` = a path or `file://` to a
-repository, `_local_remote`): `push` runs its hooks and honours its config,
-so its `config` and `hooks/` are watched (scope `ext` or `wt`) and that
-config is parsed like the others — but its own remotes are not followed
-([45]); +1.4 ms per command with one local remote.
+Exception, a **local remote** (`remote.*.url`/`pushurl` = a path or
+`file://` to a repository, `_local_remote`): `push` runs its hooks and
+honours its config, so its `config` and `hooks/` are watched (scope `ext` or
+`wt`) and that config is parsed like the others — but its own remotes are
+not followed ([45]); +1.4 ms per command with one local remote. The remote
+is **opened as receive-pack opens it**, a port of `enter_repo`: `<p>/.git`,
+`<p>`, `<p>.git/.git`, `<p>.git`, the gitfile followed, then `commondir`,
+without the environment (git clears it for the transport); the config and
+hooks/ are the common dir's, and the gitfile, `commondir` and
+`config.worktree` are watched too ([61]: a planted `commondir`, a gitfile
+remote, a worktree as remote moved what git runs elsewhere;
+`test_local_remote_hooks_git_runs_are_watched` asks git which hook it
+runs). In exec mode, **`git push <path>`** to a local repository that no
+trusted config names is refused, the way out named (`git remote add`,
+`trust`): its hooks are watched for nobody ([62]). The destination is read
+like git's parse-options reads `push` (`--repo`, abbreviated long options,
+`-o` and its value; a relative path from the root); the repository itself
+(`push . main:x`) and the path of a configured remote pass.
 Fingerprinting it alerted on every neighbouring file and, worse, `restore`
 deleted there ([25]). Under the root → scope `wt`; outside the tree but
 writable by the user (e.g. `../shared-hooks` in the same mounted volume) →
@@ -459,7 +508,8 @@ sha256 of the root's absolute path:
                 outside the repository [25] [56]
 <key>.idx       cache of the index parse: version, then one record per index file
                 of the repository (its own, modules/<x>, worktrees/<x>: sha256 of the
-                file + gitlinks), rewritten by any check when an index changes; a
+                file, object id width + gitlinks [63]), rewritten by any check
+                when an index changes; a
                 record only exists for an index whose names passed verify_path [55],
                 an older version is ignored; never a source of trust
 <key>.pending   a refusal nobody read (exec mode, no controlling terminal): kind
@@ -778,9 +828,10 @@ Rule: any new vector or false positive discovered must first become a test.
 
 ## Adversarial review playbook
 
-gitguard has been through nine adversarial review passes (the numbered
-catalogue in `tests/attacks/__init__.py` is their output: 57 bypasses and
-false positives, two of them RCEs found after the tool was believed solid;
+gitguard has been through eleven adversarial review passes (the numbered
+catalogue in `tests/attacks/__init__.py` is their output: 65 bypasses and
+false positives, two of them RCEs found after the tool was believed solid,
+[58]–[65] from the tenth and eleventh, replayed and fixed on 2026-10-22;
 [44] is still open, see "Known limitations"; the ninth pass was the
 promotion of the git-parity `xfail`s [46]–[50]).
 The method that worked, for the next pass — by a human or by agents that know
@@ -893,8 +944,9 @@ content; fail closed on anything the parser cannot make sense of.
   `post-index-change` hook, an unwrapped client) — all outside the wrapper.
 - `core.splitIndex`: refused (gitlinks in `sharedindex.*`, not read).
 - Parity gaps with git are tracked in `tests/test_git_parity.py` as
-  `xfail(strict=True)`; none is open at the moment (the former ones, [46] to
-  [50], are fixed). Deliberate divergences, fail-closed: NUL in a config
+  `xfail(strict=True)`; none is open at the moment (the former ones, [46]
+  to [50], and the sh expansions of [58] are fixed). Deliberate divergences,
+  fail-closed: NUL in a config
   (refused, git truncates), a bad config line (refused, git dies).
   `core.bare = true` in a non-bare layout is not handled (git then has no
   work tree).
@@ -908,6 +960,12 @@ content; fail closed on anything the parser cannot make sense of.
   `.husky/_/h` runs `.husky/<hook>` from the tree anyway, and hooks that
   load neighbouring files would break. `OPEN` in `tests/test_attacks.py` is
   the place for a future open attack that fits the corpus.
+- A value whose path sh builds from a command's output other than the
+  cwd (`$(cd sub && pwd)/t.sh`, `$(cat f)`) is beyond the sh readings
+  ([58]): only the forms that reduce to the top of the tree or to a
+  literal word are covered. A push destination reached through an alias,
+  `url.<base>.insteadOf` rewriting a URL into a local path, or `git
+  send-pack` is not checked ([62]).
 - A `-c`/`--config-env` given to a git that gitguard did not wrap (hook,
   alias, IDE) is invisible; the one of the wrapped command and the
   environment are read ([48]). Same for the repository-local variables

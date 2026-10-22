@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 import gitguard as gg_mod
-from gitguard import _expand2, global_config_files, index_gitlinks, parse_git_config
+from gitguard import _expand2, global_config_files, index_gitlinks, object_id_size, parse_git_config
 from tests.conftest import GG, write_exec
 
 XF = pytest.mark.xfail
@@ -286,7 +286,19 @@ def _alias_e2e(gg: GG, repo: Path, cmd: str) -> None:
     assert r.blocked, f"rewritten tool.sh accepted although `git t` executes it\n{r.text}"
 
 
-@pytest.mark.parametrize("cmd", SHELL_OK)
+# sh expansions expandvars does not perform: git (sh) runs tool.sh, gitguard
+# saw no path. [58]
+SHELL_EXPANSIONS = ["${TOOL:-./tool.sh}", "${TOOL-./tool.sh}", "${PWD:+./tool.sh}",
+              '"${TOOL:-./tool.sh}"', "$(pwd)/tool.sh", "`pwd`/tool.sh",
+              "./tool.sh${OPT:+ x}", "sh -c '${T:-./tool.sh}'",
+              "$( pwd )/tool.sh", "$(pwd -P)/tool.sh", '"$(pwd)"/tool.sh',
+              "${A:=./tool.sh}", "${A:-${B:-./tool.sh}}", "$(echo .)/tool.sh",
+              "`echo ./tool.sh`", "${A:-.}/tool.sh", "x=$(pwd); $x/tool.sh",
+              "f() { $1/tool.sh; }; f .", "cd $(pwd) && ./tool.sh",
+              "$(dirname $(pwd)/x)/tool.sh", "${HOME:+$(pwd)}/tool.sh"]
+
+
+@pytest.mark.parametrize("cmd", SHELL_OK + SHELL_EXPANSIONS)
 def test_alias_script_watched(gg: GG, repo: Path, cmd: str) -> None:
     _alias_e2e(gg, repo, cmd)
 
@@ -504,9 +516,19 @@ def _git_gitlinks(gg: GG, repo: Path) -> list[str]:
     return sorted(out)
 
 
+@pytest.mark.parametrize("fmt", ["sha1", "sha256"])
 @pytest.mark.parametrize("skiphash", [False, True], ids=["hash", "skipHash"])
 @pytest.mark.parametrize("version", [2, 3, 4])
-def test_index_gitlinks_match_ls_files(gg: GG, repo: Path, version: int, skiphash: bool) -> None:
+def test_index_gitlinks_match_ls_files(gg: GG, repo: Path, tmp_path: Path, version: int,
+                                       skiphash: bool, fmt: str) -> None:
+    """…in both object formats: the entries of a SHA-256 index hold 32-byte
+    ids, the parser assumed 20 and refused every one as forged. [63]"""
+    if fmt == "sha256":
+        repo = tmp_path / "s256"
+        assert gg.git("init", "-q", "--object-format=sha256", str(repo)).rc == 0
+        (repo / "f").write_text("a\n")
+        gg.git("add", "f", cwd=repo)
+        assert gg.git("commit", "-qm", "i", cwd=repo).rc == 0
     sha = gg.git("rev-parse", "HEAD", cwd=repo).out.strip()
     long = "/".join(["d" * 200] * 25) + "/sub"          # > 0xFFF: saturated name length
     paths = ["vendor/a", "vendor/ab", "node_modules/pkg", "é space/x", long, "z"]
@@ -519,7 +541,62 @@ def test_index_gitlinks_match_ls_files(gg: GG, repo: Path, version: int, skiphas
     assert gg.git(*pre, "update-index", "--index-version", str(version), cwd=repo).rc == 0
     want = _git_gitlinks(gg, repo)
     assert len(want) == len(paths)
-    assert sorted(index_gitlinks(repo / ".git/index")) == want
+    assert sorted(index_gitlinks(repo / ".git/index", None, object_id_size(repo / ".git"))) == want
+
+
+# Repository format as git reads it (check_repository_format): config text
+# of the gitdir -> must git open the repository. [63]
+OBJECT_FORMAT_VARIANTS = {
+    "v1_sha256": "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha256\n",
+    "v1_sha1": "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha1\n",
+    "v1_none": "[core]\n\trepositoryformatversion = 1\n",
+    "v0_sha256": "[core]\n\trepositoryformatversion = 0\n[extensions]\n\tobjectformat = sha256\n",
+    "no_version_sha256": "[extensions]\n\tobjectformat = sha256\n",
+    "v2_sha256": "[core]\n\trepositoryformatversion = 2\n[extensions]\n\tobjectformat = sha256\n",
+    "v01_sha256": "[core]\n\trepositoryformatversion = 01\n[extensions]\n\tobjectformat = sha256\n",
+    "v0x1_sha256": "[core]\n\trepositoryformatversion = 0x1\n[extensions]\n\tobjectformat = sha256\n",
+    "v1k_sha256": "[core]\n\trepositoryformatversion = 1k\n[extensions]\n\tobjectformat = sha256\n",
+    "v08_sha256": "[core]\n\trepositoryformatversion = 08\n[extensions]\n\tobjectformat = sha256\n",
+    "v_quoted_blank": "[core]\n\trepositoryformatversion = \"1 \"\n[extensions]\n\tobjectformat = sha256\n",
+    "v_leading_tab": "[core]\n\trepositoryformatversion = \"\t1\"\n[extensions]\n\tobjectformat = sha256\n",
+    "v_negative": "[core]\n\trepositoryformatversion = -1\n[extensions]\n\tobjectformat = sha256\n",
+    "v_minus2": "[core]\n\trepositoryformatversion = -2\n[extensions]\n\tobjectformat = sha256\n",
+    "v_minus0": "[core]\n\trepositoryformatversion = -0\n[extensions]\n\tobjectformat = sha256\n",
+    "v_empty": "[core]\n\trepositoryformatversion =\n[extensions]\n\tobjectformat = sha256\n",
+    "upper_SHA256": "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = SHA256\n",
+    "quoted_blank": "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = \"sha256 \"\n",
+    "valueless": "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat\n",
+    "empty": "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat =\n",
+    "last_wins_sha1": "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha256\n\tobjectformat = sha1\n",
+    "last_wins_sha256": "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha1\n\tobjectformat = sha256\n",
+    "mixed_case_key": "[CORE]\n\tRepositoryFormatVersion = 1\n[Extensions]\n\tObjectFormat = sha256\n",
+    "via_include": "[core]\n\trepositoryformatversion = 1\n[include]\n\tpath = inc\n",
+    # an invalid value makes git die as it reads it, whatever the version
+    # and whatever follows: "last value wins" does not apply
+    "md5_then_sha256": "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = md5\n\tobjectformat = sha256\n",
+    "no_version_md5": "[extensions]\n\tobjectformat = md5\n",
+    "no_version_valueless": "[extensions]\n\tobjectformat\n",
+    "v_minus1_md5": "[core]\n\trepositoryformatversion = -1\n[extensions]\n\tobjectformat = md5\n",
+    "title_case": "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = Sha256\n",
+}
+
+
+@pytest.mark.parametrize("name", OBJECT_FORMAT_VARIANTS)
+def test_object_format_as_git_reads_it(gg: GG, tmp_path: Path, name: str) -> None:
+    from gitguard import Refuse
+    r = tmp_path / "s256"
+    assert gg.git("init", "-q", "--object-format=sha256", str(r)).rc == 0
+    (r / ".git/inc").write_text("[extensions]\n\tobjectformat = sha256\n")
+    (r / ".git/config").write_text(OBJECT_FORMAT_VARIANTS[name])
+    oracle = gg.git("rev-parse", "--show-object-format", cwd=r)
+    try:
+        got = object_id_size(r / ".git")
+    except Refuse:
+        got = None
+    if oracle.rc:
+        assert got is None, f"git refuses the repository ({oracle.err.strip()}), gitguard reads {got}"
+    else:
+        assert got == {"sha1": 20, "sha256": 32}[oracle.out.strip()], (oracle.out, got)
 
 
 # ======================== 7. system/global config files that git reads
@@ -903,3 +980,57 @@ def test_verify_path_matches_git(gg: GG, tmp_path: Path, mode: int) -> None:
         if git_ok != gg_mod.verify_path(name, mode):
             diffs.append((name, "git accepts" if git_ok else "git refuses", r.stderr[:80]))
     assert not diffs, diffs
+
+
+# ================== local remotes: the hooks git runs on push are watched [61]
+def _remote_layout(gg: GG, tmp_path: Path, layout: str) -> str:
+    """Build a remote in the volume; return the URL to configure."""
+    v = tmp_path / "vol"
+    v.mkdir()
+    init = lambda *a: gg.git("init", "-q", *map(str, a))
+    if layout == "bare":
+        init("--bare", v / "r.git"); return str(v / "r.git")
+    if layout == "bare_suffix_tried":
+        init("--bare", v / "r.git"); return str(v / "r")
+    if layout == "bare_trailing_slash":
+        init("--bare", v / "r.git"); return str(v / "r.git") + "/"
+    if layout == "file_url":
+        init("--bare", v / "r.git"); return "file://" + str(v / "r.git")
+    if layout == "worktree_repo":
+        init(v / "o"); return str(v / "o")
+    if layout == "dotgit_dotgit":
+        init(v / "o.git"); return str(v / "o")
+    if layout == "gitfile":
+        init("--separate-git-dir", v / "gd", v / "o"); return str(v / "o")
+    if layout == "commondir_relative":
+        init("--bare", v / "main.git")
+        init("--bare", v / "r.git")
+        (v / "r.git/commondir").write_text("../main.git\n"); return str(v / "r.git")
+    if layout == "linked_worktree":
+        init(v / "m")
+        (v / "m/f").write_text("f\n")
+        gg.git("add", "f", cwd=v / "m")
+        gg.git("commit", "-qm", "f", cwd=v / "m")
+        assert gg.git("worktree", "add", "-q", str(v / "w"), cwd=v / "m").rc == 0
+        return str(v / "w")
+    raise AssertionError(layout)
+
+
+@pytest.mark.parametrize("layout", ["bare", "bare_suffix_tried", "bare_trailing_slash", "file_url",
+                                    "worktree_repo", "dotgit_dotgit", "gitfile",
+                                    "commondir_relative", "linked_worktree"])
+def test_local_remote_hooks_git_runs_are_watched(gg: GG, repo: Path, tmp_path: Path,
+                                                 layout: str) -> None:
+    url = _remote_layout(gg, tmp_path, layout)
+    log = tmp_path / "ran.log"
+    hooks = [p for p in (tmp_path / "vol").rglob("hooks") if p.is_dir()]
+    for h in hooks:
+        write_exec(h / "pre-receive", f"#!/bin/sh\necho {h} >> '{log}'\n")
+    gg.git("remote", "add", "origin", url, cwd=repo)
+    r = gg.git("push", "-q", "origin", "HEAD:refs/heads/probe", cwd=repo)
+    assert r.rc == 0 and log.exists(), f"oracle: git ran no pre-receive\n{r.text}"
+    ran = Path(log.read_text().split()[0])
+    gg.trust(repo)
+    write_exec(ran / "pre-receive", EVIL)
+    res = gg.check(repo)
+    assert res.blocked, f"{ran}/pre-receive (run by git push) rewritten, accepted\n{res.text}"

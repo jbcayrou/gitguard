@@ -404,3 +404,100 @@ def test_data_key_file_rotation_is_silent(gg: GG, repo: Path, tmp_path: Path, ke
     f.write_text("ROTATED\n")
     assert not gg.check(repo).blocked
     assert not gg.run("git", "status", cwd=repo).blocked
+
+
+# ------------------------------- false positives [63] [64] [65]
+def test_sha256_repository_can_be_trusted(gg: GG, tmp_path: Path) -> None:
+    """[63] `git init --object-format=sha256`: the index entries hold 32-byte
+    object ids, the parser assumed 20 and refused the index as forged."""
+    r = tmp_path / "s256"
+    assert gg.git("init", "-q", "--object-format=sha256", str(r)).rc == 0
+    commit(gg, r)
+    gg.trust(r)
+    commit(gg, r, "g", "x")
+    assert not gg.check(r).blocked
+
+
+def test_reftable_commit_and_branch(gg: GG, tmp_path: Path) -> None:
+    """[64] `git init --ref-format=reftable`: every ref update rewrites
+    `reftable/tables.list` and the tables, which were fingerprinted."""
+    r = tmp_path / "rt"
+    assert gg.git("init", "-q", "--ref-format=reftable", str(r)).rc == 0
+    commit(gg, r)
+    gg.trust(r)
+    commit(gg, r, "g", "x")
+    gg.git("branch", "b2", cwd=r)
+    assert not gg.check(r).blocked, gg.run("diff", cwd=r).text
+
+
+def test_hookspath_above_the_state_directory(gg: GG, repo: Path) -> None:
+    """[65] core.hooksPath = .. with the state directory under that parent
+    (here `tmp_path/state`; in real life `~/.local/state/gitguard` under a
+    hooksPath of `~`): the manifest that `trust` writes is itself watched, so
+    the repository alerts again right after every `trust`."""
+    gg.git("config", "core.hooksPath", "..", cwd=repo)
+    gg.trust(repo)
+    assert not gg.check(repo).blocked, gg.run("diff", cwd=repo).text
+
+
+def test_hookspath_above_the_tree_ignores_tree_edits(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[65] core.hooksPath = .. with the state directory elsewhere:
+    git runs only `../<hook>`, yet editing a tracked file of the repository
+    alerts (the parent is walked recursively, the tree included)."""
+    import tempfile
+    gg.env["GITGUARD_STATE"] = tempfile.mkdtemp(dir=tmp_path.parent)
+    gg.git("config", "core.hooksPath", "..", cwd=repo)
+    gg.trust(repo)
+    commit(gg, repo)
+    assert not gg.check(repo).blocked, gg.run("diff", cwd=repo).text
+
+
+def test_nested_submodules_recursive(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[60] a submodule with its own submodule (`--recursive`): the inner
+    gitfile points under `.git/modules/<sub>/modules/`, nothing alerts —
+    after the clone, a commit in the inner one and a superproject status."""
+    inner_src = make_source(gg, tmp_path, "innersrc")
+    mid = make_source(gg, tmp_path, "midsrc")
+    assert gg.git("submodule", "add", "-q", str(inner_src), "inner", cwd=mid).rc == 0
+    assert gg.git("commit", "-qm", "inner", cwd=mid).rc == 0
+    assert gg.git("submodule", "add", "-q", str(mid), "mid", cwd=repo).rc == 0
+    assert gg.git("submodule", "update", "-q", "--init", "--recursive", cwd=repo).rc == 0
+    assert gg.git("commit", "-qm", "mid", cwd=repo).rc == 0
+    g = (repo / "mid/inner/.git").read_text()
+    assert "modules/mid/modules/inner" in g, g
+    gg.trust(repo)
+    commit(gg, repo / "mid/inner", "t", "t")
+    assert gg.run("git", "status", cwd=repo).rc == 0
+    r = gg.check(repo)
+    assert not r.blocked, r.text
+
+
+def test_sha256_submodule_in_sha1_superproject(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[63] each gitdir has its own object format: a SHA-256 submodule's
+    index is read with 32-byte ids, the superproject's with 20."""
+    src = tmp_path / "s256src"
+    assert gg.git("init", "-q", "--object-format=sha256", str(src)).rc == 0
+    commit(gg, src)
+    r = gg.git("submodule", "add", "-q", str(src), "sub", cwd=repo)
+    if r.rc:
+        pytest.skip(f"this git refuses mixed object formats: {r.err.strip()}")
+    gg.git("commit", "-qm", "sub", cwd=repo)
+    gg.trust(repo)
+    assert not gg.check(repo).blocked
+
+
+def test_sha256_submodule_with_a_linked_worktree(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[63] the index of a submodule's linked worktree
+    (`modules/<x>/worktrees/<w>/index`) has the submodule's object format,
+    found through its `commondir`, not the superproject's."""
+    src = tmp_path / "s256src"
+    assert gg.git("init", "-q", "--object-format=sha256", str(src)).rc == 0
+    commit(gg, src)
+    r = gg.git("submodule", "add", "-q", str(src), "sub", cwd=repo)
+    if r.rc:
+        pytest.skip(f"this git refuses mixed object formats: {r.err.strip()}")
+    gg.git("commit", "-qm", "sub", cwd=repo)
+    assert gg.git("worktree", "add", "-q", str(tmp_path / "subwt"), cwd=repo / "sub").rc == 0
+    assert (repo / ".git/modules/sub/worktrees").is_dir()
+    gg.trust(repo)
+    assert not gg.check(repo).blocked, gg.check(repo).text
