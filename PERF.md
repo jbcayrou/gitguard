@@ -116,6 +116,28 @@ every token cost a `resolve()`: an alias-heavy config produced 1248
 tokens for 35 distinct ones. Resolved once per base now, which more than
 pays for the readings.
 
+## 2026-10-23: fixes [66]–[70], [72], [73], [75], [76]
+
+`gitguard` alone (plain check), `ca23feb` (the previous measurement) against
+`606c09e`, head to head, N = 60, median, two rounds each (the A/B script
+under "Reproducing"):
+
+| machine, repository                        | before  | after   |
+|--------------------------------------------|--------:|--------:|
+| macOS, small repository (gitguard itself)  | 40.4 ms | 41.4 ms |
+| macOS, 40 shell aliases in the config      | 42.8 ms | 43.5 ms |
+| Debian VM, small repository                | 30.0 ms | 30.7 ms |
+| Debian VM, 40 shell aliases in the config  | 29.9 ms | 30.7 ms |
+
++0.7 to +1 ms. Compiling the script accounts for most of it: 153 → 164 KB,
+12.7 → 13.5 ms (macOS, median of 30 `compile()`). The rest is a handful
+of `stat` calls: the remote's gitdir as a second base for global
+`core.hooksPath` ([68]), the symlink chain of a config path ([75]), and
+reading `alias.*` values for the command word ([66]) — shell aliases return
+at the first character. Absolute figures differ from the 2026-10-22 table
+(machine state, the VM's load); only the head-to-head column pair is
+comparable.
+
 ## Where the time goes (2026-10-17 figures)
 
 | component                                             | cost            |
