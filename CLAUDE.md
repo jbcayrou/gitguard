@@ -82,11 +82,11 @@ are honoured as git honours them.
 | passthroughs that read no repository | `TRANSPORT`, `main` | Which git runs |
 | the gitlink brought by `checkout`/`switch`/`stash` | `enters_new_gitlinks`, `_alias_command`, `with_ignored_submodule_dirt` | Nested repositories |
 | performance | PERF.md | Nested repositories (end) |
-| open attack [44], accepted limitations [71], [74], out-of-scope cases | — | Known limitations |
+| accepted limitations [44], [71], [74], out-of-scope cases | — | Known limitations |
 
 ## Tests
 
-`python3 -m pytest` (~800 tests, expected failures: [44], [71], [74], ~130 s), before
+`python3 -m pytest` (~800 tests, expected failures: [44], [71], [74], the accepted limitations, ~130 s), before
 any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
 && venv/bin/pip install pytest`.
 

@@ -721,9 +721,9 @@ def test_clone_config_parameters_env_no_autotrust(gg: GG, tmp_path: Path) -> Non
     assert gg.check(tmp_path / "c").blocked
 
 
-@pytest.mark.xfail(strict=True, reason="[44] open: the check runs before git updates the tree")
+@pytest.mark.xfail(strict=True, reason="[44] accepted limitation (DESIGN.md, Known limitations)")
 def test_checkout_rewrites_tracked_hook_then_runs_it(gg: GG, repo: Path, tmp_path: Path) -> None:
-    """[44] OPEN — core.hooksPath in the tree (husky, .githooks) and hooks
+    """[44] accepted limitation — core.hooksPath in the tree (husky, .githooks) and hooks
     tracked by git. refs/ and objects/ are volatile: the container commits a
     rewritten post-checkout on a branch. The state is clean when gitguard
     checks; `git checkout feat` writes the new hook, then runs it."""
@@ -873,7 +873,7 @@ def test_user_ignore_submodules_none_does_not_reopen_it(gg: GG, tmp_path: Path) 
 
 
 def test_trust_warns_hooks_in_tree(gg: GG, repo: Path) -> None:
-    """[44] open flaw made visible: hooks under core.hooksPath in the tree."""
+    """[44] accepted limitation made visible: hooks under core.hooksPath in the tree."""
     write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
     gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
     r = gg.run("trust", cwd=repo)

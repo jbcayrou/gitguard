@@ -804,7 +804,7 @@ into the tree was not watched.
 
 ## Tests
 
-**`python3 -m pytest`** (~800 tests, expected failures [44], [71], [74], ~130 s),
+**`python3 -m pytest`** (~800 tests, expected failures [44], [71], [74] — accepted limitations —, ~130 s),
 to run before any change:
 
 - `tests/attacks/` — **the attack corpus**, one module per family (`gitdir`,
@@ -894,7 +894,7 @@ catalogue in `tests/attacks/__init__.py` is their output: 76 bypasses and
 false positives, two of them RCEs found after the tool was believed solid,
 [58]–[65] from the tenth and eleventh, replayed and fixed on 2026-10-22;
 [66]–[70], [72], [73], [75], [76] from the twelfth, fixed on 2026-10-23;
-[44] is still open, [71] and [74] accepted, see "Known limitations"; the ninth pass was the
+[44], [71] and [74] are accepted limitations, see "Known limitations"; the ninth pass was the
 promotion of the git-parity `xfail`s [46]–[50]).
 The method that worked, for the next pass — by a human or by agents that know
 nothing of the previous ones:
@@ -1012,18 +1012,32 @@ content; fail closed on anything the parser cannot make sense of.
   (refused, git truncates), a bad config line (refused, git dies).
   `core.bare = true` in a non-bare layout is not handled (git then has no
   work tree).
-- **Open [44]**: hooks tracked in the tree under `core.hooksPath` (husky,
-  `.githooks`). Its general form, a gitlink brought by the command,
-  was [66], fixed (see "Nested repositories"): a tracked hook has no such
-  switch, git runs the file as checked out. The container can create objects and move refs (volatile);
-  `git checkout`/`merge`/`reset`/`pull` of its commit rewrites the hook
-  *after* the check, and git runs it in the same command. Test:
-  `test_checkout_rewrites_tracked_hook_then_runs_it` (xfail). `gitguard
-  trust` warns when a hooks directory is in the tree. Forcing git onto the
-  trusted copy (`-c core.hooksPath=<backup>`) was ruled out: husky v9's
-  `.husky/_/h` runs `.husky/<hook>` from the tree anyway, and hooks that
-  load neighbouring files would break. `OPEN` in `tests/test_attacks.py` is
-  the place for a future open attack that fits the corpus.
+- **Accepted limitation [44]** (decided 2026-10-23, xfail test kept as the
+  record: `test_checkout_rewrites_tracked_hook_then_runs_it`): hooks
+  **tracked in the tree** under `core.hooksPath` (husky, `.githooks`,
+  lefthook). The container needs no `.git` write: it commits a rewritten
+  `post-checkout` (or `pre-commit`, `pre-push`…) and moves a branch to it,
+  or leaves it for the next `pull` — objects and refs are volatile. The
+  files on disk and the config are still the trusted ones when gitguard
+  checks; `git checkout`/`merge`/`pull`/`reset --hard` of that commit
+  writes the new hook, then runs it, in the same command. Its general form,
+  the gitlink brought by the command ([66]), had a switch (`-c
+  diff.ignoreSubmodules=dirty`); a tracked hook has none: git runs the file
+  as checked out. Ruled out: forcing git onto the trusted copy (`-c
+  core.hooksPath=<backup>`) — husky v9's `.husky/_/h` runs `.husky/<hook>`
+  from the tree anyway, and hooks that load neighbouring files would break;
+  reading the target tree before the command — an object reader (zlib,
+  packs, deltas) for this case, and for `pull` the tree is not local yet;
+  the tree walk — the file changes only during the command. Why accepted:
+  versioned hooks are the user's decision to execute what the repository
+  contains, the same boundary as `make` or `npm install` after a pull;
+  gitguard guards `.git`, not that choice. Mitigations in place: `gitguard
+  trust` warns when a hooks directory is in the tree and says to review
+  incoming changes to those files; the prevention layer is a global
+  `core.hooksPath` outside every tree (CLAUDE.md), which git's local config
+  can still override — a trusted repository's `.git/config` naming
+  `.githooks` is the user's own. `OPEN` in `tests/test_attacks.py` is the
+  place for a future open attack that fits the corpus.
 - **Accepted limitation [71], [74]** (adversarial review of 2026-10-22,
   xfail tests kept as the record): an alias of the user's own, already
   trusted, that runs a script **of the work tree** reached through a `cd`

@@ -115,8 +115,12 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      part of the config diff shown before [y/N]; only gitguard's own codes
      are kept now.
 [44] OPEN — a tracked hook under core.hooksPath in the tree is rewritten by the
-     very command the user runs (checkout/merge/reset of a commit the
+     very command the user runs (checkout/merge/reset/pull of a commit the
      container created, refs and objects being volatile), then executed.
+     Accepted limitation (2026-10-23, DESIGN.md, Known limitations):
+     versioned hooks are the user's choice to run what the tree contains;
+     `trust` warns. Test: test_checkout_rewrites_tracked_hook_then_runs_it
+     (xfail, the record).
 [45] A local remote (remote.*.url = a repository in the volume): its hooks
      run on push, its config is honoured; not fingerprinted. Fix: its config
      and hooks/ (and what that config names), never the whole directory.
