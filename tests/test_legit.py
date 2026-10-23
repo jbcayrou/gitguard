@@ -553,3 +553,39 @@ def test_global_relative_hookspath_with_remote_and_submodule_is_quiet(gg: GG, re
     gg.trust(repo)
     assert not gg.check(repo).blocked
     assert not gg.run("git", "status", cwd=repo).blocked
+
+
+def test_checkout_summary_still_reports_a_submodule(gg: GG, repo: Path, subsrc: Path) -> None:
+    """[66] `checkout`/`switch`/`stash` run with `-c diff.ignoreSubmodules=dirty`:
+    the summary of local changes still names a submodule with new commits
+    (`M sub`), only its own tree's modifications go unreported there; and
+    `git status`, which does not get the option, still reports them."""
+    assert gg.git("submodule", "add", "-q", str(subsrc), "sub", cwd=repo).rc == 0
+    gg.git("commit", "-qm", "sub", cwd=repo)
+    gg.trust(repo)
+    gg.git("checkout", "-qb", "other", cwd=repo)
+    # new commit in the submodule, and a dirty file there
+    (repo / "sub/t").write_text("t\n")
+    gg.git("add", "t", cwd=repo / "sub")
+    gg.git("commit", "-qm", "t", cwd=repo / "sub")
+    (repo / "sub/s").write_text("dirty\n")
+    r = gg.run("git", "checkout", "main", cwd=repo)
+    assert r.rc == 0 and "M\tsub" in r.out, r.text
+    assert not gg.check(repo).blocked
+    r = gg.run("git", "status", cwd=repo)
+    assert r.rc == 0 and "sub (new commits, modified content)" in r.out, r.text
+    r = gg.run("git", "diff", "--submodule=short", cwd=repo)
+    assert "-dirty" in r.out, r.text
+
+
+def test_stash_pop_in_a_repository_with_a_submodule(gg: GG, repo: Path, subsrc: Path) -> None:
+    """[66] ordinary `stash` / `stash pop` with a submodule present: quiet,
+    and the status printed by `pop` still lists the restored change."""
+    assert gg.git("submodule", "add", "-q", str(subsrc), "sub", cwd=repo).rc == 0
+    gg.git("commit", "-qm", "sub", cwd=repo)
+    gg.trust(repo)
+    (repo / "f").write_text("c\n")
+    assert gg.run("git", "stash", "-q", cwd=repo).rc == 0
+    r = gg.run("git", "stash", "pop", cwd=repo)
+    assert r.rc == 0 and "modified:   f" in r.out, r.text
+    assert not gg.check(repo).blocked

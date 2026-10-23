@@ -1143,3 +1143,52 @@ def test_global_relative_hookspath_in_a_submodule_as_git(gg: GG, repo: Path, tmp
     write_exec(ran / ".githooks/post-checkout", EVIL)
     r = gg.run("git", *pre, "submodule", "update", "--force", "-q", cwd=repo)
     assert r.blocked, f"{ran}/.githooks/post-checkout rewritten, accepted\n{r.text}"
+
+
+# ------------------------------------------------- aliases: the command word [66]
+ALIAS_FORMS = {
+    "plain": "checkout",
+    "with_args": "checkout -q",
+    "single_quoted": "'checkout' -q",
+    "double_quoted_part": '"check"out -q',
+    "backslash": "check\\out -q",
+    "trailing_blank": "checkout ",
+    "shell": "!git checkout -q",
+    "leading_blank": " checkout",
+    "unclosed_quote": "'checkout main",
+    "trailing_backslash": "checkout \\",
+    "empty_word_first": "'' checkout",
+    "vertical_tab": "checkout\vmain",
+}
+
+
+@pytest.mark.parametrize("form", list(ALIAS_FORMS))
+def test_alias_command_word_as_git(gg: GG, tmp_path: Path, form: str) -> None:
+    """`_alias_command` says which git command an alias runs; git is the
+    oracle: with `alias.co = <form>`, GIT_TRACE prints the expansion git
+    computed (`alias expansion: co => 'checkout' '-q'`), whose first word must
+    be the port's answer; no expansion (a shell alias, a value git dies on:
+    "bad alias.co string") must be None."""
+    import re
+    import subprocess
+    r = tmp_path / "r"
+    gg.git("init", "-q", str(r))
+    (r / "a").write_text("a\n")
+    gg.git("add", "a", cwd=r)
+    gg.git("commit", "-qm", "i", cwd=r)
+    gg.git("checkout", "-qb", "feature", cwd=r)
+    gg.git("config", "alias.co", ALIAS_FORMS[form], cwd=r)
+    stored = [v for s, k, v in parse_git_config(r / ".git/config") if (s, k) == ("alias", "co")]
+    assert stored == [gg.git("config", "alias.co", cwd=r).out[:-1]], stored
+    res = subprocess.run(["git", "co", "main"], cwd=r, env={**gg.env, "GIT_TRACE": "1"},
+                         capture_output=True, text=True, errors="replace")
+    m = re.search(r"alias expansion: co => (.*)", res.stderr)
+    word = gg_mod._alias_command(stored[0])
+    if m is None:
+        assert word is None, (res.stderr, word)
+        assert ALIAS_FORMS[form].startswith("!") or "bad alias.co string" in res.stderr, res.stderr
+    else:
+        first = re.match(r"'([^']*)'|(\S+)", m.group(1))      # sq_quote_argv: quoted when needed
+        assert first is not None, m.group(0)
+        expected = first.group(1) if first.group(1) is not None else first.group(2)
+        assert word == (expected or None), (m.group(0), word)

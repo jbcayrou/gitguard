@@ -744,6 +744,39 @@ hatch `GITGUARD_PRUNE` was also misleading: the gitlink detection never
 depended on it, so a vendored repository stayed refused after adding it —
 the real way out is a submodule (`absorbgitdirs`), now named by the message.
 
+**The gitlink that arrives with the command** ([66], fixed on 2026-10-23).
+The barrier above holds for a gitlink already in the index. The sandbox can
+also plant an untracked repository `vendor/x` (its config running a script)
+and a commit whose tree has a gitlink there, and move a branch — or forge
+`refs/stash` — to it: objects and refs are volatile, nothing is in the
+fingerprint, and the index gitguard reads has no gitlink. `git checkout` /
+`git switch` of that branch write the gitlink, then print the local changes;
+`git stash pop` applies it, then runs `git status`. Both summaries ask each
+gitlink whose directory holds a repository whether it is modified by running
+`git status` inside it (is_submodule_modified), which honours the planted
+config — all in the one command whose check passed. `checkout -f`, `-q`,
+`reset --hard`, `merge`, `pull`, `rebase` write the gitlink without entering
+it (probed on git 2.47.3 and 2.50). Fix: in exec mode, `checkout`, `switch`
+and `stash` run with `-c diff.ignoreSubmodules=dirty` inserted after the
+user's global options (`with_ignored_submodule_dirt`; the last `-c` wins, so
+a user's `=none` does not reopen it). git then compares each gitlink's
+recorded commit and skips the `git status` in the submodule
+(match_stat_with_submodule; `submodule.<name>.ignore` does not override it,
+override_submodule_config). The gitlink is written; the **next** command sees
+it and is refused, as after an `add`. What changes for the user: those three
+commands' summaries no longer flag a submodule whose own tree is dirty (new
+commits are still shown); `status` and `diff` are untouched. The option
+travels to children through GIT_CONFIG_PARAMETERS, so a hook these commands
+run sees it too. The command word is resolved through aliases as git does
+(`_alias_command`, a port of split_cmdline's first word; a builtin is never
+shadowed; an alias may name an alias; every definition counts rather than
+modelling precedence), from the repository's own config, global files and
+`-c` — a shell alias (`!…`) is not read, and `GIT_CONFIG_PARAMETERS` set by
+hand is read like `-c`. Ruled out: reading the target tree before the
+command (an object reader — zlib, packs, deltas — for one case), restoring
+the tree walk (above), `=all` (hides submodules from the summary
+altogether).
+
 Performance (M4 Pro, see PERF.md for the full tables): ~33 ms overhead per
 command, constant whatever the tree: interpreter 16 ms, stdlib imports 6 ms,
 **compiling the script 15 ms** (a script run by path is never cached as
@@ -771,7 +804,7 @@ into the tree was not watched.
 
 ## Tests
 
-**`python3 -m pytest`** (~420 tests, 1 expected failure — [44] —, ~100 s),
+**`python3 -m pytest`** (~800 tests, expected failures [44], [71], [74], ~130 s),
 to run before any change:
 
 - `tests/attacks/` — **the attack corpus**, one module per family (`gitdir`,
@@ -856,11 +889,12 @@ Rule: any new vector or false positive discovered must first become a test.
 
 ## Adversarial review playbook
 
-gitguard has been through eleven adversarial review passes (the numbered
-catalogue in `tests/attacks/__init__.py` is their output: 65 bypasses and
+gitguard has been through twelve adversarial review passes (the numbered
+catalogue in `tests/attacks/__init__.py` is their output: 76 bypasses and
 false positives, two of them RCEs found after the tool was believed solid,
 [58]–[65] from the tenth and eleventh, replayed and fixed on 2026-10-22;
-[44] is still open, see "Known limitations"; the ninth pass was the
+[66]–[70], [72], [73], [75], [76] from the twelfth, fixed on 2026-10-23;
+[44] is still open, [71] and [74] accepted, see "Known limitations"; the ninth pass was the
 promotion of the git-parity `xfail`s [46]–[50]).
 The method that worked, for the next pass — by a human or by agents that know
 nothing of the previous ones:
@@ -979,7 +1013,9 @@ content; fail closed on anything the parser cannot make sense of.
   `core.bare = true` in a non-bare layout is not handled (git then has no
   work tree).
 - **Open [44]**: hooks tracked in the tree under `core.hooksPath` (husky,
-  `.githooks`). The container can create objects and move refs (volatile);
+  `.githooks`). Its general form, a gitlink brought by the command,
+  was [66], fixed (see "Nested repositories"): a tracked hook has no such
+  switch, git runs the file as checked out. The container can create objects and move refs (volatile);
   `git checkout`/`merge`/`reset`/`pull` of its commit rewrites the hook
   *after* the check, and git runs it in the same command. Test:
   `test_checkout_rewrites_tracked_hook_then_runs_it` (xfail). `gitguard
@@ -988,15 +1024,6 @@ content; fail closed on anything the parser cannot make sense of.
   `.husky/_/h` runs `.husky/<hook>` from the tree anyway, and hooks that
   load neighbouring files would break. `OPEN` in `tests/test_attacks.py` is
   the place for a future open attack that fits the corpus.
-- **Open [66]**, the general form of [44]: the gitlink arrives with the
-  command. The sandbox plants an untracked repository (`vendor/x`, with a
-  core.fsmonitor) and a commit whose tree has a gitlink there, and moves a
-  branch to it; `git checkout`/`git switch` of that branch writes the
-  gitlink, then enters `vendor/x` to show the local changes and runs its
-  config. No config precondition, no trust-time warning. The index read
-  at check time has no gitlink: "the gitlink is the barrier" holds for a
-  gitlink already in the index, not for one the checked command brings.
-  Test: `test_checkout_brings_a_gitlink_to_a_planted_repository` (xfail).
 - **Accepted limitation [71], [74]** (adversarial review of 2026-10-22,
   xfail tests kept as the record): an alias of the user's own, already
   trusted, that runs a script **of the work tree** reached through a `cd`

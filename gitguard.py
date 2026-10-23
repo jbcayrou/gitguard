@@ -1604,14 +1604,18 @@ def check_safe_bare() -> None:
              f"recommended: {SAFE_BARE_HINT}")
 
 
-def config_refs(repo: Repo, remote_names: set[str] | None = None) -> list[tuple[str, Path]]:
+def config_refs(repo: Repo, remote_names: set[str] | None = None,
+                aliases: dict[str, set[str]] | None = None) -> list[tuple[str, Path]]:
     """Paths outside the gitdir that the config makes git execute or read:
     core.hooksPath, include.path (recursive), and any token of a value that
     exists as a path. Returns [(scope, path)] with scope 'wt' (under the root)
     or 'ext' (elsewhere, writable). Plus the tree files that drive git: root
     gitfile, .gitmodules, each submodule's gitfile. `remote_names`, if given,
     receives the name of every remote the repository's config defines (not a
-    remote's own config): what `git push <name>` resolves through config. [62]"""
+    remote's own config): what `git push <name>` resolves through config. [62]
+    `aliases`, if given, receives for every `alias.<name>` the repository's
+    config defines the git command it expands to (`_alias_command`), all
+    definitions kept: what `git <name>` runs. [66]"""
     out: dict[Path, str] = {}
 
     def add(literal: Path, p: Path, allow_dir: bool = False) -> None:
@@ -1724,6 +1728,10 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None) -> list[tuple[
         # submodule's: there, `<name>` is a path.
         if remote_names is not None and base == repo.root and section.startswith("remote."):
             remote_names.add(section[len("remote."):])
+        if aliases is not None and base == repo.root and section == "alias":
+            word = _alias_command(value)
+            if word is not None:
+                aliases.setdefault(key, set()).add(word)
         if (section, key) in DIR_KEYS:
             if glob:
                 global_dirs.append((section, key, value))
@@ -3238,6 +3246,77 @@ def check_remote_destination(repo: Repo, rest: list[str], remote_names: set[str]
                          f"`gitguard trust`, then `git {again}`. [{62 if cmd == 'push' else 70}]")
 
 
+def _alias_command(value: str) -> str | None:
+    """The git command an alias expands to: the first word of its value split
+    as git's `split_cmdline` does (quotes `'` and `"`, `\\` escapes outside
+    single quotes). None for a shell alias (`!…`), an empty value, or one git
+    dies on (unclosed quote: "bad alias.<name> string"). [66]"""
+    if value.startswith("!"):
+        return None
+    word: list[str] = []
+    quoted, ended, i = "", False, 0
+    while i < len(value):
+        c = value[i]
+        if not quoted and c in " \t\n\r":   # git's isspace: no \v, no \f
+            ended = True                  # a leading blank ends an empty first word, as in git
+        elif not quoted and c in "'\"":
+            quoted = c
+        elif c == quoted:
+            quoted = ""
+        else:
+            if c == "\\" and quoted != "'":
+                i += 1
+                if i >= len(value):
+                    return None
+                c = value[i]
+            if not ended:
+                word.append(c)
+        i += 1
+    if quoted:
+        return None
+    return "".join(word) or None
+
+
+# Commands that write a tree into the index and then summarise the work tree
+# in the same process: checkout/switch (the local changes), stash pop/apply
+# (`git status`). The summary enters every gitlink whose directory holds a
+# repository to run `git status` there (is_submodule_modified), which honours
+# that repository's config — one the sandbox planted, unknown to the index
+# gitguard read, since the gitlink arrives with the command. [66]
+ENTERS_NEW_GITLINKS = frozenset({"checkout", "switch", "stash"})
+IGNORE_SUBMODULE_DIRT = "diff.ignoreSubmodules=dirty"
+
+
+def enters_new_gitlinks(rest: list[str], aliases: dict[str, set[str]]) -> bool:
+    """Does `git <rest>` run one of ENTERS_NEW_GITLINKS, directly or through
+    an alias? A builtin is never shadowed by an alias of its name, and an
+    alias may expand to another alias (git.c run_argv). Every definition of
+    an alias counts (a superset: precedence is not modelled). Case-insensitive:
+    config keys are, and `git-Checkout` finds `git-checkout` in the exec path
+    of a case-insensitive file system. [66]"""
+    todo, seen = [w.lower() for w in rest[:1]], set()
+    while todo:
+        word = todo.pop()
+        if word in ENTERS_NEW_GITLINKS:
+            return True
+        if word not in seen:
+            seen.add(word)
+            todo.extend(w.lower() for w in aliases.get(word, ()))
+    return False
+
+
+def with_ignored_submodule_dirt(args: list[str], rest: list[str]) -> list[str]:
+    """`args` with `-c diff.ignoreSubmodules=dirty` inserted after the global
+    options (after the user's own `-c`: the last one wins). git then compares
+    the recorded commit of each gitlink without running `git status` in the
+    submodule (match_stat_with_submodule), and still reports new commits;
+    only "modified content" of a submodule's own tree goes unreported by
+    these commands' summaries. `submodule.<name>.ignore` does not override
+    it (override_submodule_config). Checked on git 2.47 and 2.50. [66]"""
+    cut = len(args) - len(rest)
+    return [*args[:cut], "-c", IGNORE_SUBMODULE_DIRT, *args[cut:]]
+
+
 def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None, git: str) -> int:
     os.chdir(orig)
     if newrepo is None:
@@ -3531,10 +3610,14 @@ def main(argv: list[str]) -> int:
         repo = open_repo(root)
         label, key = repo.label, repo.key
         remote_names: set[str] = set()
-        refs = config_refs(repo, remote_names)
+        aliases: dict[str, set[str]] = {}
+        refs = config_refs(repo, remote_names, aliases)
         check_structure(repo, refs)
         if mode == "exec":
-            check_remote_destination(repo, split_global_options(argv, orig).rest, remote_names, refs)
+            rest = split_global_options(argv, orig).rest
+            check_remote_destination(repo, rest, remote_names, refs)
+            if enters_new_gitlinks(rest, aliases):
+                argv = with_ignored_submodule_dirt(argv, rest)
         new = manifest(repo, refs)
         old = load_manifest(key)
         fingerprinted = True

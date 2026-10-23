@@ -744,75 +744,132 @@ def test_checkout_rewrites_tracked_hook_then_runs_it(gg: GG, repo: Path, tmp_pat
     assert not mark.exists(), "post-checkout from the container's commit was executed"
 
 
-@pytest.mark.xfail(strict=True, reason="[66] open: the gitlink arrives with the checkout, after the check")
-@pytest.mark.parametrize("cmd", [["checkout", "main"], ["switch", "main"]])
-def test_checkout_brings_a_gitlink_to_a_planted_repository(gg: GG, tmp_path: Path, cmd: list) -> None:
-    """[66] OPEN — no special config needed. The sandbox plants an untracked
-    nested repository `vendor/x` (core.fsmonitor), builds a commit whose tree
-    has a gitlink at `vendor/x` and moves `main` to it (objects and refs are
+def _plant_gitlink(gg: GG, r: Path, mark: Path, ref: str = "refs/heads/main") -> None:
+    """The sandbox of [66]: an untracked repository `vendor/x` whose config runs
+    a script (core.fsmonitor touching `mark`), a commit whose tree has a
+    gitlink at `vendor/x`, and `ref` moved to it — objects and refs are
+    volatile, nothing of this is in the fingerprint. For `refs/stash` the
+    commit is shaped like a stash (two parents, a reflog entry)."""
+    x = r / "vendor/x"
+    gg.git("init", "-q", str(x))
+    (x / "s").write_text("s\n")
+    gg.git("add", "s", cwd=x)
+    gg.git("commit", "-qm", "s", cwd=x)
+    write_exec(x / ".git/fsm.sh", f"#!/bin/sh\ntouch '{mark}'\n")
+    gg.git("config", "core.fsmonitor", str(x / ".git/fsm.sh"), cwd=x)
+    (x / "s").write_text("dirty\n")        # a dirty submodule tree: what `git status` reports
+    sub = gg.git("rev-parse", "HEAD", cwd=x).out.strip()
+    import subprocess
+    mk = lambda text: subprocess.run(["git", "mktree", "--missing"], cwd=r, env=gg.env, input=text,
+                                     capture_output=True, text=True, check=True).stdout.strip()
+    vt = mk(f"160000 commit {sub}\tx\n")
+    tree = mk(gg.git("ls-tree", "HEAD", cwd=r).out + f"040000 tree {vt}\tvendor\n")
+    if ref == "refs/stash":
+        idx = gg.git("commit-tree", "-p", "HEAD", "-m", "index", tree, cwd=r).out.strip()
+        c = gg.git("commit-tree", "-p", "HEAD", "-p", idx, "-m", "WIP", tree, cwd=r).out.strip()
+        gg.git("update-ref", "--create-reflog", "-m", "WIP", ref, c, cwd=r)
+    else:
+        c = gg.git("commit-tree", "-p", "HEAD", "-m", "evil", tree, cwd=r).out.strip()
+        gg.git("update-ref", ref, c, cwd=r)
+
+
+def _two_branches(gg: GG, tmp_path: Path) -> Path:
+    r = tmp_path / "r"
+    gg.git("init", "-q", str(r))
+    (r / "a").write_text("a\n")
+    gg.git("add", "a", cwd=r)
+    gg.git("commit", "-qm", "i", cwd=r)
+    gg.git("checkout", "-qb", "feature", cwd=r)
+    return r
+
+
+GITLINK_BRINGERS = {
+    "checkout": (["checkout", "main"], []),
+    "switch": (["switch", "main"], []),
+    "alias_global": (["co", "main"], ["alias.co=checkout"]),
+    "alias_quoted": (["co", "main"], ["alias.co='switch' --no-guess"]),
+    "alias_chain": (["c", "main"], ["alias.c=co", "alias.co=checkout"]),
+    "alias_before_global_option": (["--no-pager", "co", "main"], ["alias.co=checkout"]),
+}
+
+
+@pytest.mark.parametrize("form", list(GITLINK_BRINGERS))
+def test_checkout_brings_a_gitlink_to_a_planted_repository(gg: GG, tmp_path: Path, form: str) -> None:
+    """[66] no special config needed. The sandbox plants an untracked nested
+    repository `vendor/x` (core.fsmonitor), builds a commit whose tree has a
+    gitlink at `vendor/x` and moves `main` to it (objects and refs are
     volatile). The user, on another branch, runs `git checkout main`: the
     index gitguard reads has no gitlink, the check passes; git writes the
     gitlink, then shows the local changes, enters `vendor/x` and runs its
-    fsmonitor in the same command. `checkout -f`, `reset --hard` and `merge`
-    write the gitlink without entering it, and so does `checkout -q` (no
-    summary of local changes)."""
+    fsmonitor in the same command. Fix: these commands run with
+    `-c diff.ignoreSubmodules=dirty`, which drops the `git status` in the
+    submodule; the gitlink is written, the next command is refused. Also
+    through an alias, global or `-c`, quoted, chained."""
     mark = tmp_path / "RAN"
-    r = tmp_path / "r"
-    gg.git("init", "-q", str(r))
-    (r / "a").write_text("a\n")
-    gg.git("add", "a", cwd=r)
-    gg.git("commit", "-qm", "i", cwd=r)
-    gg.git("checkout", "-qb", "feature", cwd=r)
+    r = _two_branches(gg, tmp_path)
+    cmd, config = GITLINK_BRINGERS[form]
+    for kv in config:
+        gg.git("config", "--global", *kv.split("=", 1), cwd=r)
     gg.trust(r)
-    # the sandbox
-    x = r / "vendor/x"
-    gg.git("init", "-q", str(x))
-    (x / "s").write_text("s\n")
-    gg.git("add", "s", cwd=x)
-    gg.git("commit", "-qm", "s", cwd=x)
-    write_exec(x / ".git/fsm.sh", f"#!/bin/sh\ntouch '{mark}'\n")
-    gg.git("config", "core.fsmonitor", str(x / ".git/fsm.sh"), cwd=x)
-    sub = gg.git("rev-parse", "HEAD", cwd=x).out.strip()
-    import subprocess
-    mk = lambda text: subprocess.run(["git", "mktree", "--missing"], cwd=r, env=gg.env, input=text,
-                                     capture_output=True, text=True, check=True).stdout.strip()
-    vt = mk(f"160000 commit {sub}\tx\n")
-    tree = mk(gg.git("ls-tree", "HEAD", cwd=r).out + f"040000 tree {vt}\tvendor\n")
-    c = gg.git("commit-tree", "-p", "HEAD", "-m", "evil", tree, cwd=r).out.strip()
-    gg.git("update-ref", "refs/heads/main", c, cwd=r)
+    _plant_gitlink(gg, r, mark)
     assert not mark.exists() and not gg.check(r).blocked
     # the user
-    gg.run("git", *cmd, cwd=r)
+    res = gg.run("git", *cmd, cwd=r)
+    assert res.rc == 0, res.text
     assert not mark.exists(), "the planted repository's fsmonitor ran during the checkout"
+    assert gg.git("rev-parse", "--abbrev-ref", "HEAD", cwd=r).out.strip() == "main"
+    # the gitlink is in the index now: the next command is refused
+    assert gg.check(r).blocked
 
 
-def test_checkout_gitlink_control_real_git_runs_it(gg: GG, tmp_path: Path) -> None:
-    """[66] positive control of the test above, with the real git and the
-    same planting: git does run the planted fsmonitor on `checkout main`."""
+def test_alias_given_on_the_command_line_is_followed(gg: GG, tmp_path: Path) -> None:
+    """[66] `git -c alias.co=checkout co main`: the alias comes from the
+    command line (GIT_CONFIG_PARAMETERS), read like the files."""
     mark = tmp_path / "RAN"
-    r = tmp_path / "r"
-    gg.git("init", "-q", str(r))
-    (r / "a").write_text("a\n")
-    gg.git("add", "a", cwd=r)
-    gg.git("commit", "-qm", "i", cwd=r)
-    gg.git("checkout", "-qb", "feature", cwd=r)
-    x = r / "vendor/x"
-    gg.git("init", "-q", str(x))
-    (x / "s").write_text("s\n")
-    gg.git("add", "s", cwd=x)
-    gg.git("commit", "-qm", "s", cwd=x)
-    write_exec(x / ".git/fsm.sh", f"#!/bin/sh\ntouch '{mark}'\n")
-    gg.git("config", "core.fsmonitor", str(x / ".git/fsm.sh"), cwd=x)
-    sub = gg.git("rev-parse", "HEAD", cwd=x).out.strip()
-    import subprocess
-    mk = lambda text: subprocess.run(["git", "mktree", "--missing"], cwd=r, env=gg.env, input=text,
-                                     capture_output=True, text=True, check=True).stdout.strip()
-    vt = mk(f"160000 commit {sub}\tx\n")
-    tree = mk(gg.git("ls-tree", "HEAD", cwd=r).out + f"040000 tree {vt}\tvendor\n")
-    c = gg.git("commit-tree", "-p", "HEAD", "-m", "evil", tree, cwd=r).out.strip()
-    gg.git("update-ref", "refs/heads/main", c, cwd=r)
-    gg.git("checkout", "main", cwd=r)
+    r = _two_branches(gg, tmp_path)
+    gg.trust(r)
+    _plant_gitlink(gg, r, mark)
+    res = gg.run("git", "-c", "alias.co=checkout", "co", "main", cwd=r)
+    assert res.rc == 0 and not mark.exists(), res.text
+
+
+def test_stash_pop_brings_a_gitlink_to_a_planted_repository(gg: GG, tmp_path: Path) -> None:
+    """[66] the stash form: a forged `refs/stash` (two parents, a reflog
+    entry) whose tree has the gitlink. `git stash pop` applies it, then runs
+    `git status`, which enters `vendor/x`. `-c diff.ignoreSubmodules=dirty`
+    reaches the child through GIT_CONFIG_PARAMETERS."""
+    mark = tmp_path / "RAN"
+    r = _two_branches(gg, tmp_path)
+    gg.trust(r)
+    _plant_gitlink(gg, r, mark, ref="refs/stash")
+    assert not mark.exists() and not gg.check(r).blocked
+    res = gg.run("git", "stash", "pop", cwd=r)
+    assert res.rc == 0 and "vendor/x" in res.out, res.text
+    assert not mark.exists(), "the planted repository's fsmonitor ran during the stash pop"
+    assert gg.check(r).blocked
+
+
+@pytest.mark.parametrize("ref, cmd", [("refs/heads/main", ["checkout", "main"]),
+                                      ("refs/stash", ["stash", "pop"])])
+def test_gitlink_control_real_git_runs_it(gg: GG, tmp_path: Path, ref: str, cmd: list) -> None:
+    """[66] positive control of the tests above, with the real git and the
+    same planting: git does run the planted fsmonitor."""
+    mark = tmp_path / "RAN"
+    r = _two_branches(gg, tmp_path)
+    _plant_gitlink(gg, r, mark, ref=ref)
+    gg.git(*cmd, cwd=r)
     assert mark.exists(), "git no longer enters the nested repository: [66] may be moot"
+
+
+def test_user_ignore_submodules_none_does_not_reopen_it(gg: GG, tmp_path: Path) -> None:
+    """[66] the injected `-c` comes after the user's: `-c
+    diff.ignoreSubmodules=none` on the command line does not win back."""
+    mark = tmp_path / "RAN"
+    r = _two_branches(gg, tmp_path)
+    gg.trust(r)
+    _plant_gitlink(gg, r, mark)
+    res = gg.run("git", "-c", "diff.ignoreSubmodules=none", "checkout", "main", cwd=r)
+    assert res.rc == 0 and not mark.exists(), res.text
 
 
 def test_trust_warns_hooks_in_tree(gg: GG, repo: Path) -> None:

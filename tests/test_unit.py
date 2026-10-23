@@ -527,3 +527,45 @@ def test_state_dir_order(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
     monkeypatch.setenv("GITGUARD_STATE", str(tmp_path / "explicit"))
     assert gg_mod.state_dir() == tmp_path / "explicit"
+
+
+# ------------------------------------------------------------ aliases [66]
+@pytest.mark.parametrize("value, word", [
+    ("checkout", "checkout"),
+    ("checkout main", "checkout"),
+    ("  checkout", None),               # a leading blank: git's first word is empty
+    ("'switch' --no-guess", "switch"),
+    ('"check"out', "checkout"),
+    ("check\\out", "checkout"),
+    ("'check\\out'", "check\\out"),     # no escape inside single quotes
+    ("'' checkout", None),
+    ("!git checkout", None),
+    ("", None),
+    ("'checkout", None),                # unclosed quote: git dies
+    ("checkout \\", None),              # trailing backslash: git dies
+    ("checkout 'a", None),
+    ("checkout\vmain", "checkout\vmain"),   # git's isspace: \v and \f are not blanks
+])
+def test_alias_command(value: str, word: str | None) -> None:
+    assert gg_mod._alias_command(value) == word
+
+
+def test_enters_new_gitlinks() -> None:
+    f = gg_mod.enters_new_gitlinks
+    assert f(["checkout", "x"], {}) and f(["stash", "pop"], {}) and f(["switch"], {})
+    assert not f(["status"], {}) and not f([], {})
+    assert f(["co"], {"co": {"checkout"}})
+    assert f(["c"], {"c": {"co"}, "co": {"checkout"}})
+    assert not f(["c"], {"c": {"co"}, "co": {"status"}})
+    assert f(["c"], {"c": {"status", "switch"}})          # any definition counts
+    assert not f(["a"], {"a": {"b"}, "b": {"a"}})          # a loop ends
+    assert f(["checkout"], {"checkout": {"status"}})       # a builtin is never shadowed
+    assert f(["Co"], {"co": {"Checkout"}}) and f(["CHECKOUT"], {})   # case-insensitive
+
+
+def test_with_ignored_submodule_dirt() -> None:
+    args = ["-C", "x", "--no-pager", "-c", "a=b", "checkout", "main"]
+    assert gg_mod.with_ignored_submodule_dirt(args, args[5:]) == [
+        "-C", "x", "--no-pager", "-c", "a=b", "-c", "diff.ignoreSubmodules=dirty", "checkout", "main"]
+    assert gg_mod.with_ignored_submodule_dirt(["stash"], ["stash"]) == [
+        "-c", "diff.ignoreSubmodules=dirty", "stash"]

@@ -307,20 +307,28 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      depth-1-everywhere fix stopped watching `.githooks/lib/common.sh`,
      sourced by the hook: caught in review); the state directory is never
      entered, a config path inside it refused.
-[66] OPEN — the gitlink arrives with the command. "The gitlink is the
-     barrier" (DESIGN.md, Nested repositories) assumed a gitlink exists in
-     the index before the command that opens the nested repository. The
-     sandbox plants an untracked repository `vendor/x` (core.fsmonitor),
-     a commit whose tree has a gitlink at `vendor/x`, and moves a branch to
-     it (objects and refs volatile). `git checkout`/`git switch` to that
-     branch writes the gitlink, then shows the local changes, enters
-     `vendor/x` and runs its fsmonitor, in the same command; the index
-     gitguard read had no gitlink. No special config, no trust-time
+[66] The gitlink arrives with the command. "The gitlink is the barrier"
+     (DESIGN.md, Nested repositories) assumed a gitlink exists in the index
+     before the command that opens the nested repository. The sandbox plants
+     an untracked repository `vendor/x` (core.fsmonitor), a commit whose tree
+     has a gitlink at `vendor/x`, and moves a branch to it (objects and refs
+     volatile). `git checkout`/`git switch` to that branch writes the
+     gitlink, then shows the local changes, enters `vendor/x` and runs its
+     fsmonitor, in the same command; `git stash pop` of a forged
+     `refs/stash` does the same through the `git status` it ends with. The
+     index gitguard read had no gitlink. No special config, no trust-time
      warning: a generalisation of [44]. `checkout -f`, `reset --hard`,
-     `merge`, `pull . main` and `checkout -q`
-     (no summary of local changes) write the gitlink without entering it. Found by
-     an adversarial review, replayed against git 2.50 and 2.47.3. Test:
-     test_checkout_brings_a_gitlink_to_a_planted_repository (xfail).
+     `merge`, `pull . main`, `rebase` and `checkout -q` write the gitlink
+     without entering it. Found by an adversarial review, replayed against
+     git 2.50 and 2.47.3. Fix: `checkout`, `switch` and `stash` — also
+     through an alias, global or `-c`, chained — run with
+     `-c diff.ignoreSubmodules=dirty`: the summary compares each gitlink's
+     recorded commit without running `git status` in it
+     (match_stat_with_submodule); the gitlink is written, the next command
+     is refused. Tests: test_checkout_brings_a_gitlink_to_a_planted_repository,
+     test_stash_pop_brings_a_gitlink_to_a_planted_repository, with the real
+     git as positive control; parity of the alias word in
+     test_alias_command_word_as_git.
 [67] Non-bare local remote with a relative core.hooksPath (husky
      `.husky/_`): receive-pack runs hooks in the remote's $GIT_DIR, so git
      runs `<remote>/.git/.husky/_/<hook>`; gitguard resolved it against

@@ -278,12 +278,13 @@ When your editor ran git, not you
 - It cannot close the race between its check and git's execution if the sandbox is still writing. Stop the sandbox before running git on the host.
 - `restore` only cleans the pivot vector. Objects, commits and tree files the sandbox dropped stay there for you to inspect, and so is a watched file outside the repository: restore never writes there.
 - Hooks tracked *in the tree* under `core.hooksPath` (husky, `.githooks`) are watched, but a `checkout`, `merge` or `pull` of a commit the sandbox created rewrites them after the check, and git runs the new version in the same command. `gitguard trust` warns when that layout is in place; review incoming changes to those files.
+- `checkout`, `switch` and `stash` (also through an alias) run with `-c diff.ignoreSubmodules=dirty`: a commit the sandbox created can bring a gitlink to a repository it planted in the tree, and the summary those commands print would otherwise run `git status` inside it, with its config, in the same command. Their summary still shows a submodule with new commits, no longer one whose own tree is merely dirty; `status` and `diff` are unchanged, and the next command on the repository is refused.
 - A trusted hook that calls a program by name depends on your `PATH`. If a `PATH` directory sits in the mounted volume, that is out of reach.
 - The question needs stdout and stderr on a terminal. A prompt's `$(git …)` or a `git log | head` on a changed repository is refused, not asked: rerun without the pipe, or `gitguard trust`.
 - No desktop notification without a session (ssh, cron, systemd). The pending record is still written and the wait still times out; check `gitguard pending` by hand.
 - Bare repositories are refused, not managed. `core.splitIndex` is refused: the gitlinks it needs to read live in `sharedindex.*`.
 - Parity with git is checked against git itself in `tests/test_git_parity.py`; a gap found there is marked as an expected failure until fixed, and none is open at the moment. Deliberate, fail-closed divergences: a NUL byte or a line git dies on in a config file is refused.
 
-The suite replays a catalogue of fifty bypasses and false positives found over nine adversarial review passes, and requires a refusal for each one while ordinary git workflows stay silent. The catalogue, the review method and the design notes are in the repository.
+The suite replays a catalogue of over seventy bypasses and false positives found over twelve adversarial review passes, and requires a refusal for each one while ordinary git workflows stay silent. The catalogue, the review method and the design notes are in the repository.
 
 </section>
