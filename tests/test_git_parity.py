@@ -506,6 +506,30 @@ def test_core_worktree_hookspath(explicit: GG, repo: Path, tmp_path: Path) -> No
     assert explicit.check(repo).blocked
 
 
+@pytest.mark.parametrize("where", ["common", "common_with_extension", "config_worktree"])
+@pytest.mark.discovery
+def test_core_worktree_in_a_linked_worktree_as_git(explicit: GG, repo: Path, tmp_path: Path,
+                                                   where: str) -> None:
+    """[76] check_repository_format_gently applies core.worktree only `if
+    (!has_common)`: never in a linked worktree — unless
+    extensions.worktreeConfig, which reads this gitdir's config.worktree
+    (its value wins) and clears has_common. Git says where the tree is,
+    open_repo must agree, and the worktree stays trustable."""
+    wt, other = tmp_path / "wt", tmp_path / "other"
+    other.mkdir()
+    assert explicit.git("worktree", "add", "-q", str(wt), cwd=repo).rc == 0
+    if where != "common":
+        explicit.git("config", "extensions.worktreeConfig", "true", cwd=repo)
+    if where == "config_worktree":
+        assert explicit.git("config", "--worktree", "core.worktree", str(other), cwd=wt).rc == 0
+    else:
+        explicit.git("config", "core.worktree", str(other), cwd=repo)
+    top = Path(explicit.git("rev-parse", "--show-toplevel", cwd=wt).out.strip()).resolve()
+    assert top == (wt if where == "common" else other).resolve(), where
+    assert gg_mod.open_repo(wt).root.resolve() == top
+    assert explicit.run("trust", cwd=wt).rc == 0
+
+
 # ========================================= 6. index gitlinks vs ls-files -s
 def _git_gitlinks(gg: GG, repo: Path) -> list[str]:
     r = subprocess.run(["git", "ls-files", "-s", "-z"], cwd=repo, env=gg.env, capture_output=True)
@@ -996,6 +1020,22 @@ def _remote_layout(gg: GG, tmp_path: Path, layout: str) -> str:
         init("--bare", v / "r.git"); return str(v / "r.git") + "/"
     if layout == "file_url":
         init("--bare", v / "r.git"); return "file://" + str(v / "r.git")
+    if layout == "file_url_encoded_space":                     # [69]
+        init("--bare", v / "My Repos/r.git"); return "file://" + str(v / "My%20Repos/r.git")
+    if layout == "file_url_encoded_lowercase_dot":
+        init("--bare", v / "r.git"); return "file://" + str(v / "r%2egit")
+    if layout == "file_url_encoded_slash":
+        init("--bare", v / "d/r.git"); return "file://" + str(v / "d%2Fr.git")
+    if layout == "file_url_invalid_escape_kept":
+        init("--bare", v / "a%zz/r.git"); return "file://" + str(v / "a%zz/r.git")
+    if layout == "file_url_double_encoding_decoded_once":
+        init("--bare", v / "a%20b/r.git"); return "file://" + str(v / "a%2520b/r.git")
+    if layout == "file_url_host_dropped":                      # parse_connect_url: path from the first `/`
+        init("--bare", v / "r.git"); return "file://host.example" + str(v / "r.git")
+    if layout == "file_url_bracket_host":                      # host_end: a `/` inside `[…]` is not the path
+        init("--bare", v / "r.git"); return "file://u@[::1/x]" + str(v / "r.git")
+    if layout == "file_url_encoded_colon_slashes":             # `a%3A%2F%2F` is the directory `a:`
+        init("--bare", v / "a:/r.git"); return "file://" + str(v) + "/a%3A%2F%2Fr.git"
     if layout == "worktree_repo":
         init(v / "o"); return str(v / "o")
     if layout == "dotgit_dotgit":
@@ -1016,9 +1056,16 @@ def _remote_layout(gg: GG, tmp_path: Path, layout: str) -> str:
     raise AssertionError(layout)
 
 
-@pytest.mark.parametrize("layout", ["bare", "bare_suffix_tried", "bare_trailing_slash", "file_url",
-                                    "worktree_repo", "dotgit_dotgit", "gitfile",
-                                    "commondir_relative", "linked_worktree"])
+REMOTE_LAYOUTS = ["bare", "bare_suffix_tried", "bare_trailing_slash", "file_url",
+                  "file_url_encoded_space", "file_url_encoded_lowercase_dot",
+                  "file_url_encoded_slash", "file_url_invalid_escape_kept",
+                  "file_url_double_encoding_decoded_once", "file_url_host_dropped",
+                  "file_url_bracket_host", "file_url_encoded_colon_slashes",
+                  "worktree_repo", "dotgit_dotgit", "gitfile",
+                  "commondir_relative", "linked_worktree"]
+
+
+@pytest.mark.parametrize("layout", REMOTE_LAYOUTS)
 def test_local_remote_hooks_git_runs_are_watched(gg: GG, repo: Path, tmp_path: Path,
                                                  layout: str) -> None:
     url = _remote_layout(gg, tmp_path, layout)
@@ -1029,7 +1076,35 @@ def test_local_remote_hooks_git_runs_are_watched(gg: GG, repo: Path, tmp_path: P
     gg.git("remote", "add", "origin", url, cwd=repo)
     r = gg.git("push", "-q", "origin", "HEAD:refs/heads/probe", cwd=repo)
     assert r.rc == 0 and log.exists(), f"oracle: git ran no pre-receive\n{r.text}"
-    ran = Path(log.read_text().split()[0])
+    ran = Path(log.read_text().split("\n")[0])
+    gg.trust(repo)
+    write_exec(ran / "pre-receive", EVIL)
+    res = gg.check(repo)
+    assert res.blocked, f"{ran}/pre-receive (run by git push) rewritten, accepted\n{res.text}"
+
+
+@pytest.mark.parametrize("layout", REMOTE_LAYOUTS)
+def test_local_remote_relative_hookspath_where_git_resolves_it(gg: GG, repo: Path, tmp_path: Path,
+                                                               layout: str) -> None:
+    """[67] a relative core.hooksPath in the remote's config: a pre-receive
+    is planted under `rel-hooks/` in every gitdir and work tree of the
+    volume, git says which one it runs, rewriting that one is seen."""
+    url = _remote_layout(gg, tmp_path, layout)
+    vol = tmp_path / "vol"
+    for c in vol.rglob("config"):
+        if (c.parent / "HEAD").is_file():
+            with open(c, "a") as fh:
+                fh.write("[core]\n\thooksPath = rel-hooks\n")
+    log = tmp_path / "ran.log"
+    gitdirs = {h.parent for h in vol.rglob("HEAD")
+               if (h.parent / "objects").is_dir() or (h.parent / "commondir").is_file()}
+    for d in gitdirs | {g.parent for g in gitdirs}:
+        h = d / "rel-hooks"
+        write_exec(h / "pre-receive", f"#!/bin/sh\necho {h} >> '{log}'\n")
+    gg.git("remote", "add", "origin", url, cwd=repo)
+    r = gg.git("push", "-q", "origin", "HEAD:refs/heads/probe", cwd=repo)
+    assert r.rc == 0 and log.exists(), f"oracle: git ran no pre-receive\n{r.text}"
+    ran = Path(log.read_text().split("\n")[0])
     gg.trust(repo)
     write_exec(ran / "pre-receive", EVIL)
     res = gg.check(repo)

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from tests.attacks._helpers import add_submodule, make_source
-from tests.conftest import GG
+from tests.conftest import GG, write_exec
 
 
 def commit(gg: GG, repo: Path, name: str = "f", content: str = "b") -> None:
@@ -501,3 +501,35 @@ def test_sha256_submodule_with_a_linked_worktree(gg: GG, repo: Path, tmp_path: P
     assert (repo / ".git/modules/sub/worktrees").is_dir()
     gg.trust(repo)
     assert not gg.check(repo).blocked, gg.check(repo).text
+
+
+# ---------------------------------------- adversarial review of 2026-10-22
+def test_global_program_path_that_is_a_symlink(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[75] `gpg.program = /opt/homebrew/bin/gpg` (Homebrew symlinks
+    every binary), `core.editor = /usr/bin/vim` (Debian alternatives), a
+    stow-managed `~/.gitconfig.local`: add() refuses any config path that is
+    itself a symlink, so every repository is refused, `trust` included."""
+    real = tmp_path / "opt/Cellar/gpg/bin/gpg"
+    write_exec(real, "#!/bin/sh\nexit 0\n")
+    link = tmp_path / "opt/bin/gpg"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real)
+    gg.git("config", "--global", "gpg.program", str(link))
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0, r.text
+    assert not gg.check(repo).blocked
+
+
+def test_linked_worktree_of_a_submodule(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[76] `git -C sub worktree add ../subwt`: git ignores the
+    common config's core.worktree in a linked worktree; open_repo applied
+    it and took `.git/modules/sub` for the tree (a volatile-zone refusal,
+    or an internal ValueError)."""
+    add_submodule(gg, repo, tmp_path)
+    wt = tmp_path / "subwt"
+    assert gg.git("worktree", "add", "-q", str(wt), cwd=repo / "sub").rc == 0
+    top = gg.git("rev-parse", "--show-toplevel", cwd=wt).out.strip()
+    assert Path(top).resolve() == wt.resolve()
+    r = gg.run("trust", cwd=wt)
+    assert r.rc == 0, r.text
+    assert not gg.run("git", "status", cwd=wt).blocked

@@ -307,6 +307,79 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      depth-1-everywhere fix stopped watching `.githooks/lib/common.sh`,
      sourced by the hook: caught in review); the state directory is never
      entered, a config path inside it refused.
+[66] OPEN — the gitlink arrives with the command. "The gitlink is the
+     barrier" (DESIGN.md, Nested repositories) assumed a gitlink exists in
+     the index before the command that opens the nested repository. The
+     sandbox plants an untracked repository `vendor/x` (core.fsmonitor),
+     a commit whose tree has a gitlink at `vendor/x`, and moves a branch to
+     it (objects and refs volatile). `git checkout`/`git switch` to that
+     branch writes the gitlink, then shows the local changes, enters
+     `vendor/x` and runs its fsmonitor, in the same command; the index
+     gitguard read had no gitlink. No special config, no trust-time
+     warning: a generalisation of [44]. `checkout -f`, `reset --hard`,
+     `merge`, `pull . main` and `checkout -q`
+     (no summary of local changes) write the gitlink without entering it. Found by
+     an adversarial review, replayed against git 2.50 and 2.47.3. Test:
+     test_checkout_brings_a_gitlink_to_a_planted_repository (xfail).
+[67] Non-bare local remote with a relative core.hooksPath (husky
+     `.husky/_`): receive-pack runs hooks in the remote's $GIT_DIR, so git
+     runs `<remote>/.git/.husky/_/<hook>`; gitguard resolved it against
+     the remote's work tree. Fix: the remote's relative values resolve
+     against its gitdir, where enter_repo chdirs
+     (`test_local_remote_relative_hookspath_where_git_resolves_it`: git
+     says which hook it runs, every layout).
+[68] OPEN — a global (or system) relative core.hooksPath (`.githooks`) was
+     resolved against the repository's root only; git applies it in every
+     repository it enters: a local bare remote
+     (`hub.git/.githooks/pre-receive` on push), a submodule
+     (`sub/.githooks/post-checkout` on `submodule update`).
+[69] `file://` remote URLs are URL-decoded by git (`My%20Repos`),
+     not by _local_remote: no repository found, nothing watched; the same
+     spelling passed the [62] check of `git push <url>`. Fix: a port of
+     parse_connect_url — url_decode on the whole URL (`%XX` once, `%00`
+     and invalid escapes kept), the host dropped up to the first `/`
+     after a `[…]`; parity layouts for space, lowercase hex, `%2F`,
+     `%3A%2F%2F`, `%zz`, `%2520`, `file://host/p`, `file://u@[::1/x]/p`.
+[70] `git archive --remote=<local path>` runs upload-archive in
+     that repository, which runs its `tar.<fmt>.command` (remote-enabled
+     for tgz/tar.gz by default); only `push` destinations were checked
+     [62]. Fix: the [62] check also takes archive's `--remote`, read as
+     cmd_archive reads it (KEEP_ALL: no abbreviation, anywhere before
+     `--`, last wins, `--no-remote`, `-o`/`--output`/`--exec` values).
+[71] OPEN — `!cd tools && ./lint.sh`, `!(cd tools; sh lint.sh)`: the token
+     resolves against the root (`<root>/lint.sh`), `tools` is dropped as a
+     directory, `tools/lint.sh` (what sh runs) is never watched.
+[72] OPEN — `--work-tree` without `--git-dir` (or GIT_WORK_TREE alone):
+     git discovers the gitdir from the cwd and uses the given tree, where
+     it resolves a relative core.hooksPath; gitguard checked the
+     discovered tree. ([18] fixed the discovery half.)
+[73] remote.pushDefault / branch.<x>.pushRemote / branch.<x>.remote
+     naming a path: git pushes to it as a URL; only remote.*.url/pushurl
+     were followed, and a bare `git push` has no destination for the [62]
+     check. Needs an unusual trusted config. Fix: the three keys are
+     followed as local remotes, like remote.*.url.
+[74] OPEN — an unset variable glued inside a word (`!sh
+     ./tools$NOPE/lint.sh`, `${NOPE}`) expands to nothing in sh; the sh
+     readings [58] give `.` or keep the text, never the empty expansion.
+     Low realism.
+[75] False positive: add() refused any config path that is itself a
+     symlink, outside the tree too: `gpg.program = /opt/homebrew/bin/gpg`
+     (Homebrew), `core.editor = /usr/bin/vim` (Debian alternatives), a
+     stow-managed `~/.gitconfig.local` refused every repository, `trust`
+     included. Fix: refused only in the tree; outside, a replaceable link
+     is watched as a link (target string and the content it reaches:
+     repointing it, or a link behind it, is seen); a link to a directory
+     stays refused.
+[76] False positive: a linked worktree of a submodule (`git -C sub
+     worktree add`) could never be trusted: open_repo applied the common
+     config's core.worktree, which git ignores in a linked worktree, and
+     took `.git/modules/<sub>` for the tree (volatile-zone refusal or
+     internal ValueError). Fix: core.worktree only without a commondir
+     (git's `if (!has_common)`) — or with extensions.worktreeConfig, which
+     reads config.worktree and clears has_common; git is the oracle for
+     the three cases (`test_core_worktree_in_a_linked_worktree_as_git`).
+     Found by an adversarial review (two agents), replayed against git 2.50
+     and 2.47.3; each open one has an xfail(strict) test.
 """
 from __future__ import annotations
 

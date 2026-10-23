@@ -763,19 +763,25 @@ def open_repo(root: Path) -> Repo:
         # core.worktree: git takes that directory as the work tree (relative
         # to the gitdir) and resolves a relative core.hooksPath there; the
         # directory containing `.git` was kept, and the hooks never watched.
-        # Read where git reads it: the common config, then config.worktree
-        # if extensions.worktreeConfig is set. [47]
+        # Read where git reads it (check_repository_format_gently): the
+        # common config [47]; then, with extensions.worktreeConfig, this
+        # gitdir's config.worktree, whose value wins. Applied only without a
+        # commondir (file or GIT_COMMON_DIR) — git's `if (!has_common)` —
+        # or with the extension, which clears has_common: a submodule's
+        # linked worktree took `.git/modules/<x>` for its tree. [76]
         wt, ext = None, False
+        has_common = env is not None or cd.is_file()
         for section, key, value in parse_git_config(common / "config"):
             if section == "core" and key == "worktree":
                 wt = value
             elif section == "extensions" and key == "worktreeconfig":
                 ext = value.lower() in ("true", "yes", "on", "1")
         if ext:
+            has_common = False
             for section, key, value in parse_git_config(g / "config.worktree"):
                 if section == "core" and key == "worktree":
                     wt = value
-        if wt:
+        if wt and not has_common:
             root = _expand2(wt, g)[1]
     return Repo(root, g.resolve(), common, anchor)
 
@@ -1610,15 +1616,33 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None) -> list[tuple[
         # The config naming gitguard's own state: the reference would watch
         # itself (every `trust` rewrites it). Structurally abnormal. [65]
         state = STATE.resolve()
-        if p == state or state in p.parents:
+        if any(q == state or state in q.parents for q in (p, literal)):
             raise Refuse(f"path referenced by the config lies in gitguard's state "
                          f"directory ({state}): {literal}")
-        # A referenced path reached through a symlink is refused: resolving the
-        # link would pull its target (e.g. $HOME) into the fingerprint, and
-        # `restore` would delete "what was added" over there.
-        if literal.is_symlink() or any(q.is_symlink() for q in literal.parents
-                                       if repo.root in q.parents or q == repo.root):
+        # A referenced path reached through a symlink in the tree is refused:
+        # resolving the link would pull its target (e.g. $HOME) into the
+        # fingerprint, and `restore` would delete "what was added" over there.
+        # The link's own location decides, not its spelling (`/tmp/x/h` for
+        # `/private/tmp/x/h` on macOS, an aliased directory).
+        in_tree = lambda q: repo.root in q.parents or q == repo.root
+        link = literal.is_symlink()
+        if (link and in_tree(literal.parent.resolve() / literal.name)) or any(
+                q.is_symlink() for q in literal.parents if in_tree(q)):
             raise Refuse(f"path referenced by the config reached through a symlink: {literal}")
+        # Outside the tree a symlink is ordinary (Homebrew's
+        # `/opt/homebrew/bin/gpg`, Debian's `/usr/bin/vim` alternative, a
+        # stow-managed `~/.gitconfig.local`): refused, it blocked every
+        # repository, `trust` included. The link itself is watched when it
+        # can be replaced: its hash holds its target string and the content
+        # git runs, so repointing it is seen (the canonical path below alone
+        # would keep hashing the old target). `restore` never acts outside
+        # the repository. A link to a directory stays refused (_hash_file):
+        # its content would escape the fingerprint. [75]
+        if link and literal != p and _replaceable(literal):
+            if p.is_dir():
+                raise Refuse(f"path referenced by the config is a symlink to a "
+                             f"directory: {literal}")
+            out[literal] = "ext"
         for base in (repo.gitdir, repo.common):
             if p == base or base in p.parents:
                 # Covered by walk_gitdir… except in a volatile zone (logs/,
@@ -1636,10 +1660,13 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None) -> list[tuple[
             out[p] = "ext"
 
     # .lfsconfig: git-lfs reads lfs.customtransfer.*.path from it (a program it runs). [34]
+    # The gitfile sits next to the tree git was entered from, which
+    # core.worktree may have moved elsewhere (a linked worktree with
+    # extensions.worktreeConfig): then it is outside the root, scope ext. [76]
     for special in [repo.label / ".git", repo.root / ".gitmodules",
                     repo.root / ".lfsconfig"]:
         if special.is_file():
-            out[special] = "wt"
+            out[special] = "wt" if repo.root in special.parents else "ext"
     for n in repo.gitfiles:
         if n.is_file():
             out[n] = "wt"
@@ -1697,13 +1724,20 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None) -> list[tuple[
             if p.is_file():
                 nxt.append((p, base, remotes))
             add(literal, p)
-        elif remotes and section.startswith("remote.") and key in ("url", "pushurl"):
+        elif remotes and ((section.startswith("remote.") and key in ("url", "pushurl"))
+                          or (section == "remote" and key == "pushdefault")
+                          or (section.startswith("branch.") and key in ("remote", "pushremote"))):
             # A local remote: `push` runs its hooks and honours its
             # config (hooksPath…). Only those, never the whole
             # directory ([25]): its config and its hooks/ [45], from the
             # common dir git opens, the gitfile and `commondir` that lead
             # there, and config.worktree (read with extensions.worktreeConfig;
             # watched and parsed in any case, a superset). [61]
+            # remote.pushDefault, branch.<b>.pushRemote and branch.<b>.remote
+            # name a remote, but a name no `remote.<name>` section defines is
+            # taken as a URL: `git push` with no argument went there,
+            # unwatched. A defined name is also tried as a path (a superset:
+            # `<root>/origin` is rarely a repository). [73]
             r = _local_remote(value, base)
             if r is not None:
                 gd, common, rbase, files = r
@@ -1765,13 +1799,32 @@ def _local_remote(url: str, base: Path) -> tuple[Path, Path, Path, list[Path]] |
     `<p>/.git` or a bare `<p>` and watched their config and hooks/: a
     planted `commondir`, a gitfile remote (`init --separate-git-dir`) moved
     the config and hooks git runs elsewhere. [61] A regular file that is no
-    gitfile (a bundle) is not a repository: git dies on a push there."""
-    v = url[len("file://"):] if url.startswith("file://") else url
-    if "://" in v or (":" in v.split("/", 1)[0] and not v.startswith(("/", ".", "~"))):
-        return None
+    gitfile (a bundle) is not a repository: git dies on a push there.
+    A URL is read as parse_connect_url (connect.c) reads it: percent-decoded
+    whole (url_decode: `My%20Repos`, `%2F`, once, `%00` kept), split at the
+    first `://`, the scheme must be `file`, the host part dropped up to the
+    first `/` after a `[…]` (`file://host/p`, `file://[a/b]/p` reach `/p`).
+    The encoded text named no directory: the remote went unwatched and
+    `push` unchecked. [69] The base of the remote's relative values is its
+    gitdir: enter_repo chdirs there and receive-pack runs the hooks from
+    there (a non-bare remote with `core.hooksPath = .husky/_` runs
+    `<remote>/.git/.husky/_/pre-receive`, not `<remote>/.husky/_`). [67]"""
+    v = _url_decode(url) if _IS_URL.match(url) else url
+    scheme, sep, host = v.partition("://")
+    if sep:
+        if scheme != "file":
+            return None                   # git, ssh, http…: not a local repository
+        start = host.find("@[") + 1 if "@[" in host else 0
+        end = host.find("]", start + 1) + 1 if host[start:start + 1] == "[" else 0
+        slash = host.find("/", end if end > 0 else 0)
+        if slash == -1:
+            return None                   # "no path specified": git dies
+        v = host[slash:]
+    elif ":" in v.split("/", 1)[0] and not v.startswith(("/", ".", "~")):
+        return None                       # url_is_local_not_ssh: a colon before any slash is ssh
     p = _expand2(v, base)[1]
     dotgit = p.with_name(p.name + ".git")
-    for cand, rbase in ((p / ".git", p), (p, p), (dotgit / ".git", dotgit), (dotgit, dotgit)):
+    for cand in (p / ".git", p, dotgit / ".git", dotgit):
         if cand.is_file() or (cand.is_dir() and is_bare_gitdir(cand, env=False)):
             break
     else:
@@ -1794,7 +1847,19 @@ def _local_remote(url: str, base: Path) -> tuple[Path, Path, Path, list[Path]] |
     if cd.is_file():
         files.append(cd)
         common = _resolve_existing(gd / _read_path_file(cd), cd)
-    return gd, common, rbase, files
+    return gd, common, gd, files
+
+
+_PCT = re.compile(rb"%([0-9A-Fa-f]{2})")
+_IS_URL = re.compile(r"[A-Za-z0-9][A-Za-z0-9+.-]*://")     # url.c is_url
+
+
+def _url_decode(s: str) -> str:
+    """git's url_decode_internal (url.c): `%XX` with two hex digits becomes
+    that byte, except `%00`; anything else (`%`, `%zz`, `+`) stays as is."""
+    out = _PCT.sub(lambda m: m.group(0) if m.group(1) == b"00" else bytes([int(m.group(1), 16)]),
+                   os.fsencode(s))
+    return os.fsdecode(out)
 
 
 def submodule_trees(repo: Repo) -> list[tuple[Path, Path]]:
@@ -3057,6 +3122,32 @@ def _push_destination(args: list[str]) -> str | None:
     return repo_opt
 
 
+def _archive_remote(args: list[str]) -> str | None:
+    """`git archive`'s `--remote`: cmd_archive parses it with
+    PARSE_OPT_KEEP_ALL (git 2.47 and 2.50, checked by hand): anywhere before
+    `--`, `--remote=<r>` or `--remote <r>`, never abbreviated, the last one
+    wins, `--no-remote` clears it; `-o`, `--output`, `--exec` take the next
+    argument as their value. Only `-o` itself: `-ofile` holds its value, and
+    a cluster starting with any other letter (`-vo`, `-9o`) is an unknown
+    option kept whole for the remote, the next argument still parsed."""
+    remote, i = None, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            break
+        if a in ("--remote", "--output", "--exec", "-o"):
+            if a == "--remote" and i + 1 < len(args):
+                remote = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--remote="):
+            remote = a[len("--remote="):]
+        elif a == "--no-remote":
+            remote = None
+        i += 1
+    return remote
+
+
 def _legacy_remote_urls(repo: Repo, name: str) -> list[str]:
     """URLs of a remote defined the old way, `.git/remotes/<name>` (`URL:`
     lines) or `.git/branches/<name>` (`<url>#<branch>`): git still reads them."""
@@ -3071,7 +3162,7 @@ def _legacy_remote_urls(repo: Repo, name: str) -> list[str]:
     return out
 
 
-def check_push_destination(repo: Repo, rest: list[str], remote_names: set[str],
+def check_remote_destination(repo: Repo, rest: list[str], remote_names: set[str],
                            refs: list[tuple[str, Path]]) -> None:
     """`git push <path>` to a local repository that no trusted config names:
     receive-pack runs that repository's hooks and honours its config, and
@@ -3081,10 +3172,13 @@ def check_push_destination(repo: Repo, rest: list[str], remote_names: set[str],
     Not seen: a push through an alias, `url.<base>.insteadOf` rewriting a
     URL into a local path, `send-pack`. Allowed: the repository itself
     (`git push . main:x`) and a repository a configured remote already
-    designates (its config is in `refs`, watched). [62]"""
-    if not rest or rest[0] != "push":
+    designates (its config is in `refs`, watched). [62]
+    `git archive --remote=<path>` likewise: upload-archive runs in that
+    repository and executes its `tar.<format>.command`. [70]"""
+    if not rest or rest[0] not in ("push", "archive"):
         return
-    dest = _push_destination(rest[1:])
+    cmd = rest[0]
+    dest = (_push_destination if cmd == "push" else _archive_remote)(rest[1:])
     if dest is None or dest in remote_names:
         return
     urls = _legacy_remote_urls(repo, dest) or [dest]
@@ -3092,10 +3186,11 @@ def check_push_destination(repo: Repo, rest: list[str], remote_names: set[str],
         r = _local_remote(url, repo.root)
         watched = {p for _, p in refs}
         if r is not None and r[1] != repo.common and (r[1] / "config") not in watched:
-            raise Refuse(f"`git push {dest}`: a local repository no trusted config names "
-                         f"({r[0]}); git would run its hooks, which gitguard does not watch. "
-                         f"Make it a remote (`git remote add <name> {url}`), run `gitguard "
-                         f"trust`, then `git push <name>`. [62]")
+            again = "push <name>" if cmd == "push" else "archive --remote=<name>"
+            raise Refuse(f"`git {cmd}` to {dest}: a local repository no trusted config names "
+                         f"({r[0]}); git would run its hooks and config, which gitguard does "
+                         f"not watch. Make it a remote (`git remote add <name> {url}`), run "
+                         f"`gitguard trust`, then `git {again}`. [{62 if cmd == 'push' else 70}]")
 
 
 def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None, git: str) -> int:
@@ -3394,7 +3489,7 @@ def main(argv: list[str]) -> int:
         refs = config_refs(repo, remote_names)
         check_structure(repo, refs)
         if mode == "exec":
-            check_push_destination(repo, split_global_options(argv, orig).rest, remote_names, refs)
+            check_remote_destination(repo, split_global_options(argv, orig).rest, remote_names, refs)
         new = manifest(repo, refs)
         old = load_manifest(key)
         fingerprinted = True

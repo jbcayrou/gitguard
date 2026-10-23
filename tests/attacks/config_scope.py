@@ -409,3 +409,152 @@ def attack_template_dir_hook_rewritten(gg: GG, repo: Path, tmp_path: Path) -> No
     gg.git("config", "init.templateDir", str(tpl), cwd=repo)
     gg.trust(repo)
     write_exec(tpl / "hooks/post-checkout", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+# ---------------------------------------- adversarial review of 2026-10-22
+def attack_local_remote_relative_hookspath(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[67] non-bare local remote with a relative core.hooksPath
+    (husky `.husky/_`): receive-pack runs hooks in the remote's $GIT_DIR,
+    git runs `<remote>/.git/.husky/_/pre-receive`; gitguard watched
+    `<remote>/.husky/_`"""
+    hub = tmp_path / "vol-hub"
+    gg.git("init", "-q", str(hub))
+    (hub / ".husky/_").mkdir(parents=True)
+    gg.git("config", "core.hooksPath", ".husky/_", cwd=hub)
+    gg.git("remote", "add", "hub", str(hub), cwd=repo)
+    gg.trust(repo)
+    write_exec(hub / ".git/.husky/_/pre-receive", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_global_relative_hookspath_in_bare_remote(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[68] OPEN — a global relative core.hooksPath (`.githooks`) applies to a
+    local bare remote too: receive-pack runs `hub.git/.githooks/pre-receive`;
+    gitguard resolved the global value against the repository's root only"""
+    hub = tmp_path / "vol-hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    gg.git("config", "--global", "core.hooksPath", ".githooks")
+    gg.git("remote", "add", "hub", str(hub), cwd=repo)
+    gg.trust(repo)
+    write_exec(hub / ".githooks/pre-receive", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_global_relative_hookspath_in_submodule(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[68] OPEN — the same global `.githooks` inside a submodule: `git
+    submodule update` checks the submodule out and runs
+    `sub/.githooks/post-checkout`"""
+    from tests.attacks._helpers import add_submodule
+    gg.git("config", "--global", "core.hooksPath", ".githooks")
+    sub = add_submodule(gg, repo, tmp_path)
+    gg.trust(repo)
+    write_exec(sub / ".githooks/post-checkout", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_local_remote_percent_encoded_file_url(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[69] `file://…/My%20Repos/hub.git`: git URL-decodes it and runs
+    the remote's hooks on push; _local_remote took the encoded text as a path
+    and found no repository"""
+    hub = tmp_path / "My Repos/hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    gg.git("remote", "add", "hub", "file://" + str(hub).replace(" ", "%20"), cwd=repo)
+    gg.trust(repo)
+    write_exec(hub / "hooks/pre-receive", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_alias_script_after_cd(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[71] OPEN — `!cd tools && ./lint.sh`: the token resolves to
+    `<root>/lint.sh`, `tools/lint.sh` (what sh runs) is never watched"""
+    write_exec(repo / "tools/lint.sh", "#!/bin/sh\nexit 0\n")
+    gg.git("config", "alias.lint", "!cd tools && ./lint.sh", cwd=repo)
+    gg.trust(repo)
+    write_exec(repo / "tools/lint.sh", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_alias_script_in_subshell_after_cd(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[71] OPEN — `!(cd tools; sh lint.sh)`"""
+    write_exec(repo / "tools/lint.sh", "#!/bin/sh\nexit 0\n")
+    gg.git("config", "alias.lint", "!(cd tools; sh lint.sh)", cwd=repo)
+    gg.trust(repo)
+    write_exec(repo / "tools/lint.sh", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_push_default_names_a_path(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[73] remote.pushDefault = a path: git takes an unconfigured
+    remote name as a URL and pushes there; only remote.*.url/pushurl were
+    followed"""
+    hub = tmp_path / "vol-hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    gg.git("config", "remote.pushDefault", str(hub), cwd=repo)
+    gg.trust(repo)
+    write_exec(hub / "hooks/pre-receive", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_push_remote_names_a_path(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[73] branch.main.pushRemote = a path"""
+    hub = tmp_path / "vol-hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    gg.git("config", "branch.main.pushRemote", str(hub), cwd=repo)
+    gg.trust(repo)
+    write_exec(hub / "hooks/pre-receive", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_branch_remote_names_a_path(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[73] branch.main.remote = a path (with an upstream, `git push` goes
+    there)"""
+    hub = tmp_path / "vol-hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    gg.git("config", "branch.main.remote", str(hub), cwd=repo)
+    gg.git("config", "branch.main.merge", "refs/heads/main", cwd=repo)
+    gg.trust(repo)
+    write_exec(hub / "hooks/pre-receive", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def _program_link(gg: GG, tmp_path: Path, chain: bool = False) -> tuple[Path, Path]:
+    """gpg.program named through a symlink outside the tree, as Homebrew
+    does; with `chain`, through two links. Returns (link to repoint, target)."""
+    real = tmp_path / "vol-bin/Cellar/gpg"
+    write_exec(real, "#!/bin/sh\nexit 0\n")
+    hop = tmp_path / "vol-bin/hop"
+    hop.symlink_to(real)
+    link = tmp_path / "vol-bin/gpg"
+    link.symlink_to(hop if chain else real)
+    gg.git("config", "--global", "gpg.program", str(link))
+    return (hop if chain else link), real
+
+
+def attack_global_program_symlink_repointed(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[75] control: the program link outside the tree is watched as a link:
+    repointed to a planted script, seen (the canonical path alone kept
+    hashing the old target)"""
+    link, _ = _program_link(gg, tmp_path)
+    gg.trust(repo)
+    write_exec(tmp_path / "vol-bin/evil", "#!/bin/sh\ntouch /tmp/evil\n")
+    link.unlink()
+    link.symlink_to(tmp_path / "vol-bin/evil")
+
+
+def attack_global_program_symlink_intermediate_repointed(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[75] control: an unwatched link between the named link and the
+    program, repointed: the named link's hash holds the content it reaches"""
+    hop, _ = _program_link(gg, tmp_path, chain=True)
+    gg.trust(repo)
+    write_exec(tmp_path / "vol-bin/evil", "#!/bin/sh\ntouch /tmp/evil\n")
+    hop.unlink()
+    hop.symlink_to(tmp_path / "vol-bin/evil")
+
+
+def attack_global_program_symlink_target_rewritten(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[75] control: the program behind the link rewritten"""
+    _, real = _program_link(gg, tmp_path)
+    gg.trust(repo)
+    write_exec(real, "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_alias_script_glued_to_empty_variable(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[74] OPEN — `!sh ./tools$NOPE/lint.sh`: an unset variable inside a
+    word expands to nothing in sh; the sh readings give `.` or keep the
+    text, never the empty expansion"""
+    (repo / "tools").mkdir()
+    (repo / "tools/lint.sh").write_text("exit 0\n")
+    gg.git("config", "alias.lint", "!sh ./tools$NOPE/lint.sh", cwd=repo)
+    gg.trust(repo)
+    (repo / "tools/lint.sh").write_text("touch /tmp/evil\n")

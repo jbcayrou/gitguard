@@ -743,6 +743,77 @@ def test_checkout_rewrites_tracked_hook_then_runs_it(gg: GG, repo: Path, tmp_pat
     assert not mark.exists(), "post-checkout from the container's commit was executed"
 
 
+@pytest.mark.xfail(strict=True, reason="[66] open: the gitlink arrives with the checkout, after the check")
+@pytest.mark.parametrize("cmd", [["checkout", "main"], ["switch", "main"]])
+def test_checkout_brings_a_gitlink_to_a_planted_repository(gg: GG, tmp_path: Path, cmd: list) -> None:
+    """[66] OPEN — no special config needed. The sandbox plants an untracked
+    nested repository `vendor/x` (core.fsmonitor), builds a commit whose tree
+    has a gitlink at `vendor/x` and moves `main` to it (objects and refs are
+    volatile). The user, on another branch, runs `git checkout main`: the
+    index gitguard reads has no gitlink, the check passes; git writes the
+    gitlink, then shows the local changes, enters `vendor/x` and runs its
+    fsmonitor in the same command. `checkout -f`, `reset --hard` and `merge`
+    write the gitlink without entering it, and so does `checkout -q` (no
+    summary of local changes)."""
+    mark = tmp_path / "RAN"
+    r = tmp_path / "r"
+    gg.git("init", "-q", str(r))
+    (r / "a").write_text("a\n")
+    gg.git("add", "a", cwd=r)
+    gg.git("commit", "-qm", "i", cwd=r)
+    gg.git("checkout", "-qb", "feature", cwd=r)
+    gg.trust(r)
+    # the sandbox
+    x = r / "vendor/x"
+    gg.git("init", "-q", str(x))
+    (x / "s").write_text("s\n")
+    gg.git("add", "s", cwd=x)
+    gg.git("commit", "-qm", "s", cwd=x)
+    write_exec(x / ".git/fsm.sh", f"#!/bin/sh\ntouch '{mark}'\n")
+    gg.git("config", "core.fsmonitor", str(x / ".git/fsm.sh"), cwd=x)
+    sub = gg.git("rev-parse", "HEAD", cwd=x).out.strip()
+    import subprocess
+    mk = lambda text: subprocess.run(["git", "mktree", "--missing"], cwd=r, env=gg.env, input=text,
+                                     capture_output=True, text=True, check=True).stdout.strip()
+    vt = mk(f"160000 commit {sub}\tx\n")
+    tree = mk(gg.git("ls-tree", "HEAD", cwd=r).out + f"040000 tree {vt}\tvendor\n")
+    c = gg.git("commit-tree", "-p", "HEAD", "-m", "evil", tree, cwd=r).out.strip()
+    gg.git("update-ref", "refs/heads/main", c, cwd=r)
+    assert not mark.exists() and not gg.check(r).blocked
+    # the user
+    gg.run("git", *cmd, cwd=r)
+    assert not mark.exists(), "the planted repository's fsmonitor ran during the checkout"
+
+
+def test_checkout_gitlink_control_real_git_runs_it(gg: GG, tmp_path: Path) -> None:
+    """[66] positive control of the test above, with the real git and the
+    same planting: git does run the planted fsmonitor on `checkout main`."""
+    mark = tmp_path / "RAN"
+    r = tmp_path / "r"
+    gg.git("init", "-q", str(r))
+    (r / "a").write_text("a\n")
+    gg.git("add", "a", cwd=r)
+    gg.git("commit", "-qm", "i", cwd=r)
+    gg.git("checkout", "-qb", "feature", cwd=r)
+    x = r / "vendor/x"
+    gg.git("init", "-q", str(x))
+    (x / "s").write_text("s\n")
+    gg.git("add", "s", cwd=x)
+    gg.git("commit", "-qm", "s", cwd=x)
+    write_exec(x / ".git/fsm.sh", f"#!/bin/sh\ntouch '{mark}'\n")
+    gg.git("config", "core.fsmonitor", str(x / ".git/fsm.sh"), cwd=x)
+    sub = gg.git("rev-parse", "HEAD", cwd=x).out.strip()
+    import subprocess
+    mk = lambda text: subprocess.run(["git", "mktree", "--missing"], cwd=r, env=gg.env, input=text,
+                                     capture_output=True, text=True, check=True).stdout.strip()
+    vt = mk(f"160000 commit {sub}\tx\n")
+    tree = mk(gg.git("ls-tree", "HEAD", cwd=r).out + f"040000 tree {vt}\tvendor\n")
+    c = gg.git("commit-tree", "-p", "HEAD", "-m", "evil", tree, cwd=r).out.strip()
+    gg.git("update-ref", "refs/heads/main", c, cwd=r)
+    gg.git("checkout", "main", cwd=r)
+    assert mark.exists(), "git no longer enters the nested repository: [66] may be moot"
+
+
 def test_trust_warns_hooks_in_tree(gg: GG, repo: Path) -> None:
     """[44] open flaw made visible: hooks under core.hooksPath in the tree."""
     write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
@@ -890,7 +961,7 @@ def test_trust_of_an_unchanged_repo_asks_nothing(gg: GG, repo: Path) -> None:
 
 # ------------------------------- exec-mode carriers [58] [62]
 def test_dash_c_fsmonitor_default_expansion_is_refused(gg: GG, repo: Path, tmp_path: Path) -> None:
-    """[58] OPEN — `git -c 'core.fsmonitor=${X:-./p.sh}' status` with p.sh planted
+    """[58] `git -c 'core.fsmonitor=${X:-./p.sh}' status` with p.sh planted
     in the tree: the `-c` value goes through the same tokenizer as the
     files; `-c core.fsmonitor=./p.sh` is refused (control)."""
     mark = tmp_path / "RAN"
@@ -902,7 +973,7 @@ def test_dash_c_fsmonitor_default_expansion_is_refused(gg: GG, repo: Path, tmp_p
 
 
 def test_push_to_a_path_in_the_volume_is_checked(gg: GG, repo: Path, tmp_path: Path) -> None:
-    """[62] OPEN — `git push ../other main`: receive-pack runs the destination's
+    """[62] `git push ../other main`: receive-pack runs the destination's
     hooks and honours its config. Watched for a configured local remote
     [45], not for a destination named on the command line."""
     mark = tmp_path / "RAN"
@@ -995,3 +1066,127 @@ def test_push_to_a_name_only_a_submodule_configures(gg: GG, repo: Path, tmp_path
     assert r.blocked and "[62]" in r.err and not mark.exists(), r.text
     gg.git("push", "-q", "foo", "main", cwd=repo)
     assert mark.exists(), "control: git takes `foo` as a path and runs its pre-receive"
+
+
+# ---------------------------------------- adversarial review of 2026-10-22
+def test_push_to_a_percent_encoded_file_url_is_checked(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[69] `git push file://…/My%20Repos/other.git` to an
+    unconfigured repository: git decodes the URL and runs its hooks, the
+    [62] check found no repository at the encoded path."""
+    mark = tmp_path / "RAN"
+    other = tmp_path / "My Repos/other.git"
+    gg.git("init", "-q", "--bare", str(other))
+    write_exec(other / "hooks/pre-receive", f"#!/bin/sh\ntouch '{mark}'\n")
+    gg.run("git", "push", "-q", "file://" + str(other).replace(" ", "%20"), "main", cwd=repo)
+    assert not mark.exists(), "the destination's pre-receive ran"
+
+
+def test_in_tree_symlink_spelled_through_an_alias_is_refused(gg: GG, repo: Path,
+                                                            tmp_path: Path) -> None:
+    """[75] the symlink rule follows the link's location, not its spelling:
+    `core.hooksPath = <alias>/.githooks`, <alias> a symlink to the tree and
+    `.githooks` a symlink in the tree to a directory elsewhere, is refused
+    like `core.hooksPath = .githooks` is; only a link outside the tree is
+    ordinary."""
+    elsewhere = tmp_path / "elsewhere"
+    write_exec(elsewhere / "pre-commit", "#!/bin/sh\nexit 0\n")
+    (repo / ".githooks").symlink_to(elsewhere)
+    alias = tmp_path / "alias"
+    alias.symlink_to(repo)
+    gg.git("config", "core.hooksPath", str(alias / ".githooks"), cwd=repo)
+    r = gg.run("trust", cwd=repo)
+    assert r.rc != 0 and "symlink" in r.err, r.text
+    gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
+    r = gg.run("trust", cwd=repo)
+    assert r.rc != 0 and "symlink" in r.err, r.text
+
+
+def _archive_sibling(gg: GG, tmp_path: Path) -> Path:
+    """A repository next to `repo` whose tar.tgz.command touches RAN."""
+    sib = tmp_path / "sib"
+    gg.git("init", "-q", str(sib))
+    (sib / "a").write_text("a\n")
+    gg.git("add", "a", cwd=sib)
+    gg.git("commit", "-qm", "a", cwd=sib)
+    gg.git("config", "tar.tgz.command", f"touch '{tmp_path / 'RAN'}'; gzip -cn", cwd=sib)
+    return sib
+
+
+def test_archive_remote_to_a_path_is_checked(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[70] `git archive --remote=../sib --format=tgz`: upload-archive
+    runs in the sibling repository and executes its `tar.tgz.command`
+    (remote-enabled by default for tgz/tar.gz). Only `push` was checked."""
+    mark = tmp_path / "RAN"
+    _archive_sibling(gg, tmp_path)
+    r = gg.run("git", "archive", "--remote=../sib", "--format=tgz", "-o", os.devnull, "HEAD", cwd=repo)
+    assert r.blocked and "[70]" in r.err and not mark.exists(), r.text
+    gg.git("archive", "--remote=../sib", "--format=tgz", "-o", os.devnull, "HEAD", cwd=repo)
+    assert mark.exists(), "control: git runs it"
+
+
+# How cmd_archive takes --remote (PARSE_OPT_KEEP_ALL), checked on git 2.47
+# and 2.50: each form below reaches ../sib with plain git.
+ARCHIVE_FORMS = {
+    "separate": ["--remote", "../sib", "--format=tgz", "HEAD"],
+    "after_positional": ["--format=tgz", "HEAD", "--remote=../sib"],
+    "last_wins": ["--remote=/nonexistent", "--remote=../sib", "--format=tgz", "HEAD"],
+    "after_attached_output": ["-o" + os.devnull, "--remote=../sib", "--format=tgz", "HEAD"],
+    "after_long_output": ["--output", os.devnull, "--remote=../sib", "--format=tgz", "HEAD"],
+    "after_unknown_cluster": ["-9o", os.devnull, "--remote=../sib", "--format=tgz", "HEAD"],
+    "file_url": ["--remote=file://{sib}", "--format=tgz", "HEAD"],
+}
+
+
+@pytest.mark.parametrize("form", sorted(ARCHIVE_FORMS))
+def test_archive_remote_forms_are_checked(gg: GG, repo: Path, tmp_path: Path, form: str) -> None:
+    """[70] every spelling of --remote git honours is seen"""
+    mark = tmp_path / "RAN"
+    sib = _archive_sibling(gg, tmp_path)
+    args = [a.replace("{sib}", str(sib)) for a in ARCHIVE_FORMS[form]]
+    r = gg.run("git", "archive", *args, cwd=repo)
+    assert r.blocked and "[70]" in r.err and not mark.exists(), r.text
+    c = gg.git("archive", *args, cwd=repo)
+    # `-9o` reaches ../sib, whose upload-archive then dies on the kept `-9o`.
+    reached = mark.exists() or (form == "after_unknown_cluster" and "remote:" in c.err)
+    assert reached, f"control: git did not reach ../sib\n{c.text}"
+
+
+def test_archive_remote_from_a_subdirectory_is_relative_to_the_root(gg: GG, repo: Path,
+                                                                     tmp_path: Path) -> None:
+    """[70] git resolves --remote from the top of the tree, like push"""
+    _archive_sibling(gg, tmp_path)
+    (repo / "src").mkdir()
+    r = gg.run("git", "archive", "--remote=../sib", "--format=tgz", "-o", os.devnull, "HEAD",
+               cwd=repo / "src")
+    assert r.blocked and "[70]" in r.err, r.text
+
+
+def test_archive_remote_allowed_cases(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[70] a configured remote (its config watched), `--no-remote`, and
+    `--remote` as the value of `--exec` or after `--` are not refused"""
+    mark = tmp_path / "RAN"
+    _archive_sibling(gg, tmp_path)
+    for args in (["--remote=../sib", "--no-remote"], ["--exec", "--remote=../sib"],
+                 ["--", "--remote=../sib"]):
+        r = gg.run("git", "archive", "--format=tgz", "-o", os.devnull, *args, cwd=repo)
+        assert "[70]" not in r.err, (args, r.text)
+    gg.git("remote", "add", "sib", "../sib", cwd=repo)
+    gg.trust(repo)
+    r = gg.run("git", "archive", "--remote=sib", "--format=tgz", "-o", os.devnull, "HEAD", cwd=repo)
+    assert not r.blocked and mark.exists(), r.text
+
+
+@pytest.mark.xfail(strict=True, reason="[72] open: --work-tree alone keeps the discovered tree")
+def test_work_tree_alone_checks_the_given_tree(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[72] OPEN — `git --work-tree=../w commit` (no --git-dir): git
+    discovers the gitdir from the cwd and takes ../w as the work tree, where
+    it resolves a relative core.hooksPath; gitguard checked the discovered
+    tree. ([18] fixed the opposite: discovery from the cwd, not from ../w.)"""
+    mark = tmp_path / "RAN"
+    (repo / ".githooks").mkdir()
+    gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
+    (tmp_path / "w/.githooks").mkdir(parents=True)
+    gg.trust(repo)
+    write_exec(tmp_path / "w/.githooks/pre-commit", f"#!/bin/sh\ntouch '{mark}'\n")
+    gg.run("git", "--work-tree=../w", "commit", "-q", "--allow-empty", "-m", "x", cwd=repo)
+    assert not mark.exists(), "the hook of the given work tree ran"

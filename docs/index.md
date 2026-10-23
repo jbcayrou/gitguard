@@ -87,7 +87,7 @@ core.hooksPath = .githooks
 : The directory the config names, with husky, lefthook or pre-commit inside it. A sandbox that can only write the tree rewrites those hooks without touching `.git`.
 
 remote.origin.url = ../other.git
-: A local remote: the config and hooks of the repository `push` enters, opened as git opens it (gitfile, `commondir`). `git push <path>` to a repository no remote names is refused: make it a remote, trust, push.
+: A local remote: the config and hooks of the repository `push` enters, opened as git opens it (gitfile, `commondir`). `git push <path>` and `git archive --remote=<path>` to a repository no remote names are refused: make it a remote, trust, retry.
 
 include.path  includeIf
 : Followed recursively to git's own depth of ten, each file hashed.

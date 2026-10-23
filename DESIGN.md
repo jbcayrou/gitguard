@@ -181,7 +181,12 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    and `refs` are looked up there, so a lone `HEAD` makes any directory a
    gitdir — refused as bare ([54]). Without them, a `core.worktree` in the config (common `config`, then
    `config.worktree` if `extensions.worktreeConfig`) redirects the tree as
-   git does ([47]); the state key, `.root` and the messages stay on the
+   git does ([47]) — not in a linked worktree (a `commondir` file or
+   `GIT_COMMON_DIR`): git applies it only `if (!has_common)`, and a
+   submodule's linked worktree took `.git/modules/<x>` for its tree ([76]).
+   With `extensions.worktreeConfig` git reads this gitdir's `config.worktree`
+   (its value wins) and clears has_common, so the value applies even there;
+   the state key, `.root` and the messages stay on the
    directory holding `.git` (`Repo.anchor`, `Repo.label`): a `core.worktree`
    written by the sandbox is an ordinary config change shown in the diff,
    not a "never trusted" repository.
@@ -263,7 +268,12 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    - no control character in a watched name; no symlink in the first two
      levels of the gitdir; `config` and `hooks/` (of the gitdir and of the
      commondir) belong to the user and are not world-writable; no path named
-     by the config reached through a symlink.
+     by the config reached through a symlink in the tree. Outside the tree
+     a symlink is ordinary (Homebrew, Debian alternatives, stow): refused,
+     it blocked every repository ([75]); a replaceable one is watched as a
+     link, whose hash holds its target string and the content it reaches,
+     so repointing it or a link behind it is seen. A link to a directory
+     stays refused, its content would escape the fingerprint.
    - an unreadable directory makes gitguard **refuse** (`os.walk(onerror=…)`)
      instead of being seen as empty. A directory that **vanished** during the
      walk (`FileNotFoundError`) is ignored: it holds nothing any more.
@@ -373,7 +383,13 @@ not followed ([45]); +1.4 ms per command with one local remote. The remote
 is **opened as receive-pack opens it**, a port of `enter_repo`: `<p>/.git`,
 `<p>`, `<p>.git/.git`, `<p>.git`, the gitfile followed, then `commondir`,
 without the environment (git clears it for the transport); the config and
-hooks/ are the common dir's, and the gitfile, `commondir` and
+hooks/ are the common dir's, its relative values (`core.hooksPath =
+.husky/_`) resolve against its gitdir, where enter_repo chdirs ([67]), a
+`file://` URL is read as parse_connect_url reads it — percent-decoded
+whole, the host part dropped (`file://host/p`, `file://[a/b]/p`) ([69]) — and
+`remote.pushDefault`, `branch.<b>.pushRemote` and `branch.<b>.remote` are
+followed like `remote.*.url` (a name no section defines is a URL for git,
+[73]). The gitfile, `commondir` and
 `config.worktree` are watched too ([61]: a planted `commondir`, a gitfile
 remote, a worktree as remote moved what git runs elsewhere;
 `test_local_remote_hooks_git_runs_are_watched` asks git which hook it
@@ -382,7 +398,11 @@ trusted config names is refused, the way out named (`git remote add`,
 `trust`): its hooks are watched for nobody ([62]). The destination is read
 like git's parse-options reads `push` (`--repo`, abbreviated long options,
 `-o` and its value; a relative path from the root); the repository itself
-(`push . main:x`) and the path of a configured remote pass.
+(`push . main:x`) and the path of a configured remote pass. `git archive
+--remote=<path>` gets the same check ([70]: upload-archive runs the
+remote's `tar.<format>.command`), its option read as cmd_archive reads it
+(no abbreviation, last one wins, `--no-remote`, `-o`/`--output`/`--exec`
+values, nothing after `--`).
 Fingerprinting it alerted on every neighbouring file and, worse, `restore`
 deleted there ([25]). Under the root → scope `wt`; outside the tree but
 writable by the user (e.g. `../shared-hooks` in the same mounted volume) →
@@ -960,6 +980,25 @@ content; fail closed on anything the parser cannot make sense of.
   `.husky/_/h` runs `.husky/<hook>` from the tree anyway, and hooks that
   load neighbouring files would break. `OPEN` in `tests/test_attacks.py` is
   the place for a future open attack that fits the corpus.
+- **Open [66]**, the general form of [44]: the gitlink arrives with the
+  command. The sandbox plants an untracked repository (`vendor/x`, with a
+  core.fsmonitor) and a commit whose tree has a gitlink there, and moves a
+  branch to it; `git checkout`/`git switch` of that branch writes the
+  gitlink, then enters `vendor/x` to show the local changes and runs its
+  config. No config precondition, no trust-time warning. The index read
+  at check time has no gitlink: "the gitlink is the barrier" holds for a
+  gitlink already in the index, not for one the checked command brings.
+  Test: `test_checkout_brings_a_gitlink_to_a_planted_repository` (xfail).
+- **Open [68], [71], [72], [74]** (adversarial review of 2026-10-22,
+  catalogue in `tests/attacks/__init__.py`, each with an xfail test): a
+  global relative hooksPath applied in a local remote or a submodule
+  ([68]); a script reached after `cd` in an alias ([71]); `--work-tree`
+  alone ([72]); an empty variable glued in a word ([74]). [67], [69],
+  [70], [73], [75], [76] from the same review are fixed.
+- A global `core.hooksPath` (or any config path) that is a symlink to a
+  directory outside the tree (a stow-managed hooks directory) is refused
+  ([75]): the link would have to be watched apart from the directory it
+  reaches. Replace the link by the real path.
 - A value whose path sh builds from a command's output other than the
   cwd (`$(cd sub && pwd)/t.sh`, `$(cat f)`) is beyond the sh readings
   ([58]): only the forms that reduce to the top of the tree or to a
