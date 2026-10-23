@@ -997,10 +997,27 @@ content; fail closed on anything the parser cannot make sense of.
   at check time has no gitlink: "the gitlink is the barrier" holds for a
   gitlink already in the index, not for one the checked command brings.
   Test: `test_checkout_brings_a_gitlink_to_a_planted_repository` (xfail).
-- **Open [71], [74]** (adversarial review of 2026-10-22, catalogue in
-  `tests/attacks/__init__.py`, each with an xfail test): a script reached
-  after `cd` in an alias ([71]); an empty variable glued in a word ([74]).
-  [67]–[70], [72], [73], [75], [76] from the same review are fixed.
+- **Accepted limitation [71], [74]** (adversarial review of 2026-10-22,
+  xfail tests kept as the record): an alias of the user's own, already
+  trusted, that runs a script **of the work tree** reached through a `cd`
+  (`!cd tools && ./lint.sh`, `!(cd tools; sh lint.sh)`, [71]) or through
+  an unset variable glued inside a word (`!sh ./tools$NOPE/lint.sh`,
+  [74]). The config does not change — the sandbox rewrites the script,
+  which the sh readings ([58]) did not name, and the tree is not walked.
+  Not fixed, on purpose: the readings enumerate candidates, they do not
+  interpret sh, and a shell can build a path in endless ways (`$(cat f)`,
+  `eval`, a script calling another); each variant closed would invite the
+  next, and the alternative — refusing every construct gitguard cannot
+  resolve — is a blocklist. The exploit needs an alias that assumes one
+  repository's layout (rare in `~/.gitconfig`, which serves every
+  repository; a local one lives in `.git/config`, fingerprinted), known to
+  the sandbox beforehand (it reads `.git/config`, not `~/.gitconfig`), and
+  then run by the user. The toplevel idiom (`cd "$(git rev-parse
+  --show-toplevel)" && ./scripts/x`) is covered. Way out: name the script
+  from the root (`!./tools/lint.sh`) or keep it outside the tree. **Rule:
+  the sh readings are not extended for further variants of this shape
+  unless a review shows a realistic one.** [67]–[70], [72], [73], [75],
+  [76] from the same review are fixed.
 - `git --work-tree=<other> …` changes the set of hooks git runs, so the
   fingerprint differs from the repository's own tree ([72]): the tree is
   blessed with `GIT_WORK_TREE=<other> gitguard trust` (same state key),
@@ -1012,7 +1029,7 @@ content; fail closed on anything the parser cannot make sense of.
 - A value whose path sh builds from a command's output other than the
   cwd (`$(cd sub && pwd)/t.sh`, `$(cat f)`) is beyond the sh readings
   ([58]): only the forms that reduce to the top of the tree or to a
-  literal word are covered. A push destination reached through an alias,
+  literal word are covered (same family as [71], [74] above). A push destination reached through an alias,
   `url.<base>.insteadOf` rewriting a URL into a local path, or `git
   send-pack` is not checked ([62]).
 - A `-c`/`--config-env` given to a git that gitguard did not wrap (hook,

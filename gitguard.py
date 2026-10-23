@@ -1707,8 +1707,9 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None) -> list[tuple[
                                                    repo.common / "config",
                                                    repo.common / "config.worktree")]
     queue += [(f, repo.root, True, True) for f in global_config_files()]
-    queue += [(f, b, True, False) for f, b in _submodule_configs(repo)]
-    sub_bases = {b for _, b in _submodule_configs(repo)}
+    sub_configs = _submodule_configs(repo)
+    queue += [(f, b, True, False) for f, b in sub_configs]
+    sub_bases = {b for _, b in sub_configs}
     remote_bases: set[Path] = set()
     global_dirs: list[tuple[str, str, str]] = []
     env_dirs: list[tuple[str, str, str]] = []
@@ -2009,7 +2010,10 @@ def _value_tokens(value: str) -> set[str]:
     are the top of the tree (where a `!` alias runs) [37]; `${X:-./t.sh}`,
     `${X:+…}`, `$(pwd)/t.sh`, `` `pwd`/t.sh `` were left as text that names
     no file [58]; other variables come from the environment git inherits
-    from gitguard."""
+    from gitguard. Candidates, not an interpretation of sh: a path built
+    through `cd dir && ./x` or an unset variable glued in a word is an
+    accepted limitation ([71], [74], DESIGN.md "Known limitations"); do not
+    grow the readings for such variants."""
     toks: set[str] = set()
     for v in {value, *_sh_readings(value)}:
         toks |= set(v.split()) | set(_SH_SPLIT.split(v))
@@ -3204,7 +3208,7 @@ def _legacy_remote_urls(repo: Repo, name: str) -> list[str]:
 
 
 def check_remote_destination(repo: Repo, rest: list[str], remote_names: set[str],
-                           refs: list[tuple[str, Path]]) -> None:
+                             refs: list[tuple[str, Path]]) -> None:
     """`git push <path>` to a local repository that no trusted config names:
     receive-pack runs that repository's hooks and honours its config, and
     nothing of it is in the fingerprint (only configured remotes are, [45]

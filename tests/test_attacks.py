@@ -36,9 +36,9 @@ DEFERRED = {
 # Known open flaws: the attack is in the corpus, the refusal is not there yet.
 # xfail(strict): a fix makes the test XPASS, then remove the entry.
 OPEN = {
-    "attack_alias_script_after_cd": "[71] open",
-    "attack_alias_script_in_subshell_after_cd": "[71] open",
-    "attack_alias_script_glued_to_empty_variable": "[74] open",
+    "attack_alias_script_after_cd": "[71] accepted limitation (DESIGN.md, Known limitations)",
+    "attack_alias_script_in_subshell_after_cd": "[71] accepted limitation (DESIGN.md, Known limitations)",
+    "attack_alias_script_glued_to_empty_variable": "[74] accepted limitation (DESIGN.md, Known limitations)",
 }
 
 

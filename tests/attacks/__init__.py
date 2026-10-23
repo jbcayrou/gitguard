@@ -354,7 +354,10 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      `--`, last wins, `--no-remote`, `-o`/`--output`/`--exec` values).
 [71] OPEN — `!cd tools && ./lint.sh`, `!(cd tools; sh lint.sh)`: the token
      resolves against the root (`<root>/lint.sh`), `tools` is dropped as a
-     directory, `tools/lint.sh` (what sh runs) is never watched.
+     directory, `tools/lint.sh` (what sh runs) is never watched. Accepted
+     limitation (DESIGN.md, "Known limitations"): the sh readings
+     enumerate candidates, they do not interpret sh; needs a trusted alias
+     that assumes one repository's layout. Way out: `!./tools/lint.sh`.
 [72] `--work-tree` without `--git-dir` (or GIT_WORK_TREE alone):
      git discovers the gitdir from the cwd and uses the given tree, where
      it resolves a relative core.hooksPath; gitguard checked the
@@ -371,7 +374,7 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
 [74] OPEN — an unset variable glued inside a word (`!sh
      ./tools$NOPE/lint.sh`, `${NOPE}`) expands to nothing in sh; the sh
      readings [58] give `.` or keep the text, never the empty expansion.
-     Low realism.
+     Low realism; accepted limitation with [71].
 [75] False positive: add() refused any config path that is itself a
      symlink, outside the tree too: `gpg.program = /opt/homebrew/bin/gpg`
      (Homebrew), `core.editor = /usr/bin/vim` (Debian alternatives), a
