@@ -328,11 +328,17 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      against its gitdir, where enter_repo chdirs
      (`test_local_remote_relative_hookspath_where_git_resolves_it`: git
      says which hook it runs, every layout).
-[68] OPEN — a global (or system) relative core.hooksPath (`.githooks`) was
+[68] A global (or system) relative core.hooksPath (`.githooks`) was
      resolved against the repository's root only; git applies it in every
      repository it enters: a local bare remote
      (`hub.git/.githooks/pre-receive` on push), a submodule
-     (`sub/.githooks/post-checkout` on `submodule update`).
+     (`sub/.githooks/post-checkout` on `submodule update`). Fix: the
+     DIR_KEYS values of global origin are resolved again against every
+     local remote's gitdir and every submodule's tree; those of the
+     environment and `-c` in the submodules only (git clears
+     GIT_CONFIG_PARAMETERS for a local receive-pack, keeps it for a
+     submodule). Parity: git says which hook it runs, 17 remote layouts ×
+     global/system, and `submodule update --force` with global and `-c`.
 [69] `file://` remote URLs are URL-decoded by git (`My%20Repos`),
      not by _local_remote: no repository found, nothing watched; the same
      spelling passed the [62] check of `git push <url>`. Fix: a port of
@@ -349,10 +355,14 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
 [71] OPEN — `!cd tools && ./lint.sh`, `!(cd tools; sh lint.sh)`: the token
      resolves against the root (`<root>/lint.sh`), `tools` is dropped as a
      directory, `tools/lint.sh` (what sh runs) is never watched.
-[72] OPEN — `--work-tree` without `--git-dir` (or GIT_WORK_TREE alone):
+[72] `--work-tree` without `--git-dir` (or GIT_WORK_TREE alone):
      git discovers the gitdir from the cwd and uses the given tree, where
      it resolves a relative core.hooksPath; gitguard checked the
-     discovered tree. ([18] fixed the discovery half.)
+     discovered tree. ([18] fixed the discovery half.) Fix: open_repo
+     takes GIT_WORK_TREE as the root after discovery, before core.worktree
+     (setup_explicit_git_dir's order); a missing directory is refused.
+     The state key stays on the directory holding `.git`, so the tree
+     given is trusted through `GIT_WORK_TREE=… gitguard trust`.
 [73] remote.pushDefault / branch.<x>.pushRemote / branch.<x>.remote
      naming a path: git pushes to it as a URL; only remote.*.url/pushurl
      were followed, and a bare `git push` has no destination for the [62]

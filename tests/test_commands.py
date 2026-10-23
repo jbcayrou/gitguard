@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -1176,17 +1177,61 @@ def test_archive_remote_allowed_cases(gg: GG, repo: Path, tmp_path: Path) -> Non
     assert not r.blocked and mark.exists(), r.text
 
 
-@pytest.mark.xfail(strict=True, reason="[72] open: --work-tree alone keeps the discovered tree")
-def test_work_tree_alone_checks_the_given_tree(gg: GG, repo: Path, tmp_path: Path) -> None:
-    """[72] OPEN — `git --work-tree=../w commit` (no --git-dir): git
-    discovers the gitdir from the cwd and takes ../w as the work tree, where
-    it resolves a relative core.hooksPath; gitguard checked the discovered
-    tree. ([18] fixed the opposite: discovery from the cwd, not from ../w.)"""
+# `--work-tree` without `--git-dir`: discovery from the cwd, the given tree
+# used; a relative one from the final cwd (after -C); the environment wins
+# over core.worktree. Each form reaches ../w with plain git (control below).
+WORK_TREE_FORMS = {
+    "relative": (["--work-tree=../w"], "repo", {}),
+    "absolute": (["--work-tree={w}"], "repo", {}),
+    "separate": (["--work-tree", "../w"], "repo", {}),
+    "after_C": (["-C", "src", "--work-tree=../../w"], "repo", {}),
+    "env": ([], "repo", {"GIT_WORK_TREE": "{w}"}),
+    "env_over_core_worktree": ([], "repo", {"GIT_WORK_TREE": "{w}", "CORE_WORKTREE": "{w2}"}),
+}
+
+
+@pytest.mark.parametrize("form", sorted(WORK_TREE_FORMS))
+def test_work_tree_alone_checks_the_given_tree(gg: GG, repo: Path, tmp_path: Path,
+                                               form: str) -> None:
+    """[72] `git --work-tree=../w commit` (no --git-dir): git discovers the
+    gitdir from the cwd and takes ../w as the work tree, where it resolves a
+    relative core.hooksPath; gitguard checked the discovered tree. ([18]
+    fixed the opposite: discovery from the cwd, not from ../w.) The tree
+    given is trusted (same state key: the directory holding .git), its
+    hook rewritten, the commit refused; untouched, it runs (control)."""
+    import subprocess
+    from tests.conftest import GITGUARD
+    args, _, env_add = WORK_TREE_FORMS[form]
+    w, w2 = tmp_path / "w", tmp_path / "w2"
+    sub = lambda a: a.replace("{w}", str(w)).replace("{w2}", str(w2))
+    args = [sub(a) for a in args]
+    env = dict(gg.env, **{k: sub(v) for k, v in env_add.items() if k != "CORE_WORKTREE"})
+    if "CORE_WORKTREE" in env_add:
+        (w2 / ".githooks").mkdir(parents=True)
+        gg.git("config", "core.worktree", str(w2), cwd=repo)
     mark = tmp_path / "RAN"
-    (repo / ".githooks").mkdir()
+    (repo / "src").mkdir()
     gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
-    (tmp_path / "w/.githooks").mkdir(parents=True)
+    write_exec(w / ".githooks/pre-commit", f"#!/bin/sh\ntouch '{mark}'\n")
+    run = lambda *a, e=env: subprocess.run([sys.executable, str(GITGUARD), *a], cwd=repo, env=e,
+                                           capture_output=True, text=True)
+    # trust takes no git option: the tree is given through the environment,
+    # the same root the command's --work-tree designates (same state key:
+    # the directory holding .git; trusting the repository's own tree would
+    # leave ../w's hooks "added", and the command refused).
+    assert run("trust", e=dict(env, GIT_WORK_TREE=str(w))).returncode == 0
+    r = run("git", *args, "commit", "-q", "--allow-empty", "-m", "x")
+    assert r.returncode == 0 and mark.exists(), f"control: the trusted hook of ../w runs\n{r.stderr}"
+    mark.unlink()
+    write_exec(w / ".githooks/pre-commit", f"#!/bin/sh\ntouch '{mark}'; echo evil\n")
+    r = run("git", *args, "commit", "-q", "--allow-empty", "-m", "y")
+    assert r.returncode != 0 and not mark.exists(), f"the rewritten hook of ../w ran\n{r.stderr}"
+    assert ".githooks/pre-commit" in r.stderr, r.stderr
+
+
+def test_work_tree_alone_to_a_missing_directory_is_refused(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[72] fail closed: a work tree that does not exist is refused, not
+    checked as the discovered tree."""
     gg.trust(repo)
-    write_exec(tmp_path / "w/.githooks/pre-commit", f"#!/bin/sh\ntouch '{mark}'\n")
-    gg.run("git", "--work-tree=../w", "commit", "-q", "--allow-empty", "-m", "x", cwd=repo)
-    assert not mark.exists(), "the hook of the given work tree ran"
+    r = gg.run("git", f"--work-tree={tmp_path}/nope", "status", cwd=repo)
+    assert r.blocked and "GIT_WORK_TREE" in r.err, r.text

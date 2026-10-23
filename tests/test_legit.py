@@ -533,3 +533,23 @@ def test_linked_worktree_of_a_submodule(gg: GG, repo: Path, tmp_path: Path) -> N
     r = gg.run("trust", cwd=wt)
     assert r.rc == 0, r.text
     assert not gg.run("git", "status", cwd=wt).blocked
+
+
+def test_global_relative_hookspath_with_remote_and_submodule_is_quiet(gg: GG, repo: Path,
+                                                                       tmp_path: Path) -> None:
+    """[68] a global `core.hooksPath = .githooks` resolved in a local remote
+    and in a submodule too: with the directories absent, or present and
+    unchanged, nothing is reported."""
+    from tests.attacks._helpers import add_submodule
+    hub = tmp_path / "hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    gg.git("remote", "add", "hub", str(hub), cwd=repo)
+    sub = add_submodule(gg, repo, tmp_path)
+    gg.git("config", "--global", "core.hooksPath", ".githooks")
+    gg.trust(repo)
+    assert not gg.check(repo).blocked
+    for d in (repo, hub, sub):
+        write_exec(d / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    gg.trust(repo)
+    assert not gg.check(repo).blocked
+    assert not gg.run("git", "status", cwd=repo).blocked

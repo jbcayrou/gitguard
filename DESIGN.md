@@ -177,6 +177,10 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    gitguard refuse on a repository git would not have opened (parity
    tests; the mount checked on the VM). With `--git-dir`/`GIT_DIR`, the checked tree is
    `--work-tree`/`GIT_WORK_TREE`, else `core.worktree`, else the cwd ([28]).
+   `--work-tree`/`GIT_WORK_TREE` alone leaves discovery to the cwd ([18])
+   and then names the tree, before `core.worktree`, as
+   setup_explicit_git_dir does; the discovered tree was checked instead
+   ([72]). A missing one is refused.
    `GIT_COMMON_DIR` enters the recognition as it enters git's: `objects`
    and `refs` are looked up there, so a lone `HEAD` makes any directory a
    gitdir — refused as bare ([54]). Without them, a `core.worktree` in the config (common `config`, then
@@ -384,7 +388,11 @@ is **opened as receive-pack opens it**, a port of `enter_repo`: `<p>/.git`,
 `<p>`, `<p>.git/.git`, `<p>.git`, the gitfile followed, then `commondir`,
 without the environment (git clears it for the transport); the config and
 hooks/ are the common dir's, its relative values (`core.hooksPath =
-.husky/_`) resolve against its gitdir, where enter_repo chdirs ([67]), a
+.husky/_`) resolve against its gitdir, where enter_repo chdirs ([67]) — and
+so do the DIR_KEYS values of the global and system config, which git reads
+in the remote too, and in every submodule's tree; the environment's and
+`-c`'s in the submodules only, where git carries GIT_CONFIG_PARAMETERS
+([68]) — a
 `file://` URL is read as parse_connect_url reads it — percent-decoded
 whole, the host part dropped (`file://host/p`, `file://[a/b]/p`) ([69]) — and
 `remote.pushDefault`, `branch.<b>.pushRemote` and `branch.<b>.remote` are
@@ -989,12 +997,14 @@ content; fail closed on anything the parser cannot make sense of.
   at check time has no gitlink: "the gitlink is the barrier" holds for a
   gitlink already in the index, not for one the checked command brings.
   Test: `test_checkout_brings_a_gitlink_to_a_planted_repository` (xfail).
-- **Open [68], [71], [72], [74]** (adversarial review of 2026-10-22,
-  catalogue in `tests/attacks/__init__.py`, each with an xfail test): a
-  global relative hooksPath applied in a local remote or a submodule
-  ([68]); a script reached after `cd` in an alias ([71]); `--work-tree`
-  alone ([72]); an empty variable glued in a word ([74]). [67], [69],
-  [70], [73], [75], [76] from the same review are fixed.
+- **Open [71], [74]** (adversarial review of 2026-10-22, catalogue in
+  `tests/attacks/__init__.py`, each with an xfail test): a script reached
+  after `cd` in an alias ([71]); an empty variable glued in a word ([74]).
+  [67]–[70], [72], [73], [75], [76] from the same review are fixed.
+- `git --work-tree=<other> …` changes the set of hooks git runs, so the
+  fingerprint differs from the repository's own tree ([72]): the tree is
+  blessed with `GIT_WORK_TREE=<other> gitguard trust` (same state key),
+  and switching between trees prompts each time.
 - A global `core.hooksPath` (or any config path) that is a symlink to a
   directory outside the tree (a stow-managed hooks directory) is refused
   ([75]): the link would have to be watched apart from the directory it

@@ -1083,18 +1083,27 @@ def test_local_remote_hooks_git_runs_are_watched(gg: GG, repo: Path, tmp_path: P
     assert res.blocked, f"{ran}/pre-receive (run by git push) rewritten, accepted\n{res.text}"
 
 
+@pytest.mark.parametrize("source", ["remote_config", "global_config", "system_config"])
 @pytest.mark.parametrize("layout", REMOTE_LAYOUTS)
 def test_local_remote_relative_hookspath_where_git_resolves_it(gg: GG, repo: Path, tmp_path: Path,
-                                                               layout: str) -> None:
-    """[67] a relative core.hooksPath in the remote's config: a pre-receive
-    is planted under `rel-hooks/` in every gitdir and work tree of the
-    volume, git says which one it runs, rewriting that one is seen."""
+                                                               layout: str, source: str) -> None:
+    """[67] a relative core.hooksPath in the remote's config, [68] in the
+    global or system config (git reads them in the remote too): a
+    pre-receive is planted under `rel-hooks/` in every gitdir and work tree
+    of the volume, git says which one it runs, rewriting that one is seen."""
     url = _remote_layout(gg, tmp_path, layout)
     vol = tmp_path / "vol"
-    for c in vol.rglob("config"):
-        if (c.parent / "HEAD").is_file():
-            with open(c, "a") as fh:
-                fh.write("[core]\n\thooksPath = rel-hooks\n")
+    if source == "remote_config":
+        for c in vol.rglob("config"):
+            if (c.parent / "HEAD").is_file():
+                with open(c, "a") as fh:
+                    fh.write("[core]\n\thooksPath = rel-hooks\n")
+    elif source == "global_config":
+        gg.git("config", "--global", "core.hooksPath", "rel-hooks")
+    else:
+        (tmp_path / "sys.cfg").write_text("[core]\n\thooksPath = rel-hooks\n")
+        gg.env["GIT_CONFIG_SYSTEM"] = str(tmp_path / "sys.cfg")
+        del gg.env["GIT_CONFIG_NOSYSTEM"]          # the fixture isolates the system file
     log = tmp_path / "ran.log"
     gitdirs = {h.parent for h in vol.rglob("HEAD")
                if (h.parent / "objects").is_dir() or (h.parent / "commondir").is_file()}
@@ -1109,3 +1118,28 @@ def test_local_remote_relative_hookspath_where_git_resolves_it(gg: GG, repo: Pat
     write_exec(ran / "pre-receive", EVIL)
     res = gg.check(repo)
     assert res.blocked, f"{ran}/pre-receive (run by git push) rewritten, accepted\n{res.text}"
+
+
+@pytest.mark.parametrize("source", ["global", "dash_c"])
+def test_global_relative_hookspath_in_a_submodule_as_git(gg: GG, repo: Path, tmp_path: Path,
+                                                         source: str) -> None:
+    """[68] a relative core.hooksPath from the global config or from `-c`
+    (GIT_CONFIG_PARAMETERS reaches a submodule's git) resolves in the
+    submodule's tree: `submodule update --force` runs
+    `sub/.githooks/post-checkout`, git says so, rewriting it is seen."""
+    from tests.attacks._helpers import add_submodule
+    sub = add_submodule(gg, repo, tmp_path)
+    log = tmp_path / "ran.log"
+    for d in (repo, sub, repo / ".git/modules/sub"):
+        write_exec(d / ".githooks/post-checkout", f"#!/bin/sh\necho {d} >> '{log}'\n")
+    pre = ["-c", "core.hooksPath=.githooks"] if source == "dash_c" else []
+    if source == "global":
+        gg.git("config", "--global", "core.hooksPath", ".githooks")
+    r = gg.git(*pre, "submodule", "update", "--force", "-q", cwd=repo)
+    assert r.rc == 0 and log.exists(), f"oracle: git ran no post-checkout\n{r.text}"
+    ran = Path(log.read_text().split("\n")[0])
+    assert ran == sub, ran
+    gg.trust(repo)
+    write_exec(ran / ".githooks/post-checkout", EVIL)
+    r = gg.run("git", *pre, "submodule", "update", "--force", "-q", cwd=repo)
+    assert r.blocked, f"{ran}/.githooks/post-checkout rewritten, accepted\n{r.text}"

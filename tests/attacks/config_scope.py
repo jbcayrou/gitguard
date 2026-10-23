@@ -427,7 +427,7 @@ def attack_local_remote_relative_hookspath(gg: GG, repo: Path, tmp_path: Path) -
 
 
 def attack_global_relative_hookspath_in_bare_remote(gg: GG, repo: Path, tmp_path: Path) -> None:
-    """[68] OPEN — a global relative core.hooksPath (`.githooks`) applies to a
+    """[68] a global relative core.hooksPath (`.githooks`) applies to a
     local bare remote too: receive-pack runs `hub.git/.githooks/pre-receive`;
     gitguard resolved the global value against the repository's root only"""
     hub = tmp_path / "vol-hub.git"
@@ -439,7 +439,7 @@ def attack_global_relative_hookspath_in_bare_remote(gg: GG, repo: Path, tmp_path
 
 
 def attack_global_relative_hookspath_in_submodule(gg: GG, repo: Path, tmp_path: Path) -> None:
-    """[68] OPEN — the same global `.githooks` inside a submodule: `git
+    """[68] the same global `.githooks` inside a submodule: `git
     submodule update` checks the submodule out and runs
     `sub/.githooks/post-checkout`"""
     from tests.attacks._helpers import add_submodule

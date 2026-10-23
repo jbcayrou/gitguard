@@ -759,7 +759,18 @@ def open_repo(root: Path) -> Repo:
         if not common.is_dir():
             raise Refuse(f"{cd} names no directory: {common}")
     anchor = root
-    if not os.environ.get("GIT_DIR"):
+    wt_env = os.environ.get("GIT_WORK_TREE")
+    if wt_env and not os.environ.get("GIT_DIR"):
+        # --work-tree / GIT_WORK_TREE without --git-dir: git discovers the
+        # gitdir from the cwd ([18]) and then takes the given directory as
+        # the tree (setup_discovered_git_dir → setup_explicit_git_dir, the
+        # environment before core.worktree), where a relative core.hooksPath
+        # resolves; the discovered tree was checked instead. [72] (With
+        # --git-dir, find_root already returned it, [28].)
+        root = Path(wt_env).resolve()
+        if not root.is_dir():
+            raise Refuse(f"GIT_WORK_TREE names no directory: {wt_env}")
+    elif not os.environ.get("GIT_DIR"):
         # core.worktree: git takes that directory as the work tree (relative
         # to the gitdir) and resolves a relative core.hooksPath there; the
         # directory containing `.git` was kept, and the hooks never watched.
@@ -1681,22 +1692,40 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None) -> list[tuple[
     # alias scripts live in the submodule's tree and were never watched). [39]
     # Third element: follow `remote.*.url`. Not for the config of a remote
     # itself — pushing to A does not push to A's remotes.
-    queue = [(f, repo.root, True) for f in (repo.gitdir / "config", repo.gitdir / "config.worktree",
-                                            repo.common / "config", repo.common / "config.worktree",
-                                            *global_config_files())]
-    queue += [(f, b, True) for f, b in _submodule_configs(repo)]
+    # Fourth element: the file is of global origin (system, global, XDG and
+    # their includes). Git reads those in every repository it enters, so a
+    # relative DIR_KEYS value of theirs (`core.hooksPath = .githooks`) is
+    # resolved again against every other base below — a local remote's gitdir
+    # (receive-pack ran `hub.git/.githooks/pre-receive`), a submodule's tree
+    # (`submodule update` ran `sub/.githooks/post-checkout`) — where it was
+    # resolved against the root only. Values from the environment and `-c`
+    # reach a submodule (prepare_submodule_repo_env keeps
+    # GIT_CONFIG_PARAMETERS) but not a local receive-pack (local_repo_env
+    # clears it), checked on git 2.47 and 2.50. [68]
+    queue = [(f, repo.root, True, False) for f in (repo.gitdir / "config",
+                                                   repo.gitdir / "config.worktree",
+                                                   repo.common / "config",
+                                                   repo.common / "config.worktree")]
+    queue += [(f, repo.root, True, True) for f in global_config_files()]
+    queue += [(f, b, True, False) for f, b in _submodule_configs(repo)]
+    sub_bases = {b for _, b in _submodule_configs(repo)}
+    remote_bases: set[Path] = set()
+    global_dirs: list[tuple[str, str, str]] = []
+    env_dirs: list[tuple[str, str, str]] = []
     seen: set[Path] = set()
     tokens_seen: set[tuple[str, Path]] = set()
-    nxt: list[tuple[Path, Path, bool]] = []
+    nxt: list[tuple[Path, Path, bool, bool]] = []
 
     def consider(section: str, key: str, value: str, base: Path, cfdir: Path | None,
-                 remotes: bool) -> None:
+                 remotes: bool, glob: bool = False) -> None:
         # `git push <name>` resolves <name> through the repository's config
         # (local, global, environment: those whose base is the root), not a
         # submodule's: there, `<name>` is a path.
         if remote_names is not None and base == repo.root and section.startswith("remote."):
             remote_names.add(section[len("remote."):])
         if (section, key) in DIR_KEYS:
+            if glob:
+                global_dirs.append((section, key, value))
             literal, p = _expand2(value, base)
             if p == repo.root:
                 # A hooks directory at the root of the tree: every top-level
@@ -1722,7 +1751,7 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None) -> list[tuple[
                 return
             literal, p = _expand2(value, cfdir or base)
             if p.is_file():
-                nxt.append((p, base, remotes))
+                nxt.append((p, base, remotes, glob))
             add(literal, p)
         elif remotes and ((section.startswith("remote.") and key in ("url", "pushurl"))
                           or (section == "remote" and key == "pushdefault")
@@ -1741,11 +1770,12 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None) -> list[tuple[
             r = _local_remote(value, base)
             if r is not None:
                 gd, common, rbase, files = r
+                remote_bases.add(rbase)
                 for f in files:
                     add(f, f)
                 for f in (common / "config", gd / "config.worktree"):
                     add(f, f)
-                    nxt.append((f, rbase, False))
+                    nxt.append((f, rbase, False, False))
                 add(common / "hooks", common / "hooks", allow_dir=True)
         elif _data_key(section, key):
             return                       # a file read as data, never run [56]
@@ -1763,18 +1793,29 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None) -> list[tuple[
     # `-c`): not writable by the sandbox, but its values may name paths in
     # the volume, which git honours like any other. [48]
     for section, key, value in env_config():
+        if (section, key) in DIR_KEYS:
+            env_dirs.append((section, key, value))
         consider(section, key, value, repo.root, None, True)
     # +1: the first round consumes the base files; git then follows
     # INCLUDE_DEPTH levels of includes. With range(INCLUDE_DEPTH) the 10th
     # level was hashed but never parsed. [17]
     for _ in range(INCLUDE_DEPTH + 1):
-        for cf, base, remotes in queue:
+        for cf, base, remotes, glob in queue:
             if cf in seen or not cf.is_file():
                 continue
             seen.add(cf)
             for section, key, value in parse_git_config(cf):
-                consider(section, key, value, base, cf.parent, remotes)
+                consider(section, key, value, base, cf.parent, remotes, glob)
         queue, nxt = nxt, []
+    # The global DIR_KEYS values, resolved where git will resolve them next:
+    # in each local remote (push) and each submodule; the environment's in
+    # the submodules only. [68]
+    for base in remote_bases - {repo.root}:
+        for section, key, value in global_dirs:
+            consider(section, key, value, base, None, False)
+    for base in sub_bases - {repo.root}:
+        for section, key, value in [*global_dirs, *env_dirs]:
+            consider(section, key, value, base, None, False)
     return sorted(((scope, p) for p, scope in out.items()), key=lambda t: str(t[1]))
 
 
