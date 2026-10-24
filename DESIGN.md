@@ -521,10 +521,18 @@ refusal message.
 order); `Repo` (root/gitdir/common/anchor, `nested` and `gitfiles` cached) →
 `open_repo` (gitfile, commondir, `core.worktree`);
 `check_structure` (refuses; `check_split_index`, `check_rebase_todo`);
-`config_refs` (what the config makes git read outside the gitdir; `DIR_KEYS`
-for the keys that accept a directory; `global_config_files` for the
+`ConfigScan` (one pass over every config source: `refs`, what the config
+makes git read outside the gitdir; `remote_names`; `cmd`, the aliases;
+`add` records a path, `consider` reads one entry, `run` orders the
+sources; `config_refs(repo)` builds one; `DIR_KEYS` for the keys that
+accept a directory; `global_config_files` / `iter_global_config` for the
 system/global config); `manifest` (dict `(scope, path) → Entry`) with
-`walk_gitdir` and `walk_tree`. `gitdir_paths` is the **only** walk of the
+`walk_gitdir` and `walk_tree`; `inspect(repo) → Inspection` runs the three
+in the only safe order (scan, structure, fingerprint) for every caller —
+`main`, `entries`, `review_pending`, `retrust`, the auto-trust of
+`run_git` — and `save_trust(repo, refs, man)` takes an Inspection's
+`refs` and `new` with no default, so the state blessed is always one that
+was computed and shown. `gitdir_paths` is the **only** walk of the
 gitdir (volatile pruned): the fingerprint and the control-character scan of
 `check_structure` both use it. The volatile rules live **once** in
 `_child_root` / `_zone` / `_volatile_dir` / `_volatile_file`, shared by

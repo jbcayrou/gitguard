@@ -1033,7 +1033,7 @@ def test_save_trust_refuses_when_a_file_moved_after_the_diff(gg: GG, repo: Path,
     import gitguard as gg_mod
     monkeypatch.setattr(gg_mod, "STATE", gg.state)
     r = gg_mod.open_repo(repo)
-    refs = gg_mod.config_refs(r)
+    refs = gg_mod.config_refs(r).refs
     new = gg_mod.manifest(r, refs)                      # the state "shown"
     before = gg.key_for(repo).read_bytes()
     gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=repo)   # moved after the diff

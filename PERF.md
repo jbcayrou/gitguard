@@ -138,6 +138,22 @@ at the first character. Absolute figures differ from the 2026-10-22 table
 (machine state, the VM's load); only the head-to-head column pair is
 comparable.
 
+## 2026-10-24: design review follow-ups ([84], [85], the default switch, ConfigScan)
+
+`gitguard` alone (plain check), `28309e3` (before the four commits of the
+review) against the working tree after them, head to head, N = 60,
+median, two rounds each, macOS, small repository (a clone of gitguard):
+
+| round | before  | after   |
+|-------|--------:|--------:|
+| 1     | 44.5 ms | 44.5 ms |
+| 2     | 44.8 ms | 44.7 ms |
+
+Unchanged. The script grew 177 → 180 KB (ConfigScan's and
+_core_worktree's docstrings) and lost the Levenshtein port; the check
+does the same stat calls as before, in the same order (`inspect` only
+names the pipeline). Not measured on the Debian VM (down that day).
+
 ## Where the time goes (2026-10-17 figures)
 
 | component                                             | cost            |

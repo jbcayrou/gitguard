@@ -74,7 +74,8 @@ are honoured as git honours them.
 | discovery, gitfile, commondir, `core.worktree` | `find_root`, `is_bare_gitdir`, `open_repo`, `_core_worktree` (section "discovery", `pytest -m discovery` after a git upgrade) | What the script checks, 1–2 |
 | structural refusals (nested `.git`, index names, todo files, symlinks, perms) | `check_structure`, `check_indexes`, `check_rebase_todo` | What the script checks, 3 |
 | what is hashed in the gitdir | `walk_gitdir`, `_child_root`, `_zone`, `_volatile_*` | What the fingerprint watches in the gitdir |
-| paths the config makes git read | `config_refs`, `DIR_KEYS`, `DATA_KEYS`, `global_config_files`, `env_config` | What the fingerprint watches outside the gitdir |
+| paths the config makes git read | `ConfigScan` (`add`, `consider`, `run`), `config_refs`, `DIR_KEYS`, `DATA_KEYS`, `global_config_files`, `iter_global_config`, `env_config` | What the fingerprint watches outside the gitdir |
+| the check pipeline (scan → structure → fingerprint) | `inspect`, `Inspection`, `save_trust` | Organization of gitguard.py |
 | config parser | `_Src`, `_parse_value`, `parse_git_config` | same, "Config files parsed" |
 | output, colours, `san` | `san`, `Style`, `set_output` | Display and sanitization |
 | state files, keys, locking | `save_trust`, `load_manifest`, `update_pending` | Storage |

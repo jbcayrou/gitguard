@@ -1645,24 +1645,48 @@ def check_safe_bare() -> None:
              f"recommended: {SAFE_BARE_HINT}")
 
 
-def config_refs(repo: Repo, remote_names: set[str] | None = None,
-                cmd: CmdConfig | None = None) -> list[tuple[str, Path]]:
-    """Paths outside the gitdir that the config makes git execute or read:
-    core.hooksPath, include.path (recursive), and any token of a value that
-    exists as a path. Returns [(scope, path)] with scope 'wt' (under the root)
-    or 'ext' (elsewhere, writable). Plus the tree files that drive git: root
-    gitfile, .gitmodules, each submodule's gitfile. `remote_names`, if given,
-    receives the name of every remote the repository's config defines (not a
-    remote's own config) that has a url: what `git push <name>` resolves
-    through config. A `[remote "x"]` section without one (a global
-    `remote.origin.prune`) is not a remote for git: `push x` takes `x` as a
-    path. [62] [82] `cmd`, if given, receives what the config says of the
-    command to run: every alias's candidate commands. [66]
-    The `-c` an alias carries is config like any other: what it names is
-    watched. [80]"""
-    out: dict[Path, str] = {}
+class ConfigScan:
+    """What the configuration git will read says about one repository,
+    gathered in a single pass over every config source (`run`):
 
-    def add(literal: Path, p: Path, allow_dir: bool = False) -> None:
+    - `refs`: paths outside the gitdir that the config makes git execute or
+      read — core.hooksPath, include.path (recursive), any token of a value
+      that exists as a path — as [(scope, path)], scope 'wt' (under the
+      root) or 'ext' (elsewhere, writable); plus the tree files that drive
+      git: root gitfile, .gitmodules, each submodule's gitfile.
+    - `remote_names`: every remote the repository's config defines (not a
+      remote's own config) that has a url: what `git push <name>` resolves
+      through config. A `[remote "x"]` section without one (a global
+      `remote.origin.prune`) is not a remote for git: `push x` takes `x` as
+      a path. [62] [82]
+    - `cmd`: what the config says of the command to run, every alias's
+      candidate commands (CmdConfig). [66]
+
+    The `-c` an alias carries is config like any other: what it names is
+    watched. [80] Two steps: `consider` reads one (section, key, value) and
+    `add` records one path. The sources and the order are in `run`.
+    Formerly one 240-line function with two closures; the fixes of [39],
+    [45], [48], [56], [59], [61], [62], [65]–[68], [73], [75], [79], [80]
+    and [82] each live in a branch of `consider` or `add`."""
+
+    def __init__(self, repo: Repo) -> None:
+        self.repo = repo
+        self.out: dict[Path, str] = {}
+        self.refs: list[tuple[str, Path]] = []
+        self.remote_names: set[str] = set()
+        self.cmd = CmdConfig()
+        # DIR_KEYS values of global origin and of the environment / `-c`:
+        # resolved again against each local remote and submodule. [68]
+        self.global_dirs: list[tuple[str, str, str]] = []
+        self.env_dirs: list[tuple[str, str, str]] = []
+        self.remote_bases: set[Path] = set()
+        self.nxt: list[tuple[Path, Path, bool, bool]] = []    # config files found while reading
+        self.tokens_seen: set[tuple[str, Path]] = set()
+
+    def add(self, literal: Path, p: Path, allow_dir: bool = False) -> None:
+        """Record `p` (canonical; `literal` as the config spelt it) as a path
+        git may execute or read, or refuse it."""
+        repo, out = self.repo, self.out
         if not (p.exists() or p.is_symlink()):
             return
         # git executes files. A directory is only loaded by the keys that read
@@ -1718,67 +1742,25 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None,
         elif _replaceable(p):
             out[p] = "ext"
 
-    # .lfsconfig: git-lfs reads lfs.customtransfer.*.path from it (a program it runs). [34]
-    # The gitfile sits next to the tree git was entered from, which
-    # core.worktree may have moved elsewhere (a linked worktree with
-    # extensions.worktreeConfig): then it is outside the root, scope ext. [76]
-    for special in [repo.label / ".git", repo.root / ".gitmodules",
-                    repo.root / ".lfsconfig"]:
-        if special.is_file():
-            out[special] = "wt" if repo.root in special.parents else "ext"
-    for n in repo.gitfiles:
-        if n.is_file():
-            out[n] = "wt"
-
-    # Config files git will read: local, the main repository's (a linked
-    # worktree has no `config` of its own and uses commondir/config), then
-    # system and global — their values also name paths the container can
-    # write (global core.hooksPath, global include.path…).
-    # Each config file comes with the directory its relative values are
-    # resolved against: the root, or the submodule's own tree for the config
-    # of `.git/modules/<x>` (hashed by walk_gitdir, but its hooksPath and
-    # alias scripts live in the submodule's tree and were never watched). [39]
-    # Third element: follow `remote.*.url`. Not for the config of a remote
-    # itself — pushing to A does not push to A's remotes.
-    # Fourth element: the file is of global origin (system, global, XDG and
-    # their includes). Git reads those in every repository it enters, so a
-    # relative DIR_KEYS value of theirs (`core.hooksPath = .githooks`) is
-    # resolved again against every other base below — a local remote's gitdir
-    # (receive-pack ran `hub.git/.githooks/pre-receive`), a submodule's tree
-    # (`submodule update` ran `sub/.githooks/post-checkout`) — where it was
-    # resolved against the root only. Values from the environment and `-c`
-    # reach a submodule (prepare_submodule_repo_env keeps
-    # GIT_CONFIG_PARAMETERS) but not a local receive-pack (local_repo_env
-    # clears it), checked on git 2.47 and 2.50. [68]
-    queue = [(f, repo.root, True, False) for f in (repo.gitdir / "config",
-                                                   repo.gitdir / "config.worktree",
-                                                   repo.common / "config",
-                                                   repo.common / "config.worktree")]
-    queue += [(f, repo.root, True, True) for f in global_config_files()]
-    sub_configs = _submodule_configs(repo)
-    queue += [(f, b, True, False) for f, b in sub_configs]
-    sub_bases = {b for _, b in sub_configs}
-    remote_bases: set[Path] = set()
-    global_dirs: list[tuple[str, str, str]] = []
-    env_dirs: list[tuple[str, str, str]] = []
-    seen: set[Path] = set()
-    tokens_seen: set[tuple[str, Path]] = set()
-    nxt: list[tuple[Path, Path, bool, bool]] = []
-
-    def consider(section: str, key: str, value: str, base: Path, cfdir: Path | None,
+    def consider(self, section: str, key: str, value: str, base: Path, cfdir: Path | None,
                  remotes: bool, glob: bool = False) -> None:
+        """One config entry. `base`: the directory its relative values resolve
+        against (the root, a submodule's tree, a remote's gitdir); `cfdir`:
+        the directory of the file it comes from (None: environment or
+        command line); `remotes`: follow the remotes it names; `glob`: the
+        entry is of global origin (system, global, XDG, their includes)."""
+        repo = self.repo
         # `git push <name>` resolves <name> through the repository's config
         # (local, global, environment: those whose base is the root), not a
         # submodule's: there, `<name>` is a path.
-        if (remote_names is not None and base == repo.root and section.startswith("remote.")
-                and key in ("url", "pushurl")):
-            remote_names.add(section[len("remote."):])
+        if base == repo.root and section.startswith("remote.") and key in ("url", "pushurl"):
+            self.remote_names.add(section[len("remote."):])
         if section == "alias":
             command, pairs = _alias_parts(value)
-            if cmd is not None and base == repo.root:
+            if base == repo.root:
                 words = _shell_alias_words(value) if value.startswith("!") else {command} - {None}
                 if words:
-                    cmd.aliases.setdefault(key, set()).update(w for w in words if w)
+                    self.cmd.aliases.setdefault(key, set()).update(w for w in words if w)
             # `alias.ci = -c core.hooksPath=.githooks commit`: git applies the
             # alias's `-c` when it runs, so `.githooks` is a hooks directory
             # like one named on the command line — and travels like it:
@@ -1789,11 +1771,11 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None,
                 if sk is not None:
                     val = "true" if v is None else v
                     if sk in DIR_KEYS and base == repo.root:
-                        env_dirs.append((*sk, val))
-                    consider(*sk, val, base, None, remotes, False)
+                        self.env_dirs.append((*sk, val))
+                    self.consider(*sk, val, base, None, remotes, False)
         if (section, key) in DIR_KEYS:
             if glob:
-                global_dirs.append((section, key, value))
+                self.global_dirs.append((section, key, value))
             literal, p = _expand2(value, base)
             if p == repo.root:
                 # A hooks directory at the root of the tree: every top-level
@@ -1805,12 +1787,12 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None,
                              f"a hook, gitguard cannot watch that. Move the hooks to a "
                              f"subdirectory (e.g. `.githooks`, then `git config "
                              f"{section}.{key} .githooks`) and retry.")
-            add(literal, p, allow_dir=True)
+            self.add(literal, p, allow_dir=True)
             if key == "templatedir":
                 # git copies the whole template; what it can run is hooks/.
                 # Named on its own: still watched if the template directory
                 # contains the repository (then walked at depth 1). [65]
-                add(literal / "hooks", p / "hooks", allow_dir=True)
+                self.add(literal / "hooks", p / "hooks", allow_dir=True)
         elif section.startswith("include") and key == "path":
             # Relative to the including file; from the command line or the
             # environment git only accepts an absolute path ("relative config
@@ -1819,8 +1801,8 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None,
                 return
             literal, p = _expand2(value, cfdir or base)
             if p.is_file():
-                nxt.append((p, base, remotes, glob))
-            add(literal, p)
+                self.nxt.append((p, base, remotes, glob))
+            self.add(literal, p)
         elif remotes and ((section.startswith("remote.") and key in ("url", "pushurl"))
                           or (section == "remote" and key == "pushdefault")
                           or (section.startswith("branch.") and key in ("remote", "pushremote"))):
@@ -1838,13 +1820,13 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None,
             r = _local_remote(value, base)
             if r is not None:
                 gd, common, rbase, files = r
-                remote_bases.add(rbase)
+                self.remote_bases.add(rbase)
                 for f in files:
-                    add(f, f)
+                    self.add(f, f)
                 for f in (common / "config", gd / "config.worktree"):
-                    add(f, f)
-                    nxt.append((f, rbase, False, False))
-                add(common / "hooks", common / "hooks", allow_dir=True)
+                    self.add(f, f)
+                    self.nxt.append((f, rbase, False, False))
+                self.add(common / "hooks", common / "hooks", allow_dir=True)
         elif _data_key(section, key):
             return                       # a file read as data, never run [56]
         else:
@@ -1853,38 +1835,90 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None,
                 # share their words): each one costs a resolve(). Once per
                 # base is enough, add() is idempotent.
                 if (tok and tok not in (".", "..") and not tok.startswith("-")
-                        and (tok, base) not in tokens_seen):
-                    tokens_seen.add((tok, base))
-                    add(*_expand2(tok, base))
+                        and (tok, base) not in self.tokens_seen):
+                    self.tokens_seen.add((tok, base))
+                    self.add(*_expand2(tok, base))
 
-    # Config git takes from its environment and command line (GIT_CONFIG_*,
-    # `-c`): not writable by the sandbox, but its values may name paths in
-    # the volume, which git honours like any other. [48]
-    for section, key, value in env_config():
-        if (section, key) in DIR_KEYS:
-            env_dirs.append((section, key, value))
-        consider(section, key, value, repo.root, None, True)
-    # +1: the first round consumes the base files; git then follows
-    # INCLUDE_DEPTH levels of includes. With range(INCLUDE_DEPTH) the 10th
-    # level was hashed but never parsed. [17]
-    for _ in range(INCLUDE_DEPTH + 1):
-        for cf, base, remotes, glob in queue:
-            if cf in seen or not cf.is_file():
-                continue
-            seen.add(cf)
-            for section, key, value in parse_git_config(cf):
-                consider(section, key, value, base, cf.parent, remotes, glob)
-        queue, nxt = nxt, []
-    # The global DIR_KEYS values, resolved where git will resolve them next:
-    # in each local remote (push) and each submodule; the environment's in
-    # the submodules only. [68]
-    for base in remote_bases - {repo.root}:
-        for section, key, value in global_dirs:
-            consider(section, key, value, base, None, False)
-    for base in sub_bases - {repo.root}:
-        for section, key, value in [*global_dirs, *env_dirs]:
-            consider(section, key, value, base, None, False)
-    return sorted(((scope, p) for p, scope in out.items()), key=lambda t: str(t[1]))
+    def run(self) -> "ConfigScan":
+        """Read every source in git's order and fill `refs`, `remote_names`
+        and `cmd`."""
+        repo, out = self.repo, self.out
+        # .lfsconfig: git-lfs reads lfs.customtransfer.*.path from it (a program it runs). [34]
+        # The gitfile sits next to the tree git was entered from, which
+        # core.worktree may have moved elsewhere (a linked worktree with
+        # extensions.worktreeConfig): then it is outside the root, scope ext. [76]
+        for special in [repo.label / ".git", repo.root / ".gitmodules",
+                        repo.root / ".lfsconfig"]:
+            if special.is_file():
+                out[special] = "wt" if repo.root in special.parents else "ext"
+        for n in repo.gitfiles:
+            if n.is_file():
+                out[n] = "wt"
+
+        # Config files git will read: local, the main repository's (a linked
+        # worktree has no `config` of its own and uses commondir/config), then
+        # system and global — their values also name paths the container can
+        # write (global core.hooksPath, global include.path…).
+        # Each config file comes with the directory its relative values are
+        # resolved against: the root, or the submodule's own tree for the config
+        # of `.git/modules/<x>` (hashed by walk_gitdir, but its hooksPath and
+        # alias scripts live in the submodule's tree and were never watched). [39]
+        # Third element: follow `remote.*.url`. Not for the config of a remote
+        # itself — pushing to A does not push to A's remotes.
+        # Fourth element: the file is of global origin (system, global, XDG and
+        # their includes). Git reads those in every repository it enters, so a
+        # relative DIR_KEYS value of theirs (`core.hooksPath = .githooks`) is
+        # resolved again against every other base below — a local remote's gitdir
+        # (receive-pack ran `hub.git/.githooks/pre-receive`), a submodule's tree
+        # (`submodule update` ran `sub/.githooks/post-checkout`) — where it was
+        # resolved against the root only. Values from the environment and `-c`
+        # reach a submodule (prepare_submodule_repo_env keeps
+        # GIT_CONFIG_PARAMETERS) but not a local receive-pack (local_repo_env
+        # clears it), checked on git 2.47 and 2.50. [68]
+        queue = [(f, repo.root, True, False) for f in (repo.gitdir / "config",
+                                                       repo.gitdir / "config.worktree",
+                                                       repo.common / "config",
+                                                       repo.common / "config.worktree")]
+        queue += [(f, repo.root, True, True) for f in global_config_files()]
+        sub_configs = _submodule_configs(repo)
+        queue += [(f, b, True, False) for f, b in sub_configs]
+        sub_bases = {b for _, b in sub_configs}
+        seen: set[Path] = set()
+
+        # Config git takes from its environment and command line (GIT_CONFIG_*,
+        # `-c`): not writable by the sandbox, but its values may name paths in
+        # the volume, which git honours like any other. [48]
+        for section, key, value in env_config():
+            if (section, key) in DIR_KEYS:
+                self.env_dirs.append((section, key, value))
+            self.consider(section, key, value, repo.root, None, True)
+        # +1: the first round consumes the base files; git then follows
+        # INCLUDE_DEPTH levels of includes. With range(INCLUDE_DEPTH) the 10th
+        # level was hashed but never parsed. [17]
+        for _ in range(INCLUDE_DEPTH + 1):
+            for cf, base, remotes, glob in queue:
+                if cf in seen or not cf.is_file():
+                    continue
+                seen.add(cf)
+                for section, key, value in parse_git_config(cf):
+                    self.consider(section, key, value, base, cf.parent, remotes, glob)
+            queue, self.nxt = self.nxt, []
+        # The global DIR_KEYS values, resolved where git will resolve them next:
+        # in each local remote (push) and each submodule; the environment's in
+        # the submodules only. [68]
+        for base in self.remote_bases - {repo.root}:
+            for section, key, value in self.global_dirs:
+                self.consider(section, key, value, base, None, False)
+        for base in sub_bases - {repo.root}:
+            for section, key, value in [*self.global_dirs, *self.env_dirs]:
+                self.consider(section, key, value, base, None, False)
+        self.refs = sorted(((scope, p) for p, scope in out.items()), key=lambda t: str(t[1]))
+        return self
+
+
+def config_refs(repo: Repo) -> ConfigScan:
+    """Read every config source of `repo` once: see ConfigScan."""
+    return ConfigScan(repo).run()
 
 
 def _replaceable(p: Path) -> bool:
@@ -2300,6 +2334,29 @@ def manifest(repo: Repo, refs: list[tuple[str, Path]]) -> dict[tuple[str, str], 
     return {(e.scope, e.path): e for e in entries}
 
 
+class Inspection:
+    """Everything a check needs about one repository, computed once by
+    `inspect` in the one order that is safe: the config scan (what git will
+    read), the structural refusals (which need the roots the scan found),
+    then the fingerprint. The state blessed by `save_trust` is always the
+    `new` of an Inspection that was shown, never recomputed."""
+
+    def __init__(self, repo: Repo, scan: ConfigScan, new: dict[tuple[str, str], Entry]) -> None:
+        self.repo, self.scan, self.new = repo, scan, new
+
+    @property
+    def refs(self) -> list[tuple[str, Path]]:
+        return self.scan.refs
+
+
+def inspect(repo: Repo) -> Inspection:
+    """config_refs → check_structure → manifest. Raises Refuse on a
+    structural problem; the fingerprint is not computed then."""
+    scan = config_refs(repo)
+    check_structure(repo, scan.refs)
+    return Inspection(repo, scan, manifest(repo, scan.refs))
+
+
 # -------------------------------------------------------------------- state
 def scope_base(repo: Repo, scope: str) -> Path:
     return {"local": repo.gitdir, "common": repo.common, "wt": repo.root}.get(scope, Path("/"))
@@ -2339,17 +2396,12 @@ def load_manifest(key: Path) -> Manifest | None:
         return Manifest(1, None, [], {})     # unreadable: treated as an older format
 
 
-def save_trust(repo: Repo, refs: list[tuple[str, Path]] | None = None,
-               man: dict[tuple[str, str], Entry] | None = None) -> None:
-    """Record `man` as the reference. When the caller has already computed and
-    shown the state (prompt, auto-accept), it passes it in: we validate
-    exactly what was seen, not a recomputed state the container could have
-    altered in the meantime."""
-    if refs is None:
-        refs = config_refs(repo)
-        check_structure(repo, refs)
-    if man is None:
-        man = manifest(repo, refs)
+def save_trust(repo: Repo, refs: list[tuple[str, Path]],
+               man: dict[tuple[str, str], Entry]) -> None:
+    """Record `man` as the reference. The caller passes the state it computed
+    and showed (an Inspection's `refs` and `new`): we validate exactly what
+    was seen, never a recomputed state the container could have altered in
+    the meantime. No default: the function cannot compute one."""
     STATE.mkdir(parents=True, exist_ok=True)
     STATE.chmod(0o700)
     key = repo.key
@@ -2763,7 +2815,7 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
             dst.unlink()
         if action == "restore":
             _copy_entry(bak / scope / path.lstrip("/"), dst)
-    if manifest(repo, config_refs(repo)) == old:
+    if manifest(repo, config_refs(repo).refs) == old:
         info(f"{len(plan)} file(s) restored, {repo.label} matches the trusted state again")
     else:
         warn("restore done, but the fingerprint still differs — check with 'gitguard diff'")
@@ -2788,15 +2840,13 @@ def entries() -> Iterator[tuple[Path, Path | None, str]]:
             yield key, root, "missing"
             continue
         try:
-            repo = open_repo(root)
-            refs = config_refs(repo)
-            check_structure(repo, refs)
+            insp = inspect(open_repo(root))
         except Refuse:
             yield key, root, "structure"
             continue
         if data is None or not data.current:
             yield key, root, "legacy"
-        elif manifest(repo, refs) != data.entries:
+        elif insp.new != data.entries:
             yield key, root, "modified"
         elif not (Path(str(key) + ".d")).is_dir():
             yield key, root, "legacy"
@@ -2870,7 +2920,8 @@ def cmd_retrust() -> None:
     n = skipped = 0
     for key, root, st in entries():
         if st in ("ok", "legacy") and root:
-            save_trust(open_repo(root))
+            insp = inspect(open_repo(root))
+            save_trust(insp.repo, insp.refs, insp.new)
             clear_pending(key)
             n += 1
             info(f"re-trusted: {root}")
@@ -2935,10 +2986,8 @@ def review_pending(key: Path, d: dict) -> None:
         err(f"  {san(str(d.get('message', '')))}")
         hint("Inspect, then:  gitguard trust  (clears this record)   or:  gitguard pending -c <repo>")
         return
-    repo = open_repo(label)
-    refs = config_refs(repo)
-    check_structure(repo, refs)
-    live = manifest(repo, refs)
+    insp = inspect(open_repo(label))
+    repo, refs, live = insp.repo, insp.refs, insp.new
     old = load_manifest(key)
     if old is None or not old.current:
         raise Refuse(f"repository never trusted: {label} (gitguard trust after inspection)")
@@ -3505,7 +3554,8 @@ def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None, git: 
             warn(f"{d} already contained a .git before '{sub}': no auto-trust (gitguard trust after inspection)")
         elif (d / ".git").is_dir():
             try:
-                save_trust(open_repo(d))
+                insp = inspect(open_repo(d))
+                save_trust(insp.repo, insp.refs, insp.new)
                 info(f"new repository trusted: {d}")
             except Refuse as e:
                 warn(f"cannot trust {d} automatically: {e}")
@@ -3784,16 +3834,13 @@ def main(argv: list[str]) -> int:
             return 0
         repo = open_repo(root)
         label, key = repo.label, repo.key
-        remote_names: set[str] = set()
-        cmd = CmdConfig()
-        refs = config_refs(repo, remote_names, cmd)
-        check_structure(repo, refs)
+        insp = inspect(repo)
+        refs, new = insp.refs, insp.new
         if mode == "exec":
             rest = split_global_options(argv, orig).rest
-            check_remote_destination(repo, rest, remote_names, refs)
-            if not exempt_from_switch(rest, cmd):
+            check_remote_destination(repo, rest, insp.scan.remote_names, refs)
+            if not exempt_from_switch(rest, insp.scan.cmd):
                 argv = with_ignored_submodule_dirt(argv, rest)
-        new = manifest(repo, refs)
         old = load_manifest(key)
         fingerprinted = True
     except Refuse as e:

@@ -1323,7 +1323,6 @@ def test_autocorrect_to_an_alias_as_git(gg: GG, tmp_path: Path) -> None:
     gg.git("config", "alias.sync", "pull", cwd=r)
     gg.git("config", "help.autocorrect", "immediate", cwd=r)
     assert _ran_builtin(gg, r, "synk") == "pull"
-    cmd = gg_mod.CmdConfig()
-    gg_mod.config_refs(gg_mod.open_repo(gg_mod.find_root(r)), None, cmd)
+    cmd = gg_mod.config_refs(gg_mod.open_repo(gg_mod.find_root(r))).cmd
     assert cmd.aliases.get("sync") == {"pull"}
     assert not gg_mod.exempt_from_switch(["synk"], cmd)
