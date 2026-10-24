@@ -1657,7 +1657,7 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None,
     through config. A `[remote "x"]` section without one (a global
     `remote.origin.prune`) is not a remote for git: `push x` takes `x` as a
     path. [62] [82] `cmd`, if given, receives what the config says of the
-    command to run: every alias's candidate commands, help.autocorrect. [66]
+    command to run: every alias's candidate commands. [66]
     The `-c` an alias carries is config like any other: what it names is
     watched. [80]"""
     out: dict[Path, str] = {}
@@ -1791,8 +1791,6 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None,
                     if sk in DIR_KEYS and base == repo.root:
                         env_dirs.append((*sk, val))
                     consider(*sk, val, base, None, remotes, False)
-        if cmd is not None and base == repo.root and (section, key) == ("help", "autocorrect"):
-            cmd.autocorrect = cmd.autocorrect or _autocorrect_on(value)
         if (section, key) in DIR_KEYS:
             if glob:
                 global_dirs.append((section, key, value))
@@ -3409,107 +3407,76 @@ def _shell_alias_words(value: str) -> set[str]:
     return {w.lower().removeprefix("git-") for w in _SHELL_WORD.findall(value[1:])}
 
 
-def _autocorrect_on(value: str) -> bool:
-    """Does `help.autocorrect = value` let git run a corrected command
-    (help.c parse_autocorrect, git_unknown_cmd_config)? Off: false/no/off and
-    the empty string (git_parse_maybe_bool_text, case-insensitive), `never`,
-    `show`, 0. On: true/yes/on, a bare key (read as `true`), `immediate`,
-    `prompt` (asks on a terminal), any other integer. A value git dies on
-    counts as on: a superset. [78]"""
-    if value.lower() in ("", "false", "no", "off") or value in ("never", "show"):
-        return False
-    try:
-        return int(value, 0) != 0
-    except ValueError:
-        return True
-
-
-def _levenshtein(a: str, b: str, w: int = 0, s: int = 2, ins: int = 1, d: int = 3) -> int:
-    """Port of git's levenshtein.c with the weights help_unknown_cmd uses
-    (swap 0, substitution 2, insertion 1, deletion 3), `a` turned into `b`."""
-    row0 = [0] * (len(b) + 1)
-    row1 = [j * ins for j in range(len(b) + 1)]
-    for i in range(len(a)):
-        row2 = [(i + 1) * d] + [0] * len(b)
-        for j in range(len(b)):
-            v = row1[j] + s * (a[i] != b[j])
-            if i > 0 and j > 0 and a[i - 1] == b[j] and a[i] == b[j - 1] and v > row0[j - 1] + w:
-                v = row0[j - 1] + w
-            v = min(v, row1[j + 1] + d, row2[j] + ins)
-            row2[j + 1] = v
-        row0, row1 = row1, row2
-    return row1[len(b)]
-
-
-# git's help_unknown_cmd: a candidate is SIMILAR_ENOUGH when its weighted
-# distance + 1 is below this floor; a common command the word is a prefix of
-# scores 0. [78]
-SIMILARITY_FLOOR = 7
-
-
-# Commands that write a tree into the index and then summarise the work tree
-# in the same process, entering every gitlink whose directory holds a
-# repository to run `git status` there (is_submodule_modified), which honours
-# that repository's config — one the sandbox planted, unknown to the index
-# gitguard read, since the gitlink arrives with the command: checkout/switch
-# (the local changes), stash pop/apply (`git status`) [66]; merge, rebase and
-# pull with an autostash (its re-application prints the status), cherry-pick
-# and revert with the editor (the message template lists the status) [77].
-# Probed on git 2.47.3 and 2.50: `reset`, `restore`, `read-tree`, `bisect`,
-# `am`, `apply`, a merge without autostash do not enter. [66] [77]
-ENTERS_NEW_GITLINKS = frozenset({"checkout", "switch", "stash", "merge", "rebase", "pull",
-                                 "cherry-pick", "revert"})
+# The gitlink that arrives with the command [66]. A commit the sandbox built
+# carries a gitlink to a repository it planted in the tree (objects and refs
+# are volatile). Some commands write that gitlink into the index and, in
+# the same process, report the state of the tree, entering every gitlink
+# whose directory holds a repository to run `git status` there
+# (is_submodule_modified), which honours the planted config — unknown to
+# the index gitguard read. Seen on git 2.47.3 and 2.50: checkout and switch
+# (the local changes), stash pop/apply (`git status`) [66]; merge, rebase
+# and pull with an autostash, cherry-pick and revert with the editor [77];
+# a word help.autocorrect turns into one of them [78]; through an alias,
+# shell or not [79]. A list of those commands was the rule and each one
+# missed was a bypass ([77] after [66]), so the switch is now the default:
+# every command runs with `-c diff.ignoreSubmodules=dirty` (git then
+# compares each gitlink's recorded commit without running `git status` in
+# it, match_stat_with_submodule) except the few whose output the option
+# changes and which never write a gitlink from a tree (SWITCH_EXEMPT). A
+# command gitguard does not recognise — a typo, an alias it cannot resolve,
+# a command of a future git — gets the switch, where it changes nothing
+# visible. Fail closed. The gitlink is written; the next command is refused.
 IGNORE_SUBMODULE_DIRT = "diff.ignoreSubmodules=dirty"
+# Probed on git 2.50 with a dirty submodule, every form of each command,
+# with and without the option: status (long, --short, --porcelain), diff
+# (--submodule=short/log too) and commit (--dry-run, the message template)
+# report the submodule's dirty tree; `config --list`, `config <key>` and
+# `var -l` list the command-line config. Unchanged: submodule summary and
+# status, describe --dirty, show, stash, add, ls-files, the diff plumbing.
+# None of the five writes a gitlink from a tree (commit writes the index
+# from the work tree). A command missing here costs a line of output,
+# never a bypass.
+SWITCH_EXEMPT = frozenset({"status", "diff", "commit", "config", "var"})
 
 
 class CmdConfig:
     """What the repository's config (local, global, environment, `-c`) says
     about the command git will run, read by config_refs in exec mode: each
-    alias's candidate commands, and whether help.autocorrect is on (any
-    definition, a superset of git's last-one-wins). [66] [78] [79]"""
+    alias's candidate commands (every definition counts, a superset of
+    git's last-one-wins). [66] [79]"""
 
     def __init__(self) -> None:
         self.aliases: dict[str, set[str]] = {}
-        self.autocorrect = False
 
 
-def _reaches_entering(word: str, aliases: dict[str, set[str]]) -> bool:
-    """`word`, or an alias chain from it, names one of ENTERS_NEW_GITLINKS. A
-    builtin is never shadowed by an alias of its name (git.c run_argv);
-    every definition of an alias counts (a superset). Case-insensitive:
-    config keys are, and `git-Checkout` finds `git-checkout` in the exec path
-    of a case-insensitive file system. [66]"""
-    todo, seen = [word.lower()], set()
-    while todo:
-        w = todo.pop()
-        if w in ENTERS_NEW_GITLINKS:
-            return True
-        if w not in seen:
-            seen.add(w)
-            todo.extend(x.lower() for x in aliases.get(w, ()))
-    return False
-
-
-def enters_new_gitlinks(rest: list[str], cmd: CmdConfig) -> bool:
-    """Does `git <rest>` run one of ENTERS_NEW_GITLINKS: directly, through an
-    alias (see _alias_parts, _shell_alias_words), or — help.autocorrect on —
-    through git's correction of a word that is no alias? git corrects to the
-    one best candidate among its commands and aliases (help_unknown_cmd);
-    here any entering command or entering alias within git's similarity
-    (prefix, or weighted distance + 1 below SIMILARITY_FLOOR) counts, unique
-    or not, builtin word or not: a superset. A real command that close to one
-    gets the switch too (`push`, `rm`), whose output it does not change;
-    `status`, `diff`, `show`, `log` are not that close. [66] [78] [79]"""
+def exempt_from_switch(rest: list[str], cmd: CmdConfig) -> bool:
+    """Does `git <rest>` run a command of SWITCH_EXEMPT and nothing else?
+    Then the switch is left out, so that its output stays what the user
+    knows. A builtin is never shadowed by an alias of its name (git.c
+    run_argv). An alias is exempt only when every definition of it, through
+    alias chains, resolves to an exempt builtin (see _alias_parts); a shell
+    alias (`!git status`) never is: its words are candidates, not an
+    interpretation of sh (_shell_alias_words), and `git` is no exempt
+    command. Anything else — a word that is no command, a typo git may
+    autocorrect, an alias loop — gets the switch. Case-insensitive: config
+    keys are, and `git-Status` finds `git-status` in the exec path of a
+    case-insensitive file system. [66] [78] [79]"""
     if not rest:
         return False
-    word = rest[0].lower()
-    if _reaches_entering(word, cmd.aliases):
-        return True
-    if cmd.autocorrect and word not in cmd.aliases:
-        cands = ENTERS_NEW_GITLINKS | {a for a in cmd.aliases if _reaches_entering(a, cmd.aliases)}
-        return any(c.startswith(word) or _levenshtein(word, c) + 1 < SIMILARITY_FLOOR
-                   for c in cands)
-    return False
+    todo, seen, reached = [rest[0].lower()], set(), False
+    while todo:
+        w = todo.pop()
+        if w in SWITCH_EXEMPT:
+            reached = True
+            continue
+        if w in seen:
+            continue
+        seen.add(w)
+        defs = cmd.aliases.get(w)
+        if not defs:
+            return False
+        todo.extend(x.lower() for x in defs)
+    return reached
 
 
 def with_ignored_submodule_dirt(args: list[str], rest: list[str]) -> list[str]:
@@ -3824,7 +3791,7 @@ def main(argv: list[str]) -> int:
         if mode == "exec":
             rest = split_global_options(argv, orig).rest
             check_remote_destination(repo, rest, remote_names, refs)
-            if enters_new_gitlinks(rest, cmd):
+            if not exempt_from_switch(rest, cmd):
                 argv = with_ignored_submodule_dirt(argv, rest)
         new = manifest(repo, refs)
         old = load_manifest(key)

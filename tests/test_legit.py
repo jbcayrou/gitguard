@@ -591,6 +591,44 @@ def test_stash_pop_in_a_repository_with_a_submodule(gg: GG, repo: Path, subsrc: 
     assert not gg.check(repo).blocked
 
 
+def test_exempt_commands_still_report_a_dirty_submodule(gg: GG, repo: Path, subsrc: Path) -> None:
+    """[66] the switch is the default; status, diff, commit and config — also
+    through an alias of theirs — run without it, so a submodule whose own
+    tree is dirty is still reported and `git config --list` shows nothing
+    gitguard added. Through a shell alias (`!git status`, not resolved) the
+    switch is on: the dirt goes unreported there, the documented price."""
+    assert gg.git("submodule", "add", "-q", str(subsrc), "sub", cwd=repo).rc == 0
+    gg.git("commit", "-qm", "sub", cwd=repo)
+    gg.git("config", "--global", "alias.st", "status", cwd=repo)
+    gg.git("config", "--global", "alias.s", "st", cwd=repo)
+    gg.git("config", "--global", "alias.sst", "!git status", cwd=repo)
+    gg.trust(repo)
+    (repo / "sub/s").write_text("dirty\n")
+    for args in (["status"], ["st"], ["s"], ["commit", "--dry-run"]):
+        r = gg.run("git", *args, cwd=repo)
+        assert r.rc in (0, 1) and "modified content" in r.out, (args, r.text)
+    r = gg.run("git", "status", "--short", cwd=repo)
+    assert " m sub" in r.out, r.text
+    r = gg.run("git", "diff", "--submodule=log", cwd=repo)
+    assert "contains modified content" in r.out, r.text
+    r = gg.run("git", "config", "--list", cwd=repo)
+    assert "ignoresubmodules" not in r.out.lower(), r.text
+    r = gg.run("git", "sst", cwd=repo)
+    assert r.rc == 0 and "On branch" in r.out and "modified content" not in r.out, r.text
+    r = gg.run("git", "log", "-1", "--format=%s", cwd=repo)      # the switch, silently
+    assert r.rc == 0 and r.out.strip() == "sub", r.text
+    assert not gg.check(repo).blocked
+
+
+def test_autocorrected_word_runs_with_the_switch(gg: GG, repo: Path) -> None:
+    """[78] `git stauts` with help.autocorrect on: git corrects it, gitguard
+    adds the switch without resolving the word — no refusal, no prompt."""
+    gg.git("config", "--global", "help.autocorrect", "immediate", cwd=repo)
+    r = gg.run("git", "stauts", cwd=repo)
+    assert r.rc == 0 and "On branch" in r.out, r.text
+    assert not gg.check(repo).blocked
+
+
 def test_branch_edit_description_leaves_its_file(gg: GG, repo: Path) -> None:
     """[83] `git branch --edit-description` leaves .git/EDIT_DESCRIPTION
     behind (its template, rewritten at each edit): volatile. Setting a

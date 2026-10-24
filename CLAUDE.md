@@ -80,7 +80,7 @@ are honoured as git honours them.
 | state files, keys, locking | `save_trust`, `load_manifest`, `update_pending` | Storage |
 | exec mode: options, clone/init, prompt, pending | `split_global_options`, `parse_new_repo`, `check_or_die`, `ask_on_tty`, `wait_for_decision` | Auto-trust; Exec-mode shortcuts |
 | passthroughs that read no repository | `TRANSPORT`, `main` | Which git runs |
-| the gitlink brought by the command (checkout, merge…, aliases, autocorrect) | `ENTERS_NEW_GITLINKS`, `CmdConfig`, `enters_new_gitlinks`, `_alias_parts`, `with_ignored_submodule_dirt` | Nested repositories |
+| the gitlink brought by the command (the switch on every command, the exemption, aliases) | `SWITCH_EXEMPT`, `CmdConfig`, `exempt_from_switch`, `_alias_parts`, `with_ignored_submodule_dirt` | Nested repositories |
 | performance | PERF.md | Nested repositories (end) |
 | accepted limitations [44], [71], [74], out-of-scope cases | — | Known limitations |
 

@@ -1303,59 +1303,27 @@ def _ran_builtin(gg: GG, r: Path, *args: str) -> str | None:
 @pytest.mark.parametrize("word", AUTOCORRECT_WORDS)
 def test_autocorrect_target_as_git(gg: GG, tmp_path: Path, word: str) -> None:
     """git as the oracle of help.autocorrect: with `immediate`, GIT_TRACE says
-    which builtin git runs for a mistyped word. When it is one of
-    ENTERS_NEW_GITLINKS, enters_new_gitlinks must say so (a superset: the
-    reverse is not required). The words run with no argument in a clean
-    repository: each command errors out or does nothing. [78]"""
+    which builtin git runs for a mistyped word — a command gitguard never saw
+    on the command line, hence the switch on every word it does not know:
+    none of these is exempt, whatever git makes of it (an entering command,
+    [66]; or status, where the switch only hides a submodule's dirty tree).
+    The words run with no argument in a clean repository: each command
+    errors out or does nothing. [78]"""
     r = _autocorrect_repo(gg, tmp_path)
     ran = _ran_builtin(gg, r, "-c", "help.autocorrect=immediate", word)
     if word == "chekout":
         assert ran == "checkout", "the oracle itself"
-    cmd = gg_mod.CmdConfig()
-    cmd.autocorrect = True
-    if ran in gg_mod.ENTERS_NEW_GITLINKS:
-        assert gg_mod.enters_new_gitlinks([word], cmd), (word, ran)
+    assert not gg_mod.exempt_from_switch([word], gg_mod.CmdConfig()), (word, ran)
 
 
 def test_autocorrect_to_an_alias_as_git(gg: GG, tmp_path: Path) -> None:
     """[78] git's candidates include the aliases: `synk` corrects to the alias
-    `sync`, which runs `pull`. The aliases come from config_refs, as in
-    exec mode."""
+    `sync`, which runs `pull`. The word is no alias for gitguard: switch."""
     r = _autocorrect_repo(gg, tmp_path)
     gg.git("config", "alias.sync", "pull", cwd=r)
     gg.git("config", "help.autocorrect", "immediate", cwd=r)
     assert _ran_builtin(gg, r, "synk") == "pull"
     cmd = gg_mod.CmdConfig()
     gg_mod.config_refs(gg_mod.open_repo(gg_mod.find_root(r)), None, cmd)
-    assert cmd.autocorrect and cmd.aliases.get("sync") == {"pull"}
-    assert gg_mod.enters_new_gitlinks(["synk"], cmd)
-
-
-AUTOCORRECT_VALUES = [None, "", "never", "show", "0", "false", "no", "off", "FALSE", "Off",
-                      "true", "yes", "on", "1", "5", "-1", "immediate", "prompt", "Never", "00"]
-
-
-@pytest.mark.parametrize("value", AUTOCORRECT_VALUES)
-def test_autocorrect_values_as_git(gg: GG, tmp_path: Path, value: str | None) -> None:
-    """Which `help.autocorrect` values let git run `chekout` as `checkout`:
-    `_autocorrect_on` of the value as gitguard's parser reads it must be
-    true then, and false when git refuses — except `prompt`, which asks on a
-    terminal (this run has none), and a value git dies on (counted as on, a
-    superset). A bare key is git's true since 2.50 (parse_autocorrect); 2.47
-    dies on it, as on `true`. [78]"""
-    r = _autocorrect_repo(gg, tmp_path)
-    if value is None:
-        with open(r / ".git/config", "a") as f:
-            f.write("[help]\n\tautocorrect\n")
-    else:
-        gg.git("config", "help.autocorrect", value, cwd=r)
-    import subprocess
-    res = subprocess.run(["git", "chekout"], cwd=r, env=gg.env, stdin=subprocess.DEVNULL,
-                         capture_output=True, text=True, errors="replace")
-    ran = _ran_builtin(gg, r, "chekout") == "checkout"
-    parsed = [v for s, k, v in parse_git_config(r / ".git/config") if (s, k) == ("help", "autocorrect")]
-    on = gg_mod._autocorrect_on(parsed[-1])
-    if ran:
-        assert on, (value, parsed)
-    elif value != "prompt" and "fatal" not in res.stderr:
-        assert not on, (value, parsed, res.stderr)
+    assert cmd.aliases.get("sync") == {"pull"}
+    assert not gg_mod.exempt_from_switch(["synk"], cmd)

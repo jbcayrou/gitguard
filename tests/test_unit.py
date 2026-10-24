@@ -550,72 +550,40 @@ def test_alias_command(value: str, word: str | None) -> None:
     assert gg_mod._alias_command(value) == word
 
 
-def _cmd(aliases: dict | None = None, autocorrect: bool = False):
+def _cmd(aliases: dict | None = None):
     c = gg_mod.CmdConfig()
     c.aliases = aliases or {}
-    c.autocorrect = autocorrect
     return c
 
 
-def test_enters_new_gitlinks() -> None:
-    f = gg_mod.enters_new_gitlinks
-    for w in ("checkout", "switch", "stash", "merge", "rebase", "pull", "cherry-pick", "revert"):
+def test_exempt_from_switch() -> None:
+    """[66] [78] [79] the switch is the default; exempt: status, diff, commit,
+    config, and an alias every definition of which resolves to one of them."""
+    f = gg_mod.exempt_from_switch
+    for w in ("status", "diff", "commit", "config", "Status", "DIFF"):
         assert f([w], _cmd()), w
-    assert not f(["status"], _cmd()) and not f([], _cmd()) and not f(["reset"], _cmd())
-    assert f(["co"], _cmd({"co": {"checkout"}}))
-    assert f(["c"], _cmd({"c": {"co"}, "co": {"checkout"}}))
-    assert not f(["c"], _cmd({"c": {"co"}, "co": {"status"}}))
-    assert f(["c"], _cmd({"c": {"status", "switch"}}))          # any definition counts
-    assert not f(["a"], _cmd({"a": {"b"}, "b": {"a"}}))          # a loop ends
-    assert f(["checkout"], _cmd({"checkout": {"status"}}))       # a builtin is never shadowed
-    assert f(["Co"], _cmd({"co": {"Checkout"}})) and f(["CHECKOUT"], _cmd())   # case-insensitive
+    for w in ("checkout", "switch", "stash", "merge", "rebase", "pull", "cherry-pick", "revert",
+              "reset", "show", "log", "add", "push", "submodule", "worktree", "nonsense", "", "-p"):
+        assert not f([w], _cmd()), w
+    assert not f([], _cmd())
+    assert f(["st"], _cmd({"st": {"status"}}))
+    assert f(["s"], _cmd({"s": {"st"}, "st": {"status"}}))
+    assert not f(["co"], _cmd({"co": {"checkout"}}))
+    assert not f(["st"], _cmd({"st": {"status", "checkout"}}))    # every definition must be exempt
+    assert not f(["st"], _cmd({"st": {"git", "status"}}))         # a shell alias, `!git status`
+    assert not f(["a"], _cmd({"a": {"b"}, "b": {"a"}}))             # an alias loop resolves to nothing
+    assert f(["d"], _cmd({"d": {"st", "s"}, "s": {"st"}, "st": {"status"}}))   # a diamond
+    assert f(["status"], _cmd({"status": {"checkout"}}))           # a builtin is never shadowed
+    assert f(["ST"], _cmd({"st": {"Status"}}))                      # case-insensitive
 
 
 @pytest.mark.parametrize("typo", ["chekout", "checkuot", "swich", "swtich", "stsh", "merg", "rebas",
-                                  "pul", "cherry-pik", "revrt", "sw", "chec"])
-def test_autocorrect_typos_are_followed(typo: str) -> None:
-    """[78] with help.autocorrect on, a word git may correct to an entering
-    command gets the switch; off, nothing."""
-    assert gg_mod.enters_new_gitlinks([typo], _cmd(autocorrect=True))
-    assert not gg_mod.enters_new_gitlinks([typo], _cmd())
-
-
-def test_autocorrect_follows_entering_aliases() -> None:
-    """[78] git's candidates include the aliases: a word close to an alias
-    that enters counts; an alias name itself is expanded, never corrected."""
-    c = _cmd({"sync": {"pull"}, "lg": {"log"}}, autocorrect=True)
-    assert gg_mod.enters_new_gitlinks(["synk"], c)
-    assert not gg_mod.enters_new_gitlinks(["lg"], c)
-
-
-@pytest.mark.parametrize("word", ["status", "diff", "show", "log", "describe", "commit", "add",
-                                  "difftool", "submodule", "worktree", "blame", "branch"])
-def test_display_commands_never_get_the_switch(word: str) -> None:
-    """[78] the switch hides a submodule's dirty tree from what a command
-    reports: the commands that report it must stay out of the superset,
-    autocorrect on. Real commands that land in it (`grep`, `fetch`, `tag`,
-    `push`, `rm`: insertion costs 1) report no submodule state, the switch
-    changes nothing there."""
-    assert not gg_mod.enters_new_gitlinks([word], _cmd(autocorrect=True))
-
-
-@pytest.mark.parametrize("a, b, d", [("chekout", "checkout", 1), ("checkout", "chekout", 3),
-                                     ("status", "stash", 7), ("ab", "ba", 0), ("", "abc", 3),
-                                     ("abc", "", 9), ("pull", "push", 4)])
-def test_levenshtein(a: str, b: str, d: int) -> None:
-    """[78] git's weights: swap 0, substitution 2, insertion 1, deletion 3."""
-    assert gg_mod._levenshtein(a, b) == d
-
-
-@pytest.mark.parametrize("value, on", [("true", True), ("", False), ("false", False), ("No", False),
-                                       ("OFF", False), ("never", False), ("show", False),
-                                       ("0", False), ("1", True), ("5", True), ("-1", True),
-                                       ("immediate", True), ("prompt", True), ("yes", True),
-                                       ("Never", True), ("bogus", True)])
-def test_autocorrect_on(value: str, on: bool) -> None:
-    """[78] `Never` is not `never` for git (strcmp): a number it dies on —
-    counted as on, a superset."""
-    assert gg_mod._autocorrect_on(value) is on
+                                  "pul", "cherry-pik", "revrt", "sw", "chec", "stauts", "comit"])
+def test_typos_get_the_switch(typo: str) -> None:
+    """[78] a word that is no command and no alias gets the switch, whatever
+    help.autocorrect makes of it — an entering command, or status, where
+    the switch only hides a submodule's dirty tree from the report."""
+    assert not gg_mod.exempt_from_switch([typo], _cmd())
 
 
 @pytest.mark.parametrize("value, words", [

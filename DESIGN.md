@@ -783,43 +783,64 @@ planted config — all in the one command whose check passed. Probed command
 by command on git 2.47.3 and 2.50: `reset` (every mode), `restore`,
 `read-tree -u`, `bisect`, `am`, `apply --index`, `merge --squash`,
 `checkout -f`/`-q`, a merge or rebase without autostash write the gitlink
-without entering it. Fix: in exec mode, the commands of
-ENTERS_NEW_GITLINKS run with `-c diff.ignoreSubmodules=dirty` inserted
-after the user's global options (`with_ignored_submodule_dirt`; the last
-`-c` wins, so a user's `=none` does not reopen it). git then compares each
-gitlink's recorded commit and skips the `git status` in the submodule
-(match_stat_with_submodule; `submodule.<name>.ignore` does not override it,
-override_submodule_config). The gitlink is written; the **next** command
-sees it and is refused, as after an `add`. What changes for the user: those
-commands' reports no longer flag a submodule whose own tree is dirty (new
-commits are still shown); `status` and `diff` are untouched. The option
-travels to children through GIT_CONFIG_PARAMETERS, so a hook these
+without entering it. Fix: in exec mode, **every** command runs with `-c
+diff.ignoreSubmodules=dirty` inserted after the user's global options
+(`with_ignored_submodule_dirt`; the last `-c` wins, so a user's `=none`
+does not reopen it), except the commands of SWITCH_EXEMPT (below). git
+then compares each gitlink's recorded commit and skips the `git status`
+in the submodule (match_stat_with_submodule; `submodule.<name>.ignore`
+does not override it, override_submodule_config). The gitlink is written;
+the **next** command sees it and is refused, as after an `add`. The
+option travels to children through GIT_CONFIG_PARAMETERS, so a hook these
 commands run, and the git a shell alias runs, see it too.
 
+The switch was first applied to a list of the entering commands
+(`checkout`, `switch`, `stash`, then [77]'s merge, rebase, pull,
+cherry-pick, revert), which needed `help.autocorrect` modelled — git's
+parse_autocorrect and a port of help_unknown_cmd's weighted Levenshtein
+([78]) — to catch a typo git turns into one of them. That list failed
+open: every command it missed was a bypass ([77] came right after [66]),
+and a future git can add an autostash or a status summary to another
+command. Since 2026-10-24 the default is inverted: the switch is on
+unless the command is known to be harmless *and* to show the option's
+effect. `SWITCH_EXEMPT` = `status`, `diff`, `commit`, `config`, `var`:
+probed on git 2.50 with a dirty submodule, every form of each command,
+with and without the option — status (long, `--short`, `--porcelain`),
+diff (`--submodule=short/log` too) and commit (`--dry-run`, the message
+template) report the submodule's dirty tree, `config --list`, `config
+<key>` and `var -l` list the command-line config; `submodule summary` and
+`status`, `describe --dirty`, `show`, `stash`, `add`, `ls-files` and the
+diff plumbing are unchanged. None of the five writes a gitlink from a tree
+(commit writes the index from the work tree). A command missing from the
+exemption costs a line of output, never a bypass; a wrong exemption is a
+five-entry list to audit. What changes for the user: `status`, `diff`,
+`commit` and `config` behave as before, directly or through an alias every
+definition of which resolves to one of them; every other command, a
+shell alias (`!git status`) and a word gitguard does not know (a typo
+help.autocorrect fixes, an alias it cannot resolve) get the switch — the
+summary of a checkout or a `!git status` no longer flags a submodule
+whose own tree is merely dirty (new commits are still shown); the
+Levenshtein port and `_autocorrect_on` are gone.
+
 Which command runs is read as git reads it, from the repository's own
-config, the global files and `-c` (`CmdConfig`, filled by config_refs):
-an alias is split as split_cmdline splits it (`_split_cmdline`) and its
-leading global options skipped as handle_options does (`-p`, `-c`,
-`--config-env`; git dies on the others) ([79]); a builtin is never
-shadowed; an alias may name an alias; every definition counts rather than
-modelling precedence. A shell alias (`!…`) runs git from git's exec-path,
-which git puts first on the alias's PATH — never the wrapper, even
-installed as documented — so its words are candidate commands
-(`_shell_alias_words`, `git-` dropped): candidates, not an
-interpretation of sh, the boundary of [71] and [74]. With
-**help.autocorrect** on (`_autocorrect_on`: git's parse_autocorrect), a
-word that is no alias gets the switch when an entering command or alias is
-within git's similarity — a prefix, or help_unknown_cmd's weighted
-distance (`_levenshtein`) + 1 below 7 — unique or not, real command or not
-([78]). That superset contains the command git would pick; it also gives
-the switch to a few real commands that report no submodule state (`push`,
-`rm`, `fetch`, `grep`, `tag`), where it changes nothing, and to a typo git
-corrects to `status`. Ruled out: reading the target tree before the
-command (an object reader — zlib, packs, deltas — for one case), restoring
-the tree walk (above), `=all` (hides submodules from the report
+config, the global files and `-c` (`CmdConfig`, filled by config_refs;
+`exempt_from_switch`): an alias is split as split_cmdline splits it
+(`_split_cmdline`) and its leading global options skipped as
+handle_options does (`-p`, `-c`, `--config-env`; git dies on the others)
+([79]); a builtin is never shadowed; an alias may name an alias; every
+definition counts rather than modelling precedence, and all of them must
+resolve to an exempt command for the alias to be exempt (an alias loop
+resolves to nothing: switch). A shell alias (`!…`) runs git from git's
+exec-path, which git puts first on the alias's PATH — never the wrapper,
+even installed as documented — so its words are candidate commands
+(`_shell_alias_words`, `git-` dropped): candidates, not an interpretation
+of sh, the boundary of [71] and [74]; `git` is no exempt command, so a
+shell alias is never exempt. Ruled out: reading the target tree before
+the command (an object reader — zlib, packs, deltas — for one case),
+restoring the tree walk (above), `=all` (hides submodules from the report
 altogether), asking git for its command list (`git --list-cmds`: running
-git on the repository being judged), the switch on every command (it would
-change `status` and `diff`).
+git on the repository being judged), the switch on every command without
+exemption (it would change `status` and `diff`).
 
 Performance (M4 Pro, see PERF.md for the full tables): ~33 ms overhead per
 command, constant whatever the tree: interpreter 16 ms, stdlib imports 6 ms,

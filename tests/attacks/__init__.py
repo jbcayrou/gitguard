@@ -422,6 +422,12 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      within git's similarity (prefix, or the weighted distance of
      help_unknown_cmd + 1 below 7; _levenshtein is a port) — a superset of
      the one git picks. git is the oracle for 32 typos and 20 values.
+     Superseded on 2026-10-24: the switch is the default on every command,
+     exempt only status, diff, commit, config and var (SWITCH_EXEMPT,
+     exempt_from_switch); a word gitguard does not know gets it, so the
+     autocorrect model and the Levenshtein port are gone. The list of
+     entering commands failed open ([77] after [66]); the exemption fails
+     closed.
 [79] An alias whose head is a global option (`co = -p checkout`, `-c
      color.ui=auto checkout`, `--config-env=…`) was read by its first word;
      a shell alias (`co = !git checkout`) not at all — and its inner git is
