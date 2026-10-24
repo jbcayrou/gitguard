@@ -584,3 +584,18 @@ def attack_alias_config_hookspath_outside(gg: GG, repo: Path, tmp_path: Path) ->
     gg.git("config", "alias.ci", f"-c core.hooksPath={shared} commit", cwd=repo)
     gg.trust(repo)
     write_exec(shared / "pre-commit", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_lfsconfig_added(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[34] `.lfsconfig` planted in the tree: git-lfs reads
+    lfs.customtransfer.<x>.path from it, a program it runs"""
+    write_exec(repo / "t.sh", "#!/bin/sh\ntouch /tmp/evil\n")
+    (repo / ".lfsconfig").write_text('[lfs "customtransfer.x"]\n\tpath = ./t.sh\n')
+
+
+def attack_lfsconfig_rewritten(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[34] a trusted `.lfsconfig` rewritten to name a transfer program"""
+    (repo / ".lfsconfig").write_text("[lfs]\n\turl = https://lfs.example/x\n")
+    gg.trust(repo)
+    write_exec(repo / "t.sh", "#!/bin/sh\ntouch /tmp/evil\n")
+    (repo / ".lfsconfig").write_text('[lfs "customtransfer.x"]\n\tpath = ./t.sh\n')

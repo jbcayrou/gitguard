@@ -78,9 +78,9 @@ def test_restore_leaves_a_planted_include_target_but_cleans_the_rest(gg: GG, rep
 
 
 def test_restore_never_deletes_outside_the_trusted_roots(gg: GG, repo: Path, tmp_path: Path) -> None:
-    """hooksPath redirected after the trust to a directory outside the repository
-    (a stand-in for $HOME): the files there are not deleted, the config is
-    restored, and with nothing else to restore the command says so."""
+    """[20] hooksPath redirected after the trust to a directory outside the
+    repository (a stand-in for $HOME): the files there are not deleted, the
+    config is restored, and with nothing else to restore the command says so."""
     outside = tmp_path / "elsewhere"
     outside.mkdir()
     (outside / "precious").write_text("keep me\n")

@@ -79,3 +79,28 @@ def test_deferred_list_matches_corpus() -> None:
 
 def test_corpus_is_not_empty() -> None:
     assert len(ATTACKS) >= 30, [a[0] for a in ATTACKS]
+
+
+def test_catalogue_cross_references() -> None:
+    """The rule "a flaw is a test first" checked mechanically: every `[n]`
+    cited in gitguard.py or in a test exists in the catalogue of
+    tests/attacks/__init__.py, and every catalogue entry is cited by at
+    least one test. The lookbehind leaves out indexing (`argv[0]`, `x)[0]`,
+    `x][0]`) and the `3[1236]` of a regex; a `[0]` is a list literal."""
+    import re
+    root = Path(__file__).resolve().parent.parent
+    catalogue_file = root / "tests/attacks/__init__.py"
+    catalogue = {int(n) for n in re.findall(r"^\s*\[(\d+)\]", catalogue_file.read_text(), re.M)}
+    assert catalogue, "no catalogue entry found"
+    cite = re.compile(r"(?<![\w)\]])\[(\d+)\]")
+
+    def cited(p: Path) -> set[int]:
+        return {int(n) for n in cite.findall(p.read_text()) if int(n) > 0}   # `[0]`: a list
+
+    code = cited(root / "gitguard.py")
+    tests: set[int] = set()
+    for p in root.glob("tests/**/*.py"):
+        if p != catalogue_file:
+            tests |= cited(p)
+    assert (code | tests) <= catalogue, sorted((code | tests) - catalogue)
+    assert catalogue <= tests, f"catalogue entries no test cites: {sorted(catalogue - tests)}"
