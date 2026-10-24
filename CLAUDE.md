@@ -71,7 +71,7 @@ are honoured as git honours them.
 
 | topic | code | DESIGN.md section |
 |---|---|---|
-| discovery, gitfile, commondir, `core.worktree` | `find_root`, `is_bare_gitdir`, `open_repo` (section "discovery", `pytest -m discovery` after a git upgrade) | What the script checks, 1–2 |
+| discovery, gitfile, commondir, `core.worktree` | `find_root`, `is_bare_gitdir`, `open_repo`, `_core_worktree` (section "discovery", `pytest -m discovery` after a git upgrade) | What the script checks, 1–2 |
 | structural refusals (nested `.git`, index names, todo files, symlinks, perms) | `check_structure`, `check_indexes`, `check_rebase_todo` | What the script checks, 3 |
 | what is hashed in the gitdir | `walk_gitdir`, `_child_root`, `_zone`, `_volatile_*` | What the fingerprint watches in the gitdir |
 | paths the config makes git read | `config_refs`, `DIR_KEYS`, `DATA_KEYS`, `global_config_files`, `env_config` | What the fingerprint watches outside the gitdir |

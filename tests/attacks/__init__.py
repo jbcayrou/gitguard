@@ -457,6 +457,22 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      real git as positive control in test_commands). [77]–[83] found by an
      adversarial review (three agents), replayed against git 2.50 and
      2.47.3.
+[84] Parity, discovery: `core.worktree` read differently from git. With
+     GIT_DIR, find_root kept the first value (git: the last) and never read
+     config.worktree (git: with extensions.worktreeConfig its value wins);
+     open_repo and submodule_trees expanded `~` and `~user` (git copies the
+     value as is, check_repo_format's xstrdup, and dies on `chdir '~/t'`):
+     gitguard checked `$HOME/t`, a tree git never opens. Found in the
+     design review of 2026-10-24, replayed against git 2.50. Fix: one
+     reader (_core_worktree) for find_root and open_repo, last value wins,
+     config.worktree honoured, no interpolation; a missing directory is
+     refused as git dies.
+[85] False warning: `safe.bareRepository = explicit` set in a file the
+     global config includes was not seen (safe_bare_explicit read the
+     global files without their includes), so trust/list/retrust warned
+     about a setting that was in place. Same review. Fix: the global files
+     and their includes read by one iterator (iter_global_config), also
+     used by _template_dir_configured.
 """
 from __future__ import annotations
 

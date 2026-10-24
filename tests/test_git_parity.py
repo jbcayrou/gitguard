@@ -530,6 +530,61 @@ def test_core_worktree_in_a_linked_worktree_as_git(explicit: GG, repo: Path, tmp
     assert explicit.run("trust", cwd=wt).rc == 0
 
 
+def _git_toplevel_with_git_dir(gg: GG, gitdir: Path, cwd: Path) -> Path | None:
+    env = dict(gg.env, GIT_DIR=str(gitdir))
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, env=env,
+                       capture_output=True, text=True)
+    return Path(r.stdout.strip()).resolve() if r.returncode == 0 else None
+
+
+@pytest.mark.parametrize("where", ["two_values", "config_worktree"])
+@pytest.mark.discovery
+def test_git_dir_core_worktree_as_git(explicit: GG, repo: Path, tmp_path: Path, monkeypatch,
+                                      where: str) -> None:
+    """[84] With GIT_DIR, git reads core.worktree as check_repo_format does:
+    the last value wins, and with extensions.worktreeConfig the gitdir's
+    config.worktree wins over the common config. find_root returned the
+    first value and never read config.worktree."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    explicit.git("config", "--add", "core.worktree", str(a), cwd=repo)
+    if where == "two_values":
+        explicit.git("config", "--add", "core.worktree", str(b), cwd=repo)
+    else:
+        explicit.git("config", "extensions.worktreeConfig", "true", cwd=repo)
+        assert explicit.git("config", "--worktree", "core.worktree", str(b), cwd=repo).rc == 0
+    want = _git_toplevel_with_git_dir(explicit, repo / ".git", tmp_path)
+    assert want == b.resolve(), f"git's own behaviour changed: {want}"
+    monkeypatch.setenv("GIT_DIR", str(repo / ".git"))
+    assert gg_mod.find_root(tmp_path) == want
+
+
+@pytest.mark.parametrize("how", ["discovered", "git_dir"])
+@pytest.mark.parametrize("value", ["~/t", f"~{getpass.getuser()}/t", "$HOME/t"])
+@pytest.mark.discovery
+def test_core_worktree_not_interpolated_as_git(explicit: GG, repo: Path, tmp_path: Path,
+                                               monkeypatch, value: str, how: str) -> None:
+    """[84] git copies core.worktree as is (check_repo_format: xstrdup, no
+    `~` or variable expansion) and dies on `chdir '~/t'`. gitguard expanded
+    it and checked `$HOME/t` — a tree git never opens. Git dies ⇒ gitguard
+    refuses, never a Repo on the expanded path."""
+    home_t = Path(explicit.env["HOME"]) / "t"
+    home_t.mkdir()
+    explicit.git("config", "core.worktree", value, cwd=repo)
+    if how == "git_dir":
+        want = _git_toplevel_with_git_dir(explicit, repo / ".git", tmp_path)
+        monkeypatch.setenv("GIT_DIR", str(repo / ".git"))
+        run = lambda: gg_mod.find_root(tmp_path)
+    else:
+        want = _git_view(explicit, repo)
+        run = lambda: gg_mod.open_repo(repo).root
+    assert want is None, f"git's own behaviour changed: {want}"
+    with pytest.raises(gg_mod.Refuse):
+        got = run()
+        assert got != home_t.resolve(), got      # for the message; raises anyway
+
+
 # ========================================= 6. index gitlinks vs ls-files -s
 def _git_gitlinks(gg: GG, repo: Path) -> list[str]:
     r = subprocess.run(["git", "ls-files", "-s", "-z"], cwd=repo, env=gg.env, capture_output=True)

@@ -189,8 +189,16 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    `GIT_COMMON_DIR`): git applies it only `if (!has_common)`, and a
    submodule's linked worktree took `.git/modules/<x>` for its tree ([76]).
    With `extensions.worktreeConfig` git reads this gitdir's `config.worktree`
-   (its value wins) and clears has_common, so the value applies even there;
-   the state key, `.root` and the messages stay on the
+   (its value wins) and clears has_common, so the value applies even there.
+   One reader for both paths, `_core_worktree` (git's `check_repo_format`):
+   the last value wins and the value is taken **as is** — git copies it
+   (`xstrdup`), expands neither `~` nor a variable, and dies on `chdir
+   '~/t'`, so a value naming no directory is refused rather than checked
+   on an expanded path git never opens; with `GIT_DIR`, `find_root` kept
+   the first value and never read `config.worktree` ([84],
+   `test_git_dir_core_worktree_as_git`,
+   `test_core_worktree_not_interpolated_as_git`). The state key, `.root`
+   and the messages stay on the
    directory holding `.git` (`Repo.anchor`, `Repo.label`): a `core.worktree`
    written by the sandbox is an ordinary config change shown in the diff,
    not a "never trusted" repository.
@@ -458,7 +466,11 @@ hashed**: the sandbox cannot write them, whoever can (`$HOME` mounted) can
 write the state directory too, and hashing them turned every registered
 repository "modified" at each `git config --global` or `git lfs install`
 ([56]; a former scope `global`, with a grouped review in `retrust`, is
-gone). Last, the **config git takes from its
+gone). A reader of one global setting (`safe.bareRepository` for the
+warning, `init.templateDir` for auto-trust) goes through
+`iter_global_config`: the same files and the files they include, so that a
+setting kept in an included file is seen — `safe.bareRepository = explicit`
+there drew the warning anyway ([85]). Last, the **config git takes from its
 environment and command line** (`env_config`: `GIT_CONFIG_PARAMETERS` in
 both of git's quoting syntaxes, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
 `VALUE_n`, and in exec mode the `-c`/`--config-env` of the command,

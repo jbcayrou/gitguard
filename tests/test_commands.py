@@ -986,6 +986,17 @@ def test_safe_bare_parsed_without_git(gg: GG, repo: Path) -> None:
     assert m.safe_bare_explicit.__doc__        # public function, exercised above via list
 
 
+def test_safe_bare_in_an_included_file(gg: GG, repo: Path) -> None:
+    """[85] `safe.bareRepository = explicit` in a file ~/.gitconfig includes:
+    git honours it (oracle), the warning must not fire."""
+    home = Path(gg.env["HOME"])
+    (home / "safe.inc").write_text("[safe]\n\tbareRepository = explicit\n")
+    assert gg.git("config", "--global", "include.path", "~/safe.inc").rc == 0
+    assert gg.git("config", "safe.bareRepository", cwd=repo).out.strip() == "explicit"
+    for r in (gg.run("trust", cwd=repo), gg.run("list"), gg.run("retrust")):
+        assert r.rc == 0 and NEEDLE not in r.err, r.text
+
+
 # ------------------------------------------------------------ command line
 @pytest.mark.parametrize("args", [["tust"], ["trust", "--dry-run"], ["diff", "x"], ["list", "x"],
                                   ["retrust", "x"], ["prune", "--all"], ["restore", "-y", "x"]])

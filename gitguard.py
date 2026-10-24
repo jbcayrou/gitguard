@@ -462,6 +462,17 @@ def _unquote(raw: str) -> str:
     return v
 
 
+def config_last(path: Path, section: str, key: str) -> str | None:
+    """The value git keeps for `section.key` from one file: the last one
+    (each config callback overwrites the previous), None when absent. A
+    reader that returned at the first match diverged from git. [84]"""
+    value = None
+    for s, k, v in parse_git_config(path):
+        if s == section and k == key:
+            value = v
+    return value
+
+
 # ---------------------------------------------------------- repo / gitdir
 def key_for(root: Path) -> Path:
     """State key of a repository: first 16 hex digits of the sha256 of its canonical root."""
@@ -537,8 +548,10 @@ class Repo:
 #   _read_path_file     read_gitfile_gently / get_common_dir_noenv (setup.c):
 #                       one path, trailing CR/LF trimmed, nothing else
 #   read_gitfile        read_gitfile_gently     (setup.c)
-#   open_repo           setup_discovered_git_dir + get_common_dir_noenv +
-#                       core.worktree (setup.c)
+#   open_repo           setup_discovered_git_dir + get_common_dir_noenv (setup.c)
+#   _core_worktree      check_repository_format_gently / check_repo_format
+#                       (setup.c): core.worktree, last value, as is,
+#                       config.worktree with extensions.worktreeConfig
 #   env_common_dir      GIT_COMMON_DIR as environment.c and setup.c take it
 def _validate_headref(p: Path) -> bool:
     """git's validate_headref: a symlink to `refs/…`, or a file holding
@@ -619,10 +632,9 @@ def find_root(cwd: Path) -> Path | None:
         if wt:
             return Path(wt).resolve()
         gd = Path(os.environ["GIT_DIR"])
-        for section, key, value in parse_git_config((env_common_dir() or gd) / "config"):
-            if section == "core" and key == "worktree":
-                return (gd / value).resolve()
-        return cwd.resolve()
+        env = env_common_dir()
+        wt = _core_worktree(gd, env or gd, env is not None or (gd / "commondir").is_file())
+        return cwd.resolve() if wt is None else wt
     d = cwd.resolve()
     # Where git stops ascending, gitguard stops too, or it checks — and refuses
     # on — a repository git would not open (seen with a tmpfs mounted inside
@@ -733,6 +745,30 @@ def _resolve_existing(path: Path, src: Path) -> Path:
         raise Refuse(f"{src} names a path that does not exist: {path}") from None
 
 
+def _core_worktree(gitdir: Path, common: Path, has_common: bool) -> Path | None:
+    """The work tree `core.worktree` designates, read as git's
+    check_repository_format_gently reads it (setup.c, check_repo_format):
+    the common config's last value; with `extensions.worktreeConfig` this
+    gitdir's `config.worktree` is read too, its value wins and has_common
+    is cleared; applied only `if (!has_common)` — never in a linked
+    worktree, whose `commondir` (or GIT_COMMON_DIR) sets has_common ([76]:
+    a submodule's linked worktree took `.git/modules/<x>` for its tree).
+    The value is copied as is (xstrdup): no `~`, no variable — git dies on
+    `chdir '~/t'` and so does a missing directory; refused here rather than
+    checking a tree git never opens. Relative to the gitdir. [47] [84]"""
+    cfg = common / "config"
+    wt = config_last(cfg, "core", "worktree")
+    ext = config_last(cfg, "extensions", "worktreeconfig")
+    if ext is not None and ext.lower() in ("true", "yes", "on", "1"):
+        has_common = False
+        wt2 = config_last(gitdir / "config.worktree", "core", "worktree")
+        if wt2 is not None:
+            wt, cfg = wt2, gitdir / "config.worktree"
+    if not wt or has_common:
+        return None
+    return _resolve_existing(gitdir / wt, cfg)
+
+
 def open_repo(root: Path) -> Repo:
     g = Path(os.environ["GIT_DIR"]).resolve() if os.environ.get("GIT_DIR") else root / ".git"
     if g.is_symlink():
@@ -771,29 +807,13 @@ def open_repo(root: Path) -> Repo:
         if not root.is_dir():
             raise Refuse(f"GIT_WORK_TREE names no directory: {wt_env}")
     elif not os.environ.get("GIT_DIR"):
-        # core.worktree: git takes that directory as the work tree (relative
-        # to the gitdir) and resolves a relative core.hooksPath there; the
-        # directory containing `.git` was kept, and the hooks never watched.
-        # Read where git reads it (check_repository_format_gently): the
-        # common config [47]; then, with extensions.worktreeConfig, this
-        # gitdir's config.worktree, whose value wins. Applied only without a
-        # commondir (file or GIT_COMMON_DIR) — git's `if (!has_common)` —
-        # or with the extension, which clears has_common: a submodule's
-        # linked worktree took `.git/modules/<x>` for its tree. [76]
-        wt, ext = None, False
-        has_common = env is not None or cd.is_file()
-        for section, key, value in parse_git_config(common / "config"):
-            if section == "core" and key == "worktree":
-                wt = value
-            elif section == "extensions" and key == "worktreeconfig":
-                ext = value.lower() in ("true", "yes", "on", "1")
-        if ext:
-            has_common = False
-            for section, key, value in parse_git_config(g / "config.worktree"):
-                if section == "core" and key == "worktree":
-                    wt = value
-        if wt and not has_common:
-            root = _expand2(wt, g)[1]
+        # core.worktree: git takes that directory as the work tree and
+        # resolves a relative core.hooksPath there; the directory containing
+        # `.git` was kept, and the hooks never watched. [47] Read as git
+        # reads it (_core_worktree; with GIT_DIR, find_root did it). [76] [84]
+        wt = _core_worktree(g, common, env is not None or cd.is_file())
+        if wt is not None:
+            root = wt
     return Repo(root, g.resolve(), common, anchor)
 
 
@@ -1578,20 +1598,41 @@ def global_config_files() -> list[Path]:
     return out
 
 
+def iter_global_config() -> Iterator[tuple[Path, str, str, str]]:
+    """(file, section, key, value) of the system and global config files
+    and of the files they include, in git's reading order: INCLUDE_DEPTH
+    levels of `include.path` / `includeIf.*.path`, each relative to the
+    including file, the conditions not evaluated (a superset, as in
+    config_refs). For a reader of one global setting; config_refs keeps its
+    own walk, which carries a base and a scope per file and watches the
+    include targets. [85]"""
+    queue, seen = list(global_config_files()), set()
+    for _ in range(INCLUDE_DEPTH + 1):
+        nxt = []
+        for f in queue:
+            if f in seen or not f.is_file():
+                continue
+            seen.add(f)
+            for section, key, value in parse_git_config(f):
+                yield f, section, key, value
+                if section.startswith("include") and key == "path":
+                    nxt.append(_expand2(value, f.parent)[1])
+        queue = nxt
+
+
 SAFE_BARE_HINT = ("`git config --global safe.bareRepository explicit`: git then refuses "
                   "to discover a bare gitdir planted in a subdirectory [23], even from a "
                   "tool that does not go through gitguard")
 
 
 def safe_bare_explicit() -> bool:
-    """`safe.bareRepository = explicit` in the system or global config, read
-    with our parser (never `git config`, which would honour the judged config).
-    Last value wins, as for git."""
+    """`safe.bareRepository = explicit` in the system or global config or a
+    file they include ([85]), read with our parser (never `git config`,
+    which would honour the judged config). Last value wins, as for git."""
     value = None
-    for f in global_config_files():
-        for section, key, v in parse_git_config(f):
-            if section == "safe" and key == "barerepository":
-                value = v
+    for _, section, key, v in iter_global_config():
+        if section == "safe" and key == "barerepository":
+            value = v
     return value is not None and value.strip().lower() == "explicit"
 
 
@@ -1940,12 +1981,11 @@ def submodule_trees(repo: Repo) -> list[tuple[Path, Path]]:
     for r in dict.fromkeys([*gitdir_roots(repo.gitdir), *gitdir_roots(repo.common)]):
         if r in (repo.gitdir, repo.common) or not (r / "config").is_file():
             continue
-        wt = None
-        for section, key, value in parse_git_config(r / "config"):
-            if section == "core" and key == "worktree":
-                wt = value
+        wt = config_last(r / "config", "core", "worktree")
         if wt:
-            out.append((r, _expand2(wt, r)[1]))
+            # As is, like git (no `~`, [84]); not strict: after `submodule
+            # deinit` the directory may be gone, which refuses nothing here.
+            out.append((r, (r / wt).resolve()))
     return out
 
 
@@ -3092,20 +3132,7 @@ def _template_dir_configured(cli_config: list[str]) -> bool:
     keys += [v for k, v in os.environ.items() if k.startswith("GIT_CONFIG_KEY_")]
     if any(k.strip().lower() == "init.templatedir" for k in keys):
         return True
-    queue, seen = list(global_config_files()), set()
-    for _ in range(INCLUDE_DEPTH + 1):
-        nxt = []
-        for f in queue:
-            if f in seen or not f.is_file():
-                continue
-            seen.add(f)
-            for section, key, value in parse_git_config(f):
-                if section == "init" and key == "templatedir":
-                    return True
-                if section.startswith("include") and key == "path":
-                    nxt.append(_expand2(value, f.parent)[1])
-        queue = nxt
-    return False
+    return any(s == "init" and k == "templatedir" for _, s, k, _ in iter_global_config())
 
 
 def parse_new_repo(args: list[str]) -> tuple[str, Path] | None:
