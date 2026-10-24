@@ -405,6 +405,58 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      the three cases (`test_core_worktree_in_a_linked_worktree_as_git`).
      Found by an adversarial review (two agents), replayed against git 2.50
      and 2.47.3; each open one has an xfail(strict) test.
+[77] The [66] switch covered checkout/switch/stash only. merge, rebase
+     and pull with an autostash (rebase.autoStash, merge.autoStash,
+     pull.rebase, `--autostash`) and a dirty tree bring the gitlink, then
+     re-apply the stash and print the status, entering the planted
+     repository; cherry-pick and revert with the editor do the same while
+     writing the message template. A common global setting and a plain
+     `git rebase`/`git pull`. Fix: these commands join
+     ENTERS_NEW_GITLINKS, probed command by command (reset, restore,
+     read-tree, bisect, am, apply do not enter); the real git runs every
+     form in the positive control.
+[78] help.autocorrect defeated the command match: `git chekout main` is no
+     command for gitguard, git corrects it to checkout and runs [66]. Fix:
+     with autocorrect on (_autocorrect_on, git's parse_autocorrect), a word
+     that is no alias gets the switch when an entering command or alias is
+     within git's similarity (prefix, or the weighted distance of
+     help_unknown_cmd + 1 below 7; _levenshtein is a port) — a superset of
+     the one git picks. git is the oracle for 32 typos and 20 values.
+[79] An alias whose head is a global option (`co = -p checkout`, `-c
+     color.ui=auto checkout`, `--config-env=…`) was read by its first word;
+     a shell alias (`co = !git checkout`) not at all — and its inner git is
+     the one of git's exec-path, put first on the alias's PATH, never the
+     wrapper. Fix: the alias is split as split_cmdline (_split_cmdline,
+     whole) and its options skipped as handle_options does (_alias_parts);
+     a shell alias's words count as candidate commands, `git-` dropped
+     (_shell_alias_words): the outer `-c` reaches its inner git.
+[80] The `-c` an alias carries (`ci = -c core.hooksPath=.githooks
+     commit`) was opaque tokens to config_refs: git honours it on every
+     `git ci`, `.githooks` was not watched, a rewritten hook ran. The same
+     `-c` on the command line was refused. Fix: an alias's `-c` and
+     `--config-env` pairs go through consider() like the command line's.
+[81] `git archive --remote=<path>` from a directory that is no repository:
+     no root found, git ran unchecked, upload-archive ran the destination's
+     tar.<format>.command ([70] checked it only inside a repository). Fix:
+     the same check outside, relative to the cwd; the way out is `git -C
+     <path> archive`, checked like any command.
+[82] A `[remote "x"]` section without a url (a global `remote.origin.prune
+     = true`) made `x` a configured remote: `git push x` was not checked,
+     and git, finding no url, takes `x` as a path — `<root>/x`, a planted
+     bare repository whose pre-receive ran. Fix: a name counts only with a
+     url or pushurl from the trusted config.
+[83] False positives: `git branch --edit-description` leaves
+     `.git/EDIT_DESCRIPTION`, `git sparse-checkout set/add` rewrites
+     `.git/info/sparse-checkout` — the next command was refused every time.
+     Both join the volatile lists (a symlink there is still an entry; the
+     two-level symlink check covers both places). Not `lost-found/` (`git
+     fsck --lost-found`, the same review): fsck writes each dangling blob's
+     content to `lost-found/other/<sha>` through a symlink planted there,
+     and the sandbox chooses the blob — a hook rewrite; the planted link is
+     a new entry, refused (attack_lost_found_symlink_for_fsck, with the
+     real git as positive control in test_commands). [77]–[83] found by an
+     adversarial review (three agents), replayed against git 2.50 and
+     2.47.3.
 """
 from __future__ import annotations
 

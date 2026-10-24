@@ -558,3 +558,29 @@ def attack_alias_script_glued_to_empty_variable(gg: GG, repo: Path, tmp_path: Pa
     gg.git("config", "alias.lint", "!sh ./tools$NOPE/lint.sh", cwd=repo)
     gg.trust(repo)
     (repo / "tools/lint.sh").write_text("touch /tmp/evil\n")
+
+
+def attack_alias_config_hookspath(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[80] alias.ci = -c core.hooksPath=.githooks commit: the alias's `-c`
+    makes `.githooks` the hooks directory of every `git ci`"""
+    write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    gg.git("config", "alias.ci", "-c core.hooksPath=.githooks commit", cwd=repo)
+    gg.trust(repo)
+    write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_global_alias_config_hookspath_quoted(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[80] the same from ~/.gitconfig, quoted and after `-p`"""
+    write_exec(repo / ".githooks/pre-push", "#!/bin/sh\nexit 0\n")
+    gg.git("config", "--global", "alias.pp", "-p -c 'core.hooksPath=.githooks' push", cwd=repo)
+    gg.trust(repo)
+    write_exec(repo / ".githooks/pre-push", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_alias_config_hookspath_outside(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[80] an alias's `-c core.hooksPath` naming a directory of the volume"""
+    shared = tmp_path / "vol-hooks"
+    write_exec(shared / "pre-commit", "#!/bin/sh\nexit 0\n")
+    gg.git("config", "alias.ci", f"-c core.hooksPath={shared} commit", cwd=repo)
+    gg.trust(repo)
+    write_exec(shared / "pre-commit", "#!/bin/sh\ntouch /tmp/evil\n")

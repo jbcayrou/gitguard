@@ -291,8 +291,9 @@ gitdir (files and symlinks, at any depth, including `modules/` and
 directories `objects/??`, `pack`, `refs`, `reftable` ([64]), `logs`,
 `lfs`, `rr-cache`, `rebase-*`, `sequencer`, `commit-graphs`; files `index`,
 `*.lock`, `HEAD`,
-`*_HEAD`, `MERGE_*`, `BISECT_*`, `COMMIT_EDITMSG`, `packed-refs`, `shallow`,
-`gc.*`, `info/refs`, `objects/info/packs`… An unknown file or directory is
+`*_HEAD`, `MERGE_*`, `BISECT_*`, `COMMIT_EDITMSG`, `EDIT_DESCRIPTION`, `packed-refs`,
+`shallow`, `gc.*`, `info/refs`, `info/sparse-checkout` ([83]), `objects/info/packs`…
+An unknown file or directory is
 therefore watched. Accepted consequence: `remote add`, `worktree add`,
 `submodule add` require a `trust` (they change `config` or the structure) —
 `push -u` / `branch -u` too, but that precise case is accepted on its own in
@@ -406,11 +407,16 @@ trusted config names is refused, the way out named (`git remote add`,
 `trust`): its hooks are watched for nobody ([62]). The destination is read
 like git's parse-options reads `push` (`--repo`, abbreviated long options,
 `-o` and its value; a relative path from the root); the repository itself
-(`push . main:x`) and the path of a configured remote pass. `git archive
+(`push . main:x`) and the path of a configured remote pass. A configured
+remote is a name the trusted config gives a url or pushurl: a `[remote "x"]`
+section without one (a global `remote.origin.prune`) is no remote for git,
+which takes `x` as a path ([82]). `git archive
 --remote=<path>` gets the same check ([70]: upload-archive runs the
 remote's `tar.<format>.command`), its option read as cmd_archive reads it
 (no abbreviation, last one wins, `--no-remote`, `-o`/`--output`/`--exec`
-values, nothing after `--`).
+values, nothing after `--`); from a directory that is no repository, where
+nothing names remotes, it is checked too, relative to the cwd, and the way
+out is `git -C <path> archive` ([81]).
 Fingerprinting it alerted on every neighbouring file and, worse, `restore`
 deleted there ([25]). Under the root → scope `wt`; outside the tree but
 writable by the user (e.g. `../shared-hooks` in the same mounted volume) →
@@ -458,7 +464,11 @@ both of git's quoting syntaxes, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
 `VALUE_n`, and in exec mode the `-c`/`--config-env` of the command,
 `CLI_CONFIG`/`CLI_CONFIG_ENV` set by `apply_global_options`): the sandbox
 cannot write it, but a value may name a path in the volume ([48]). A
-relative `include.path` from there is ignored, as git refuses it.
+relative `include.path` from there is ignored, as git refuses it. The `-c` and
+`--config-env` an **alias** carries (`ci = -c core.hooksPath=.githooks
+commit`) are that config too: git applies them on every run of the alias,
+so they go through the same reading, from whichever file defines the alias
+([80]).
 
 ## Display and sanitization
 
@@ -744,38 +754,60 @@ hatch `GITGUARD_PRUNE` was also misleading: the gitlink detection never
 depended on it, so a vendored repository stayed refused after adding it —
 the real way out is a submodule (`absorbgitdirs`), now named by the message.
 
-**The gitlink that arrives with the command** ([66], fixed on 2026-10-23).
-The barrier above holds for a gitlink already in the index. The sandbox can
-also plant an untracked repository `vendor/x` (its config running a script)
-and a commit whose tree has a gitlink there, and move a branch — or forge
-`refs/stash` — to it: objects and refs are volatile, nothing is in the
-fingerprint, and the index gitguard reads has no gitlink. `git checkout` /
-`git switch` of that branch write the gitlink, then print the local changes;
-`git stash pop` applies it, then runs `git status`. Both summaries ask each
-gitlink whose directory holds a repository whether it is modified by running
-`git status` inside it (is_submodule_modified), which honours the planted
-config — all in the one command whose check passed. `checkout -f`, `-q`,
-`reset --hard`, `merge`, `pull`, `rebase` write the gitlink without entering
-it (probed on git 2.47.3 and 2.50). Fix: in exec mode, `checkout`, `switch`
-and `stash` run with `-c diff.ignoreSubmodules=dirty` inserted after the
-user's global options (`with_ignored_submodule_dirt`; the last `-c` wins, so
-a user's `=none` does not reopen it). git then compares each gitlink's
-recorded commit and skips the `git status` in the submodule
+**The gitlink that arrives with the command** ([66], fixed on 2026-10-23;
+[77]–[79] on 2026-10-24). The barrier above holds for a gitlink already in
+the index. The sandbox can also plant an untracked repository `vendor/x`
+(its config running a script) and a commit whose tree has a gitlink there,
+and move a branch — or forge `refs/stash` — to it: objects and refs are
+volatile, nothing is in the fingerprint, and the index gitguard reads has
+no gitlink. Some commands write the gitlink, then report the state of the
+tree in the same process: `checkout` / `switch` print the local changes,
+`stash pop` runs `git status`; `merge`, `rebase`, `pull` with an autostash
+re-apply it and print the status; `cherry-pick` and `revert` with the
+editor list the status in the message template ([77]). That report asks
+each gitlink whose directory holds a repository whether it is modified by
+running `git status` inside it (is_submodule_modified), which honours the
+planted config — all in the one command whose check passed. Probed command
+by command on git 2.47.3 and 2.50: `reset` (every mode), `restore`,
+`read-tree -u`, `bisect`, `am`, `apply --index`, `merge --squash`,
+`checkout -f`/`-q`, a merge or rebase without autostash write the gitlink
+without entering it. Fix: in exec mode, the commands of
+ENTERS_NEW_GITLINKS run with `-c diff.ignoreSubmodules=dirty` inserted
+after the user's global options (`with_ignored_submodule_dirt`; the last
+`-c` wins, so a user's `=none` does not reopen it). git then compares each
+gitlink's recorded commit and skips the `git status` in the submodule
 (match_stat_with_submodule; `submodule.<name>.ignore` does not override it,
-override_submodule_config). The gitlink is written; the **next** command sees
-it and is refused, as after an `add`. What changes for the user: those three
-commands' summaries no longer flag a submodule whose own tree is dirty (new
+override_submodule_config). The gitlink is written; the **next** command
+sees it and is refused, as after an `add`. What changes for the user: those
+commands' reports no longer flag a submodule whose own tree is dirty (new
 commits are still shown); `status` and `diff` are untouched. The option
-travels to children through GIT_CONFIG_PARAMETERS, so a hook these commands
-run sees it too. The command word is resolved through aliases as git does
-(`_alias_command`, a port of split_cmdline's first word; a builtin is never
+travels to children through GIT_CONFIG_PARAMETERS, so a hook these
+commands run, and the git a shell alias runs, see it too.
+
+Which command runs is read as git reads it, from the repository's own
+config, the global files and `-c` (`CmdConfig`, filled by config_refs):
+an alias is split as split_cmdline splits it (`_split_cmdline`) and its
+leading global options skipped as handle_options does (`-p`, `-c`,
+`--config-env`; git dies on the others) ([79]); a builtin is never
 shadowed; an alias may name an alias; every definition counts rather than
-modelling precedence), from the repository's own config, global files and
-`-c` — a shell alias (`!…`) is not read, and `GIT_CONFIG_PARAMETERS` set by
-hand is read like `-c`. Ruled out: reading the target tree before the
+modelling precedence. A shell alias (`!…`) runs git from git's exec-path,
+which git puts first on the alias's PATH — never the wrapper, even
+installed as documented — so its words are candidate commands
+(`_shell_alias_words`, `git-` dropped): candidates, not an
+interpretation of sh, the boundary of [71] and [74]. With
+**help.autocorrect** on (`_autocorrect_on`: git's parse_autocorrect), a
+word that is no alias gets the switch when an entering command or alias is
+within git's similarity — a prefix, or help_unknown_cmd's weighted
+distance (`_levenshtein`) + 1 below 7 — unique or not, real command or not
+([78]). That superset contains the command git would pick; it also gives
+the switch to a few real commands that report no submodule state (`push`,
+`rm`, `fetch`, `grep`, `tag`), where it changes nothing, and to a typo git
+corrects to `status`. Ruled out: reading the target tree before the
 command (an object reader — zlib, packs, deltas — for one case), restoring
-the tree walk (above), `=all` (hides submodules from the summary
-altogether).
+the tree walk (above), `=all` (hides submodules from the report
+altogether), asking git for its command list (`git --list-cmds`: running
+git on the repository being judged), the switch on every command (it would
+change `status` and `diff`).
 
 Performance (M4 Pro, see PERF.md for the full tables): ~33 ms overhead per
 command, constant whatever the tree: interpreter 16 ms, stdlib imports 6 ms,
@@ -889,11 +921,12 @@ Rule: any new vector or false positive discovered must first become a test.
 
 ## Adversarial review playbook
 
-gitguard has been through twelve adversarial review passes (the numbered
-catalogue in `tests/attacks/__init__.py` is their output: 76 bypasses and
+gitguard has been through thirteen adversarial review passes (the numbered
+catalogue in `tests/attacks/__init__.py` is their output: 83 bypasses and
 false positives, two of them RCEs found after the tool was believed solid,
 [58]–[65] from the tenth and eleventh, replayed and fixed on 2026-10-22;
 [66]–[70], [72], [73], [75], [76] from the twelfth, fixed on 2026-10-23;
+[77]–[83] from the thirteenth, fixed on 2026-10-24;
 [44], [71] and [74] are accepted limitations, see "Known limitations"; the ninth pass was the
 promotion of the git-parity `xfail`s [46]–[50]).
 The method that worked, for the next pass — by a human or by agents that know
@@ -1073,8 +1106,17 @@ content; fail closed on anything the parser cannot make sense of.
   literal word are covered (same family as [71], [74] above). A push destination reached through an alias,
   `url.<base>.insteadOf` rewriting a URL into a local path, or `git
   send-pack` is not checked ([62]).
+- Ordinary commands that still prompt once, by design: `git fsck
+  --lost-found` writes `.git/lost-found/` — kept watched, because fsck
+  writes the dangling blobs' content there by opening each path, through
+  a symlink a sandbox would plant (a volatile directory is not checked for
+  symlinks below two levels); `git --git-dir=<repo>/.git …` from another
+  directory, or a new `git worktree add`, is another tree, hence another
+  trust key ([72]); a transient `-c core.sshCommand='ssh -i <key>'` names
+  a file, which joins the fingerprint of that command ([48]) and leaves it
+  at the next one without the `-c`.
 - A `-c`/`--config-env` given to a git that gitguard did not wrap (hook,
-  alias, IDE) is invisible; the one of the wrapped command and the
+  IDE) is invisible — an alias's own `-c` is read ([80]); the one of the wrapped command and the
   environment are read ([48]). Same for the repository-local variables
   (`GIT_COMMON_DIR`, `GIT_INDEX_FILE`…): read from gitguard's own
   environment, which is the wrapped git's ([54]). Program-naming variables

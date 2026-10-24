@@ -100,3 +100,15 @@ def attack_module_hooks_dir_symlink_deep(gg: GG, repo: Path, tmp_path: Path) -> 
     os.symlink(ext, hooks)
     gg.run("trust", cwd=repo)           # refused at trust time (link to a directory): accepted
     write_exec(ext / "post-checkout")    # then the target changes, outside the fingerprint
+
+
+def attack_lost_found_symlink_for_fsck(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[83] a symlink at .git/lost-found/other/<sha> onto a hook, with a
+    dangling blob of that sha holding hook content: `git fsck --lost-found`
+    writes the blob there, through the link. lost-found/ stays watched"""
+    import subprocess
+    sha = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, env=gg.env,
+                         input="#!/bin/sh\ntouch /tmp/evil\n", capture_output=True, text=True,
+                         check=True).stdout.strip()
+    (repo / ".git/lost-found/other").mkdir(parents=True)
+    (repo / ".git/lost-found/other" / sha).symlink_to("../../hooks/post-commit")

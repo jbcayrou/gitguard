@@ -550,17 +550,108 @@ def test_alias_command(value: str, word: str | None) -> None:
     assert gg_mod._alias_command(value) == word
 
 
+def _cmd(aliases: dict | None = None, autocorrect: bool = False):
+    c = gg_mod.CmdConfig()
+    c.aliases = aliases or {}
+    c.autocorrect = autocorrect
+    return c
+
+
 def test_enters_new_gitlinks() -> None:
     f = gg_mod.enters_new_gitlinks
-    assert f(["checkout", "x"], {}) and f(["stash", "pop"], {}) and f(["switch"], {})
-    assert not f(["status"], {}) and not f([], {})
-    assert f(["co"], {"co": {"checkout"}})
-    assert f(["c"], {"c": {"co"}, "co": {"checkout"}})
-    assert not f(["c"], {"c": {"co"}, "co": {"status"}})
-    assert f(["c"], {"c": {"status", "switch"}})          # any definition counts
-    assert not f(["a"], {"a": {"b"}, "b": {"a"}})          # a loop ends
-    assert f(["checkout"], {"checkout": {"status"}})       # a builtin is never shadowed
-    assert f(["Co"], {"co": {"Checkout"}}) and f(["CHECKOUT"], {})   # case-insensitive
+    for w in ("checkout", "switch", "stash", "merge", "rebase", "pull", "cherry-pick", "revert"):
+        assert f([w], _cmd()), w
+    assert not f(["status"], _cmd()) and not f([], _cmd()) and not f(["reset"], _cmd())
+    assert f(["co"], _cmd({"co": {"checkout"}}))
+    assert f(["c"], _cmd({"c": {"co"}, "co": {"checkout"}}))
+    assert not f(["c"], _cmd({"c": {"co"}, "co": {"status"}}))
+    assert f(["c"], _cmd({"c": {"status", "switch"}}))          # any definition counts
+    assert not f(["a"], _cmd({"a": {"b"}, "b": {"a"}}))          # a loop ends
+    assert f(["checkout"], _cmd({"checkout": {"status"}}))       # a builtin is never shadowed
+    assert f(["Co"], _cmd({"co": {"Checkout"}})) and f(["CHECKOUT"], _cmd())   # case-insensitive
+
+
+@pytest.mark.parametrize("typo", ["chekout", "checkuot", "swich", "swtich", "stsh", "merg", "rebas",
+                                  "pul", "cherry-pik", "revrt", "sw", "chec"])
+def test_autocorrect_typos_are_followed(typo: str) -> None:
+    """[78] with help.autocorrect on, a word git may correct to an entering
+    command gets the switch; off, nothing."""
+    assert gg_mod.enters_new_gitlinks([typo], _cmd(autocorrect=True))
+    assert not gg_mod.enters_new_gitlinks([typo], _cmd())
+
+
+def test_autocorrect_follows_entering_aliases() -> None:
+    """[78] git's candidates include the aliases: a word close to an alias
+    that enters counts; an alias name itself is expanded, never corrected."""
+    c = _cmd({"sync": {"pull"}, "lg": {"log"}}, autocorrect=True)
+    assert gg_mod.enters_new_gitlinks(["synk"], c)
+    assert not gg_mod.enters_new_gitlinks(["lg"], c)
+
+
+@pytest.mark.parametrize("word", ["status", "diff", "show", "log", "describe", "commit", "add",
+                                  "difftool", "submodule", "worktree", "blame", "branch"])
+def test_display_commands_never_get_the_switch(word: str) -> None:
+    """[78] the switch hides a submodule's dirty tree from what a command
+    reports: the commands that report it must stay out of the superset,
+    autocorrect on. Real commands that land in it (`grep`, `fetch`, `tag`,
+    `push`, `rm`: insertion costs 1) report no submodule state, the switch
+    changes nothing there."""
+    assert not gg_mod.enters_new_gitlinks([word], _cmd(autocorrect=True))
+
+
+@pytest.mark.parametrize("a, b, d", [("chekout", "checkout", 1), ("checkout", "chekout", 3),
+                                     ("status", "stash", 7), ("ab", "ba", 0), ("", "abc", 3),
+                                     ("abc", "", 9), ("pull", "push", 4)])
+def test_levenshtein(a: str, b: str, d: int) -> None:
+    """[78] git's weights: swap 0, substitution 2, insertion 1, deletion 3."""
+    assert gg_mod._levenshtein(a, b) == d
+
+
+@pytest.mark.parametrize("value, on", [("true", True), ("", False), ("false", False), ("No", False),
+                                       ("OFF", False), ("never", False), ("show", False),
+                                       ("0", False), ("1", True), ("5", True), ("-1", True),
+                                       ("immediate", True), ("prompt", True), ("yes", True),
+                                       ("Never", True), ("bogus", True)])
+def test_autocorrect_on(value: str, on: bool) -> None:
+    """[78] `Never` is not `never` for git (strcmp): a number it dies on —
+    counted as on, a superset."""
+    assert gg_mod._autocorrect_on(value) is on
+
+
+@pytest.mark.parametrize("value, words", [
+    ("a b", ["a", "b"]), (" a", ["", "a"]), ("a ", ["a", ""]), ("", [""]),
+    ("a  \t b", ["a", "b"]), ("'a b' c", ["a b", "c"]), ('"a\\"b" c', ['a"b', "c"]),
+    ("a\\ b", ["a b"]), ("'a\\b'", ["a\\b"]), ("a\vb", ["a\vb"]),
+    ("'a", None), ("a\\", None),
+])
+def test_split_cmdline(value: str, words: list | None) -> None:
+    assert gg_mod._split_cmdline(value) == words
+
+
+@pytest.mark.parametrize("value, command, pairs", [
+    ("checkout -q", "checkout", []),
+    ("-p checkout", "checkout", []),
+    ("--paginate -p checkout", "checkout", []),
+    ("-c color.ui=auto checkout", "checkout", [("color.ui", "auto")]),
+    ("-c core.hooksPath=.githooks -c x.y commit", "commit", [("core.hooksPath", ".githooks"), ("x.y", None)]),
+    ("--config-env=core.pager=HOME log", "log", [("core.pager", "/home/user")]),
+    ("--config-env core.pager=NO_SUCH_VAR_X log", "log", []),
+    ("-C sub checkout", "checkout", []),                      # git dies; a superset
+    ("--no-pager checkout", "checkout", []),
+    ("-c", None, []), ("-p", None, []), ("--help", None, []),
+    ("!git checkout", None, []), ("'checkout", None, []),
+])
+def test_alias_parts(monkeypatch, value: str, command: str | None, pairs: list) -> None:
+    monkeypatch.setenv("HOME", "/home/user")
+    monkeypatch.delenv("NO_SUCH_VAR_X", raising=False)
+    assert gg_mod._alias_parts(value) == (command, pairs)
+
+
+def test_shell_alias_words() -> None:
+    w = gg_mod._shell_alias_words
+    assert {"git", "checkout", "q"} <= w("!git checkout -q")
+    assert {"f", "git", "co"} <= w('!f() { git co "$@"; }; f')
+    assert "switch" in w("!git-switch main") and "checkout" in w("!GIT checkout")
 
 
 def test_with_ignored_submodule_dirt() -> None:

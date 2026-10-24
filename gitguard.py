@@ -143,10 +143,10 @@ VOLATILE_FILES = {"index", "HEAD", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "MER
                   "MERGE_MODE", "MERGE_RR", "MERGE_AUTOSTASH", "AUTO_MERGE", "REBASE_HEAD",
                   "CHERRY_PICK_HEAD", "REVERT_HEAD", "SQUASH_MSG", "COMMIT_EDITMSG",
                   "TAG_EDITMSG", "packed-refs", "shallow", "gc.log", "gc.pid",
-                  "commit-graph", "multi-pack-index", "locked"}
+                  "commit-graph", "multi-pack-index", "locked", "EDIT_DESCRIPTION"}
 # Volatile files located elsewhere than a gitdir root, by relative path.
 VOLATILE_RELPATHS = {"info/refs", "objects/info/packs", "objects/info/commit-graph",
-                     "objects/info/multi-pack-index"}
+                     "objects/info/multi-pack-index", "info/sparse-checkout"}
 # Rebase/cherry-pick todo lists live in volatile directories and may contain
 # `exec <cmd>` lines that git runs: handled separately (check_rebase_todo),
 # they cannot be part of the fingerprint since git rewrites them at every step.
@@ -1605,17 +1605,20 @@ def check_safe_bare() -> None:
 
 
 def config_refs(repo: Repo, remote_names: set[str] | None = None,
-                aliases: dict[str, set[str]] | None = None) -> list[tuple[str, Path]]:
+                cmd: CmdConfig | None = None) -> list[tuple[str, Path]]:
     """Paths outside the gitdir that the config makes git execute or read:
     core.hooksPath, include.path (recursive), and any token of a value that
     exists as a path. Returns [(scope, path)] with scope 'wt' (under the root)
     or 'ext' (elsewhere, writable). Plus the tree files that drive git: root
     gitfile, .gitmodules, each submodule's gitfile. `remote_names`, if given,
     receives the name of every remote the repository's config defines (not a
-    remote's own config): what `git push <name>` resolves through config. [62]
-    `aliases`, if given, receives for every `alias.<name>` the repository's
-    config defines the git command it expands to (`_alias_command`), all
-    definitions kept: what `git <name>` runs. [66]"""
+    remote's own config) that has a url: what `git push <name>` resolves
+    through config. A `[remote "x"]` section without one (a global
+    `remote.origin.prune`) is not a remote for git: `push x` takes `x` as a
+    path. [62] [82] `cmd`, if given, receives what the config says of the
+    command to run: every alias's candidate commands, help.autocorrect. [66]
+    The `-c` an alias carries is config like any other: what it names is
+    watched. [80]"""
     out: dict[Path, str] = {}
 
     def add(literal: Path, p: Path, allow_dir: bool = False) -> None:
@@ -1726,12 +1729,29 @@ def config_refs(repo: Repo, remote_names: set[str] | None = None,
         # `git push <name>` resolves <name> through the repository's config
         # (local, global, environment: those whose base is the root), not a
         # submodule's: there, `<name>` is a path.
-        if remote_names is not None and base == repo.root and section.startswith("remote."):
+        if (remote_names is not None and base == repo.root and section.startswith("remote.")
+                and key in ("url", "pushurl")):
             remote_names.add(section[len("remote."):])
-        if aliases is not None and base == repo.root and section == "alias":
-            word = _alias_command(value)
-            if word is not None:
-                aliases.setdefault(key, set()).add(word)
+        if section == "alias":
+            command, pairs = _alias_parts(value)
+            if cmd is not None and base == repo.root:
+                words = _shell_alias_words(value) if value.startswith("!") else {command} - {None}
+                if words:
+                    cmd.aliases.setdefault(key, set()).update(w for w in words if w)
+            # `alias.ci = -c core.hooksPath=.githooks commit`: git applies the
+            # alias's `-c` when it runs, so `.githooks` is a hooks directory
+            # like one named on the command line — and travels like it:
+            # to a submodule (GIT_CONFIG_PARAMETERS kept), not to a local
+            # receive-pack (cleared), whichever file defines the alias. [80]
+            for k, v in pairs:
+                sk = _split_config_key(k)
+                if sk is not None:
+                    val = "true" if v is None else v
+                    if sk in DIR_KEYS and base == repo.root:
+                        env_dirs.append((*sk, val))
+                    consider(*sk, val, base, None, remotes, False)
+        if cmd is not None and base == repo.root and (section, key) == ("help", "autocorrect"):
+            cmd.autocorrect = cmd.autocorrect or _autocorrect_on(value)
         if (section, key) in DIR_KEYS:
             if glob:
                 global_dirs.append((section, key, value))
@@ -3246,20 +3266,45 @@ def check_remote_destination(repo: Repo, rest: list[str], remote_names: set[str]
                          f"`gitguard trust`, then `git {again}`. [{62 if cmd == 'push' else 70}]")
 
 
-def _alias_command(value: str) -> str | None:
-    """The git command an alias expands to: the first word of its value split
-    as git's `split_cmdline` does (quotes `'` and `"`, `\\` escapes outside
-    single quotes). None for a shell alias (`!…`), an empty value, or one git
-    dies on (unclosed quote: "bad alias.<name> string"). [66]"""
-    if value.startswith("!"):
-        return None
-    word: list[str] = []
-    quoted, ended, i = "", False, 0
+def check_archive_outside_repo(rest: list[str]) -> None:
+    """`git archive --remote=<path>` from a directory that is no repository:
+    no config to name remotes, nothing fingerprinted, and git still starts
+    upload-archive in that repository, which runs its `tar.<format>.command`.
+    Refused when the destination is a local repository (relative to the cwd:
+    git does not move); the way out runs the archive there, checked like any
+    command. [81]"""
+    if not rest or rest[0] != "archive":
+        return
+    dest = _archive_remote(rest[1:])
+    if dest is None:
+        return
+    r = _local_remote(dest, Path.cwd())
+    if r is not None:
+        raise Refuse(f"`git archive --remote={dest}` outside any repository: {r[0]} is a "
+                     f"local repository, git would run its config (tar.<format>.command), "
+                     f"which gitguard does not watch. Run it there instead: "
+                     f"`git -C {dest} archive …`. [81]")
+
+
+def _split_cmdline(value: str) -> list[str] | None:
+    r"""Port of git's split_cmdline (alias.c): words separated by runs of
+    git's isspace (no \v, no \f), `'` and `"` quotes, `\` escaping outside
+    single quotes. A leading blank yields an empty first word, a trailing one
+    an empty last word, as in git. None where git dies ("bad alias.<name>
+    string": unclosed quote, `\` at the end). [66]"""
+    words: list[str] = []
+    cur: list[str] = []
+    quoted, i = "", 0
     while i < len(value):
         c = value[i]
-        if not quoted and c in " \t\n\r":   # git's isspace: no \v, no \f
-            ended = True                  # a leading blank ends an empty first word, as in git
-        elif not quoted and c in "'\"":
+        if not quoted and c in " \t\n\r":
+            words.append("".join(cur))
+            cur = []
+            i += 1
+            while i < len(value) and value[i] in " \t\n\r":
+                i += 1
+            continue
+        if not quoted and c in "'\"":
             quoted = c
         elif c == quoted:
             quoted = ""
@@ -3269,39 +3314,174 @@ def _alias_command(value: str) -> str | None:
                 if i >= len(value):
                     return None
                 c = value[i]
-            if not ended:
-                word.append(c)
+            cur.append(c)
         i += 1
     if quoted:
         return None
-    return "".join(word) or None
+    words.append("".join(cur))
+    return words
+
+
+def _alias_parts(value: str) -> tuple[str | None, list[tuple[str, str | None]]]:
+    """A git (non-`!`) alias as git's handle_alias runs it: the words of
+    split_cmdline, then the global options at their head (handle_options),
+    then the command. Returns the command (None: none, or git dies) and the
+    config the alias sets for that run: its `-c k=v` (v None for a bare `k`,
+    git's true) and its `--config-env k=VAR` resolved from the environment.
+    git accepts only `-p`, `-c` and `--config-env` in an alias and dies on
+    the others ("changes environment variables", unknown option); they are
+    skipped here, with their argument — a superset: a command found where git
+    dies runs nothing. [79] [80]"""
+    if value.startswith("!"):
+        return None, []
+    words = _split_cmdline(value)
+    if words is None:
+        return None, []
+    pairs: list[tuple[str, str | None]] = []
+    i = 0
+    while i < len(words) and words[i].startswith("-"):
+        w = words[i]
+        if w in GLOBAL_STOP:
+            return None, pairs                 # git turns it into `help`/`version`
+        if w in ("-c", "--config-env") or w.startswith("--config-env="):
+            if w.startswith("--config-env="):
+                spec, i = w[len("--config-env="):], i + 1
+            elif i + 1 < len(words):
+                spec, i = words[i + 1], i + 2
+            else:
+                return None, pairs             # git dies: option without its argument
+            if w == "-c":
+                k, eq, v = spec.partition("=")
+                pairs.append((k, v if eq else None))
+            else:
+                k, eq, var = spec.rpartition("=")
+                if eq and var in os.environ:
+                    pairs.append((k, os.environ[var]))
+        elif w in GLOBAL_WITH_ARG:
+            i += 2
+        else:
+            i += 1
+    return (words[i] or None) if i < len(words) else None, pairs
+
+
+def _alias_command(value: str) -> str | None:
+    """The git command a (non-`!`) alias runs, see _alias_parts. [66] [79]"""
+    return _alias_parts(value)[0]
+
+
+_SHELL_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
+def _shell_alias_words(value: str) -> set[str]:
+    """Every word of a `!` alias, lower-cased, a leading `git-` dropped
+    (`git-checkout` in the exec-path): the commands the shell may run. A shell
+    alias runs git from git's own exec-path, put first on its PATH, so the
+    inner git is never the wrapper; the outer git's `-c` does reach it
+    (GIT_CONFIG_PARAMETERS). Candidates, not an interpretation of sh: a word
+    the shell builds (`$c`, `$(…)`) is not seen ([71], [74]). [79]"""
+    return {w.lower().removeprefix("git-") for w in _SHELL_WORD.findall(value[1:])}
+
+
+def _autocorrect_on(value: str) -> bool:
+    """Does `help.autocorrect = value` let git run a corrected command
+    (help.c parse_autocorrect, git_unknown_cmd_config)? Off: false/no/off and
+    the empty string (git_parse_maybe_bool_text, case-insensitive), `never`,
+    `show`, 0. On: true/yes/on, a bare key (read as `true`), `immediate`,
+    `prompt` (asks on a terminal), any other integer. A value git dies on
+    counts as on: a superset. [78]"""
+    if value.lower() in ("", "false", "no", "off") or value in ("never", "show"):
+        return False
+    try:
+        return int(value, 0) != 0
+    except ValueError:
+        return True
+
+
+def _levenshtein(a: str, b: str, w: int = 0, s: int = 2, ins: int = 1, d: int = 3) -> int:
+    """Port of git's levenshtein.c with the weights help_unknown_cmd uses
+    (swap 0, substitution 2, insertion 1, deletion 3), `a` turned into `b`."""
+    row0 = [0] * (len(b) + 1)
+    row1 = [j * ins for j in range(len(b) + 1)]
+    for i in range(len(a)):
+        row2 = [(i + 1) * d] + [0] * len(b)
+        for j in range(len(b)):
+            v = row1[j] + s * (a[i] != b[j])
+            if i > 0 and j > 0 and a[i - 1] == b[j] and a[i] == b[j - 1] and v > row0[j - 1] + w:
+                v = row0[j - 1] + w
+            v = min(v, row1[j + 1] + d, row2[j] + ins)
+            row2[j + 1] = v
+        row0, row1 = row1, row2
+    return row1[len(b)]
+
+
+# git's help_unknown_cmd: a candidate is SIMILAR_ENOUGH when its weighted
+# distance + 1 is below this floor; a common command the word is a prefix of
+# scores 0. [78]
+SIMILARITY_FLOOR = 7
 
 
 # Commands that write a tree into the index and then summarise the work tree
-# in the same process: checkout/switch (the local changes), stash pop/apply
-# (`git status`). The summary enters every gitlink whose directory holds a
+# in the same process, entering every gitlink whose directory holds a
 # repository to run `git status` there (is_submodule_modified), which honours
 # that repository's config — one the sandbox planted, unknown to the index
-# gitguard read, since the gitlink arrives with the command. [66]
-ENTERS_NEW_GITLINKS = frozenset({"checkout", "switch", "stash"})
+# gitguard read, since the gitlink arrives with the command: checkout/switch
+# (the local changes), stash pop/apply (`git status`) [66]; merge, rebase and
+# pull with an autostash (its re-application prints the status), cherry-pick
+# and revert with the editor (the message template lists the status) [77].
+# Probed on git 2.47.3 and 2.50: `reset`, `restore`, `read-tree`, `bisect`,
+# `am`, `apply`, a merge without autostash do not enter. [66] [77]
+ENTERS_NEW_GITLINKS = frozenset({"checkout", "switch", "stash", "merge", "rebase", "pull",
+                                 "cherry-pick", "revert"})
 IGNORE_SUBMODULE_DIRT = "diff.ignoreSubmodules=dirty"
 
 
-def enters_new_gitlinks(rest: list[str], aliases: dict[str, set[str]]) -> bool:
-    """Does `git <rest>` run one of ENTERS_NEW_GITLINKS, directly or through
-    an alias? A builtin is never shadowed by an alias of its name, and an
-    alias may expand to another alias (git.c run_argv). Every definition of
-    an alias counts (a superset: precedence is not modelled). Case-insensitive:
+class CmdConfig:
+    """What the repository's config (local, global, environment, `-c`) says
+    about the command git will run, read by config_refs in exec mode: each
+    alias's candidate commands, and whether help.autocorrect is on (any
+    definition, a superset of git's last-one-wins). [66] [78] [79]"""
+
+    def __init__(self) -> None:
+        self.aliases: dict[str, set[str]] = {}
+        self.autocorrect = False
+
+
+def _reaches_entering(word: str, aliases: dict[str, set[str]]) -> bool:
+    """`word`, or an alias chain from it, names one of ENTERS_NEW_GITLINKS. A
+    builtin is never shadowed by an alias of its name (git.c run_argv);
+    every definition of an alias counts (a superset). Case-insensitive:
     config keys are, and `git-Checkout` finds `git-checkout` in the exec path
     of a case-insensitive file system. [66]"""
-    todo, seen = [w.lower() for w in rest[:1]], set()
+    todo, seen = [word.lower()], set()
     while todo:
-        word = todo.pop()
-        if word in ENTERS_NEW_GITLINKS:
+        w = todo.pop()
+        if w in ENTERS_NEW_GITLINKS:
             return True
-        if word not in seen:
-            seen.add(word)
-            todo.extend(w.lower() for w in aliases.get(word, ()))
+        if w not in seen:
+            seen.add(w)
+            todo.extend(x.lower() for x in aliases.get(w, ()))
+    return False
+
+
+def enters_new_gitlinks(rest: list[str], cmd: CmdConfig) -> bool:
+    """Does `git <rest>` run one of ENTERS_NEW_GITLINKS: directly, through an
+    alias (see _alias_parts, _shell_alias_words), or — help.autocorrect on —
+    through git's correction of a word that is no alias? git corrects to the
+    one best candidate among its commands and aliases (help_unknown_cmd);
+    here any entering command or entering alias within git's similarity
+    (prefix, or weighted distance + 1 below SIMILARITY_FLOOR) counts, unique
+    or not, builtin word or not: a superset. A real command that close to one
+    gets the switch too (`push`, `rm`), whose output it does not change;
+    `status`, `diff`, `show`, `log` are not that close. [66] [78] [79]"""
+    if not rest:
+        return False
+    word = rest[0].lower()
+    if _reaches_entering(word, cmd.aliases):
+        return True
+    if cmd.autocorrect and word not in cmd.aliases:
+        cands = ENTERS_NEW_GITLINKS | {a for a in cmd.aliases if _reaches_entering(a, cmd.aliases)}
+        return any(c.startswith(word) or _levenshtein(word, c) + 1 < SIMILARITY_FLOOR
+                   for c in cands)
     return False
 
 
@@ -3603,6 +3783,7 @@ def main(argv: list[str]) -> int:
         root = find_root(Path.cwd())
         if root is None:
             if mode == "exec":
+                check_archive_outside_repo(split_global_options(argv, orig).rest)
                 return run_git(argv, orig, newrepo, git)
             if mode != "check":
                 raise Refuse(f"no git repository here: {Path.cwd()}")      # [30]
@@ -3610,13 +3791,13 @@ def main(argv: list[str]) -> int:
         repo = open_repo(root)
         label, key = repo.label, repo.key
         remote_names: set[str] = set()
-        aliases: dict[str, set[str]] = {}
-        refs = config_refs(repo, remote_names, aliases)
+        cmd = CmdConfig()
+        refs = config_refs(repo, remote_names, cmd)
         check_structure(repo, refs)
         if mode == "exec":
             rest = split_global_options(argv, orig).rest
             check_remote_destination(repo, rest, remote_names, refs)
-            if enters_new_gitlinks(rest, aliases):
+            if enters_new_gitlinks(rest, cmd):
                 argv = with_ignored_submodule_dirt(argv, rest)
         new = manifest(repo, refs)
         old = load_manifest(key)

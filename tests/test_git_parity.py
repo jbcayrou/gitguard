@@ -1159,17 +1159,35 @@ ALIAS_FORMS = {
     "trailing_backslash": "checkout \\",
     "empty_word_first": "'' checkout",
     "vertical_tab": "checkout\vmain",
+    # [79] global options at the head of the alias (handle_options)
+    "paginate": "-p checkout -q",
+    "paginate_long": "--paginate checkout",
+    "config": "-c color.ui=auto checkout -q",
+    "config_bare_key": "-c x.y checkout",
+    "config_env": "--config-env=core.pager=HOME checkout",
+    "config_env_separate": "--config-env core.pager=HOME checkout",
+    "no_pager_dies": "--no-pager checkout",
+    "dash_C_dies": "-C . checkout",
+    "unknown_option_dies": "--bogus checkout",
+    "double_dash_dies": "-- checkout",
+    "option_only": "-p",
+    "config_without_argument": "-c",
 }
 
 
 @pytest.mark.parametrize("form", list(ALIAS_FORMS))
 def test_alias_command_word_as_git(gg: GG, tmp_path: Path, form: str) -> None:
-    """`_alias_command` says which git command an alias runs; git is the
-    oracle: with `alias.co = <form>`, GIT_TRACE prints the expansion git
-    computed (`alias expansion: co => 'checkout' '-q'`), whose first word must
-    be the port's answer; no expansion (a shell alias, a value git dies on:
-    "bad alias.co string") must be None."""
+    """`_alias_command` says which git command an alias runs, `_split_cmdline`
+    how its value splits; git is the oracle. With `alias.co = <form>`,
+    GIT_TRACE says which builtin git ran (`built-in: git checkout`): the port
+    must name it. Where git runs nothing because the alias's options kill it
+    ("changes environment variables", an unknown option), any answer is
+    safe. Where git expanded the alias without running a builtin, the
+    expansion it traced (`alias expansion: co => …`, sq-quoted) is the
+    split, and its first word the command; no expansion at all (a value git
+    dies on: "bad alias.co string", an empty alias) must be None. [66] [79]"""
     import re
+    import shlex
     import subprocess
     r = tmp_path / "r"
     gg.git("init", "-q", str(r))
@@ -1180,15 +1198,109 @@ def test_alias_command_word_as_git(gg: GG, tmp_path: Path, form: str) -> None:
     gg.git("config", "alias.co", ALIAS_FORMS[form], cwd=r)
     stored = [v for s, k, v in parse_git_config(r / ".git/config") if (s, k) == ("alias", "co")]
     assert stored == [gg.git("config", "alias.co", cwd=r).out[:-1]], stored
+    value = stored[0]
     res = subprocess.run(["git", "co", "main"], cwd=r, env={**gg.env, "GIT_TRACE": "1"},
                          capture_output=True, text=True, errors="replace")
-    m = re.search(r"alias expansion: co => (.*)", res.stderr)
-    word = gg_mod._alias_command(stored[0])
-    if m is None:
-        assert word is None, (res.stderr, word)
-        assert ALIAS_FORMS[form].startswith("!") or "bad alias.co string" in res.stderr, res.stderr
+    exp = re.search(r"alias expansion: co => (.*)", res.stderr)
+    ran = re.search(r"trace: built-in: git (\S+)", res.stderr)
+    word = gg_mod._alias_command(value)
+    if exp is not None and not value.lstrip(" \t\n\r").startswith("-"):
+        assert gg_mod._split_cmdline(value) == shlex.split(exp.group(1)), exp.group(0)
+    if value.startswith("!"):
+        assert word is None
+    elif ran is not None:
+        assert word == ran.group(1), (res.stderr, word)
+    elif res.returncode != 0 and ("changes environment variables" in res.stderr
+                                  or "unknown option" in res.stderr or "usage:" in res.stderr):
+        pass                                               # git runs nothing: a superset is safe
+    elif exp is not None:
+        first = shlex.split(exp.group(1))[0]
+        assert word == (first or None), (exp.group(0), word)
     else:
-        first = re.match(r"'([^']*)'|(\S+)", m.group(1))      # sq_quote_argv: quoted when needed
-        assert first is not None, m.group(0)
-        expected = first.group(1) if first.group(1) is not None else first.group(2)
-        assert word == (expected or None), (m.group(0), word)
+        assert word is None, (res.stderr, word)
+
+
+# ------------------------------------------------- help.autocorrect: what git runs [78]
+AUTOCORRECT_WORDS = ["chekout", "checkuot", "chckout", "swich", "swtich", "sw", "stsh", "stah",
+                     "merg", "mrege", "rebas", "rbase", "pul", "pulll", "cherry-pik", "cherrypick",
+                     "revrt", "rever", "chec", "stat", "statsu", "comit", "brnach", "difff", "lgo",
+                     "shwo", "co", "che", "re", "sta", "mer", "pu"]
+
+
+def _autocorrect_repo(gg: GG, tmp_path: Path) -> Path:
+    r = tmp_path / "r"
+    gg.git("init", "-q", str(r))
+    (r / "a").write_text("a\n")
+    gg.git("add", "a", cwd=r)
+    gg.git("commit", "-qm", "i", cwd=r)
+    return r
+
+
+def _ran_builtin(gg: GG, r: Path, *args: str) -> str | None:
+    import re
+    import subprocess
+    res = subprocess.run(["git", *args], cwd=r, env={**gg.env, "GIT_TRACE": "1"},
+                         stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace")
+    m = re.search(r"trace: built-in: git (\S+)", res.stderr)
+    return m.group(1) if m else None
+
+
+@pytest.mark.parametrize("word", AUTOCORRECT_WORDS)
+def test_autocorrect_target_as_git(gg: GG, tmp_path: Path, word: str) -> None:
+    """git as the oracle of help.autocorrect: with `immediate`, GIT_TRACE says
+    which builtin git runs for a mistyped word. When it is one of
+    ENTERS_NEW_GITLINKS, enters_new_gitlinks must say so (a superset: the
+    reverse is not required). The words run with no argument in a clean
+    repository: each command errors out or does nothing. [78]"""
+    r = _autocorrect_repo(gg, tmp_path)
+    ran = _ran_builtin(gg, r, "-c", "help.autocorrect=immediate", word)
+    if word == "chekout":
+        assert ran == "checkout", "the oracle itself"
+    cmd = gg_mod.CmdConfig()
+    cmd.autocorrect = True
+    if ran in gg_mod.ENTERS_NEW_GITLINKS:
+        assert gg_mod.enters_new_gitlinks([word], cmd), (word, ran)
+
+
+def test_autocorrect_to_an_alias_as_git(gg: GG, tmp_path: Path) -> None:
+    """[78] git's candidates include the aliases: `synk` corrects to the alias
+    `sync`, which runs `pull`. The aliases come from config_refs, as in
+    exec mode."""
+    r = _autocorrect_repo(gg, tmp_path)
+    gg.git("config", "alias.sync", "pull", cwd=r)
+    gg.git("config", "help.autocorrect", "immediate", cwd=r)
+    assert _ran_builtin(gg, r, "synk") == "pull"
+    cmd = gg_mod.CmdConfig()
+    gg_mod.config_refs(gg_mod.open_repo(gg_mod.find_root(r)), None, cmd)
+    assert cmd.autocorrect and cmd.aliases.get("sync") == {"pull"}
+    assert gg_mod.enters_new_gitlinks(["synk"], cmd)
+
+
+AUTOCORRECT_VALUES = [None, "", "never", "show", "0", "false", "no", "off", "FALSE", "Off",
+                      "true", "yes", "on", "1", "5", "-1", "immediate", "prompt", "Never", "00"]
+
+
+@pytest.mark.parametrize("value", AUTOCORRECT_VALUES)
+def test_autocorrect_values_as_git(gg: GG, tmp_path: Path, value: str | None) -> None:
+    """Which `help.autocorrect` values let git run `chekout` as `checkout`:
+    `_autocorrect_on` of the value as gitguard's parser reads it must be
+    true then, and false when git refuses — except `prompt`, which asks on a
+    terminal (this run has none), and a value git dies on (counted as on, a
+    superset). A bare key is git's true since 2.50 (parse_autocorrect); 2.47
+    dies on it, as on `true`. [78]"""
+    r = _autocorrect_repo(gg, tmp_path)
+    if value is None:
+        with open(r / ".git/config", "a") as f:
+            f.write("[help]\n\tautocorrect\n")
+    else:
+        gg.git("config", "help.autocorrect", value, cwd=r)
+    import subprocess
+    res = subprocess.run(["git", "chekout"], cwd=r, env=gg.env, stdin=subprocess.DEVNULL,
+                         capture_output=True, text=True, errors="replace")
+    ran = _ran_builtin(gg, r, "chekout") == "checkout"
+    parsed = [v for s, k, v in parse_git_config(r / ".git/config") if (s, k) == ("help", "autocorrect")]
+    on = gg_mod._autocorrect_on(parsed[-1])
+    if ran:
+        assert on, (value, parsed)
+    elif value != "prompt" and "fatal" not in res.stderr:
+        assert not on, (value, parsed, res.stderr)

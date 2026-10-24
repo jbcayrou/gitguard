@@ -589,3 +589,34 @@ def test_stash_pop_in_a_repository_with_a_submodule(gg: GG, repo: Path, subsrc: 
     r = gg.run("git", "stash", "pop", cwd=repo)
     assert r.rc == 0 and "modified:   f" in r.out, r.text
     assert not gg.check(repo).blocked
+
+
+def test_branch_edit_description_leaves_its_file(gg: GG, repo: Path) -> None:
+    """[83] `git branch --edit-description` leaves .git/EDIT_DESCRIPTION
+    behind (its template, rewritten at each edit): volatile. Setting a
+    description changes `.git/config`, a trust like any config change; a
+    later edit that keeps it is quiet."""
+    ed = "sh -c 'echo described > \"$1\"' --"
+    assert gg.git("-c", f"core.editor={ed}", "branch", "--edit-description", cwd=repo).rc == 0
+    gg.trust(repo)
+    (repo / ".git/EDIT_DESCRIPTION").write_text("an older template\n")
+    assert gg.git("-c", "core.editor=true", "branch", "--edit-description", cwd=repo).rc == 0
+    assert (repo / ".git/EDIT_DESCRIPTION").exists()
+    assert not gg.check(repo).blocked, gg.check(repo).text
+
+
+def test_sparse_checkout_patterns(gg: GG, repo: Path) -> None:
+    """[83] `git sparse-checkout set/add` rewrite .git/info/sparse-checkout:
+    volatile. Turning sparse checkout on changes `.git/config` (a trust)."""
+    for d in ("a", "b", "c"):
+        (repo / d).mkdir()
+        (repo / d / "f").write_text(d + "\n")
+    gg.git("add", "-A", cwd=repo)
+    gg.git("commit", "-qm", "dirs", cwd=repo)
+    assert gg.git("sparse-checkout", "set", "a", cwd=repo).rc == 0
+    gg.trust(repo)
+    assert gg.git("sparse-checkout", "set", "b", cwd=repo).rc == 0
+    assert gg.git("sparse-checkout", "add", "c", cwd=repo).rc == 0
+    assert not gg.check(repo).blocked, gg.check(repo).text
+    assert gg.git("sparse-checkout", "reapply", cwd=repo).rc == 0
+    assert not gg.check(repo).blocked

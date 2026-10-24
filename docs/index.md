@@ -87,7 +87,7 @@ core.hooksPath = .githooks
 : The directory the config names, with husky, lefthook or pre-commit inside it. A sandbox that can only write the tree rewrites those hooks without touching `.git`.
 
 remote.origin.url = ../other.git
-: A local remote: the config and hooks of the repository `push` enters, opened as git opens it (gitfile, `commondir`). `git push <path>` and `git archive --remote=<path>` to a repository no remote names are refused: make it a remote, trust, retry.
+: A local remote: the config and hooks of the repository `push` enters, opened as git opens it (gitfile, `commondir`). `git push <path>` and `git archive --remote=<path>` to a repository no remote names are refused: make it a remote, trust, retry. A remote is a name the config gives a url. Outside any repository, `git archive --remote=<path>` to a local repository is refused too: run `git -C <path> archive` instead.
 
 include.path  includeIf
 : Followed recursively to git's own depth of ten, each file hashed.
@@ -278,13 +278,13 @@ When your editor ran git, not you
 - It cannot close the race between its check and git's execution if the sandbox is still writing. Stop the sandbox before running git on the host.
 - `restore` only cleans the pivot vector. Objects, commits and tree files the sandbox dropped stay there for you to inspect, and so is a watched file outside the repository: restore never writes there.
 - Hooks tracked *in the tree* under `core.hooksPath` (husky, `.githooks`) are watched, but a `checkout`, `merge` or `pull` of a commit the sandbox created rewrites them after the check, and git runs the new version in the same command. This is accepted, not fixed: versioned hooks are a decision to run what the repository contains, like `make` after a pull. `gitguard trust` warns when that layout is in place; review incoming changes to those files, or keep the hooks outside the tree with a global `core.hooksPath`.
-- `checkout`, `switch` and `stash` (also through an alias) run with `-c diff.ignoreSubmodules=dirty`: a commit the sandbox created can bring a gitlink to a repository it planted in the tree, and the summary those commands print would otherwise run `git status` inside it, with its config, in the same command. Their summary still shows a submodule with new commits, no longer one whose own tree is merely dirty; `status` and `diff` are unchanged, and the next command on the repository is refused.
+- `checkout`, `switch`, `stash`, `merge`, `rebase`, `pull`, `cherry-pick` and `revert` (also through an alias, a shell alias, or a typo git autocorrects) run with `-c diff.ignoreSubmodules=dirty`: a commit the sandbox created can bring a gitlink to a repository it planted in the tree, and the summary those commands print would otherwise run `git status` inside it, with its config, in the same command. Their summary still shows a submodule with new commits, no longer one whose own tree is merely dirty; `status` and `diff` are unchanged, and the next command on the repository is refused.
 - A trusted hook that calls a program by name depends on your `PATH`. If a `PATH` directory sits in the mounted volume, that is out of reach.
 - The question needs stdout and stderr on a terminal. A prompt's `$(git …)` or a `git log | head` on a changed repository is refused, not asked: rerun without the pipe, or `gitguard trust`.
 - No desktop notification without a session (ssh, cron, systemd). The pending record is still written and the wait still times out; check `gitguard pending` by hand.
 - Bare repositories are refused, not managed. `core.splitIndex` is refused: the gitlinks it needs to read live in `sharedindex.*`.
 - Parity with git is checked against git itself in `tests/test_git_parity.py`; a gap found there is marked as an expected failure until fixed, and none is open at the moment. Deliberate, fail-closed divergences: a NUL byte or a line git dies on in a config file is refused.
 
-The suite replays a catalogue of over seventy bypasses and false positives found over twelve adversarial review passes, and requires a refusal for each one while ordinary git workflows stay silent. The catalogue, the review method and the design notes are in the repository.
+The suite replays a catalogue of over eighty bypasses and false positives found over thirteen adversarial review passes, and requires a refusal for each one while ordinary git workflows stay silent. The catalogue, the review method and the design notes are in the repository.
 
 </section>

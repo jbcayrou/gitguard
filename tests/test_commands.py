@@ -783,14 +783,37 @@ def _two_branches(gg: GG, tmp_path: Path) -> Path:
     return r
 
 
+# form: (the user's command, global config, the user has local changes)
 GITLINK_BRINGERS = {
-    "checkout": (["checkout", "main"], []),
-    "switch": (["switch", "main"], []),
-    "alias_global": (["co", "main"], ["alias.co=checkout"]),
-    "alias_quoted": (["co", "main"], ["alias.co='switch' --no-guess"]),
-    "alias_chain": (["c", "main"], ["alias.c=co", "alias.co=checkout"]),
-    "alias_before_global_option": (["--no-pager", "co", "main"], ["alias.co=checkout"]),
+    "checkout": (["checkout", "main"], [], False),
+    "switch": (["switch", "main"], [], False),
+    "alias_global": (["co", "main"], ["alias.co=checkout"], False),
+    "alias_quoted": (["co", "main"], ["alias.co='switch' --no-guess"], False),
+    "alias_chain": (["c", "main"], ["alias.c=co", "alias.co=checkout"], False),
+    "alias_before_global_option": (["--no-pager", "co", "main"], ["alias.co=checkout"], False),
+    # [77] other commands that bring the gitlink and enter it
+    "merge_autostash": (["merge", "main"], ["merge.autoStash=true"], True),
+    "rebase_autostash": (["rebase", "main"], ["rebase.autoStash=true"], True),
+    "pull_rebase_autostash": (["pull", ".", "main"], ["pull.rebase=true", "rebase.autoStash=true"], True),
+    "pull_merge_autostash": (["pull", "--autostash", "--no-rebase", ".", "main"], [], True),
+    "cherry_pick_edit": (["cherry-pick", "-e", "main"], ["core.editor=true"], False),
+    # [78] git corrects the word
+    "autocorrect_typo": (["chekout", "main"], ["help.autocorrect=immediate"], False),
+    "autocorrect_delay": (["swich", "main"], ["help.autocorrect=1"], False),
+    # [79] the alias's head is a global option, or a shell alias
+    "alias_paginate": (["co", "main"], ["alias.co=-p checkout"], False),
+    "alias_config": (["co", "main"], ["alias.co=-c color.ui=auto checkout"], False),
+    "alias_config_env": (["co", "main"], ["alias.co=--config-env=core.pager=HOME checkout"], False),
+    "alias_shell": (["co", "main"], ["alias.co=!git checkout"], False),
+    "alias_shell_dashed": (["co", "main"], ["alias.co=!git-switch"], False),
+    "alias_shell_function": (["co", "main"], ['alias.co=!f() { git co2 "$@"; }; f', "alias.co2=switch"],
+                             False),
 }
+
+
+def _set_global(gg: GG, r: Path, config: list) -> None:
+    for kv in config:
+        gg.git("config", "--global", *kv.split("=", 1), cwd=r)
 
 
 @pytest.mark.parametrize("form", list(GITLINK_BRINGERS))
@@ -804,22 +827,43 @@ def test_checkout_brings_a_gitlink_to_a_planted_repository(gg: GG, tmp_path: Pat
     fsmonitor in the same command. Fix: these commands run with
     `-c diff.ignoreSubmodules=dirty`, which drops the `git status` in the
     submodule; the gitlink is written, the next command is refused. Also
-    through an alias, global or `-c`, quoted, chained."""
+    through an alias, global or `-c`, quoted, chained. [77] merge, rebase,
+    pull with an autostash, cherry-pick with the editor. [78] a word git
+    autocorrects. [79] an alias whose head is `-p`/`-c`/`--config-env`, a
+    shell alias. The positive control below runs every form with the real
+    git."""
     mark = tmp_path / "RAN"
     r = _two_branches(gg, tmp_path)
-    cmd, config = GITLINK_BRINGERS[form]
-    for kv in config:
-        gg.git("config", "--global", *kv.split("=", 1), cwd=r)
+    cmd, config, dirty = GITLINK_BRINGERS[form]
+    _set_global(gg, r, config)
     gg.trust(r)
     _plant_gitlink(gg, r, mark)
     assert not mark.exists() and not gg.check(r).blocked
+    if dirty:
+        (r / "a").write_text("local change\n")   # the autostash needs one
     # the user
     res = gg.run("git", *cmd, cwd=r)
     assert res.rc == 0, res.text
-    assert not mark.exists(), "the planted repository's fsmonitor ran during the checkout"
-    assert gg.git("rev-parse", "--abbrev-ref", "HEAD", cwd=r).out.strip() == "main"
-    # the gitlink is in the index now: the next command is refused
+    assert not mark.exists(), "the planted repository's fsmonitor ran during the command"
+    # the command did bring the gitlink, and the next command is refused
+    assert gg.git("ls-files", "-s", "vendor/x", cwd=r).out.startswith("160000"), form
     assert gg.check(r).blocked
+
+
+@pytest.mark.parametrize("form", list(GITLINK_BRINGERS))
+def test_gitlink_control_real_git_runs_it(gg: GG, tmp_path: Path, form: str) -> None:
+    """[66] [77] [78] [79] positive control of the test above, form by form:
+    the real git, same config, same planting, does run the planted
+    fsmonitor."""
+    mark = tmp_path / "RAN"
+    r = _two_branches(gg, tmp_path)
+    cmd, config, dirty = GITLINK_BRINGERS[form]
+    _set_global(gg, r, config)
+    _plant_gitlink(gg, r, mark)
+    if dirty:
+        (r / "a").write_text("local change\n")
+    gg.git(*cmd, cwd=r)
+    assert mark.exists(), f"git no longer enters the nested repository with {form}: may be moot"
 
 
 def test_alias_given_on_the_command_line_is_followed(gg: GG, tmp_path: Path) -> None:
@@ -849,15 +893,13 @@ def test_stash_pop_brings_a_gitlink_to_a_planted_repository(gg: GG, tmp_path: Pa
     assert gg.check(r).blocked
 
 
-@pytest.mark.parametrize("ref, cmd", [("refs/heads/main", ["checkout", "main"]),
-                                      ("refs/stash", ["stash", "pop"])])
-def test_gitlink_control_real_git_runs_it(gg: GG, tmp_path: Path, ref: str, cmd: list) -> None:
-    """[66] positive control of the tests above, with the real git and the
-    same planting: git does run the planted fsmonitor."""
+def test_stash_gitlink_control_real_git_runs_it(gg: GG, tmp_path: Path) -> None:
+    """[66] positive control of the stash pop test: the real git does run the
+    planted fsmonitor."""
     mark = tmp_path / "RAN"
     r = _two_branches(gg, tmp_path)
-    _plant_gitlink(gg, r, mark, ref=ref)
-    gg.git(*cmd, cwd=r)
+    _plant_gitlink(gg, r, mark, ref="refs/stash")
+    gg.git("stash", "pop", cwd=r)
     assert mark.exists(), "git no longer enters the nested repository: [66] may be moot"
 
 
@@ -1180,6 +1222,82 @@ def test_archive_remote_to_a_path_is_checked(gg: GG, repo: Path, tmp_path: Path)
     assert r.blocked and "[70]" in r.err and not mark.exists(), r.text
     gg.git("archive", "--remote=../sib", "--format=tgz", "-o", os.devnull, "HEAD", cwd=repo)
     assert mark.exists(), "control: git runs it"
+
+
+def test_archive_remote_outside_any_repository_is_checked(gg: GG, tmp_path: Path) -> None:
+    """[81] the same `git archive --remote=../sib` from a directory that is
+    no repository: gitguard found no root and ran git unchecked, and git
+    still started upload-archive in `sib`, which ran its tar.tgz.command."""
+    mark = tmp_path / "RAN"
+    _archive_sibling(gg, tmp_path)
+    out = tmp_path / "elsewhere"
+    out.mkdir()
+    r = gg.run("git", "archive", "--remote=../sib", "--format=tgz", "-o", os.devnull, "HEAD", cwd=out)
+    assert r.blocked and "[81]" in r.err and "git -C ../sib archive" in r.err and not mark.exists(), r.text
+    r = gg.run("git", "-C", str(out), "archive", "--remote", "../sib", "--format=tgz", "-o",
+               os.devnull, "HEAD", cwd=tmp_path)
+    assert r.blocked and "[81]" in r.err and not mark.exists(), r.text
+    gg.git("archive", "--remote=../sib", "--format=tgz", "-o", os.devnull, "HEAD", cwd=out)
+    assert mark.exists(), "control: git runs it"
+
+
+def test_archive_outside_any_repository_allowed_cases(gg: GG, tmp_path: Path) -> None:
+    """[81] outside a repository, a destination that is no local repository
+    and a plain command are git's business: no refusal from gitguard."""
+    out = tmp_path / "elsewhere"
+    out.mkdir()
+    r = gg.run("git", "archive", "--remote=../nothing-here", "--format=tar", "HEAD", cwd=out)
+    assert "[81]" not in r.err and "gitguard" not in r.err, r.text
+    r = gg.run("git", "--version", cwd=out)
+    assert r.rc == 0, r.text
+
+
+def test_push_to_a_remote_section_without_url_is_checked(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[82] a `[remote "origin"]` section without a url (a global
+    `remote.origin.prune = true`) made `origin` a configured remote for
+    gitguard; git, finding no url, takes `origin` as a path: `<root>/origin`,
+    a bare repository the sandbox planted, whose pre-receive ran."""
+    mark = tmp_path / "RAN"
+    gg.git("config", "--global", "remote.origin.prune", "true")
+    gg.trust(repo)
+    hub = repo / "origin"
+    gg.git("init", "-q", "--bare", str(hub))
+    write_exec(hub / "hooks/pre-receive", f"#!/bin/sh\ntouch '{mark}'\n")
+    r = gg.run("git", "push", "-q", "origin", "main", cwd=repo)
+    assert r.blocked and "[62]" in r.err and not mark.exists(), r.text
+    gg.git("push", "-q", "origin", "main", cwd=repo)
+    assert mark.exists(), "control: git pushes to the path"
+
+
+def test_push_to_a_remote_with_url_stays_allowed(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[82] control: a remote whose url the trusted config gives is still a
+    remote — its config and hooks are watched ([45]), the push is not refused."""
+    hub = tmp_path / "vol-hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    gg.git("remote", "add", "origin", str(hub), cwd=repo)
+    gg.git("config", "remote.origin.prune", "true", cwd=repo)
+    gg.trust(repo)
+    r = gg.run("git", "push", "-q", "origin", "main", cwd=repo)
+    assert r.rc == 0 and not r.blocked, r.text
+
+
+def test_fsck_lost_found_writes_through_a_planted_symlink(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[83] positive control for keeping lost-found/ watched: with the real
+    git, `fsck --lost-found` writes a dangling blob's content through a
+    symlink planted at lost-found/other/<sha> — here onto post-commit, which
+    the next commit runs."""
+    import subprocess
+    mark = tmp_path / "RAN"
+    write_exec(repo / ".git/hooks/post-commit", "#!/bin/sh\nexit 0\n")
+    sha = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, env=gg.env,
+                         input=f"#!/bin/sh\ntouch '{mark}'\n", capture_output=True, text=True,
+                         check=True).stdout.strip()
+    (repo / ".git/lost-found/other").mkdir(parents=True)
+    (repo / ".git/lost-found/other" / sha).symlink_to("../../hooks/post-commit")
+    assert gg.check(repo).blocked, "the planted link must be a new entry"
+    gg.git("fsck", "--lost-found", cwd=repo)
+    gg.git("commit", "-q", "--allow-empty", "-m", "x", cwd=repo)
+    assert mark.exists(), "git no longer writes through the link: lost-found could become volatile"
 
 
 # How cmd_archive takes --remote (PARSE_OPT_KEEP_ALL), checked on git 2.47
