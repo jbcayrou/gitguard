@@ -160,15 +160,31 @@ def _options_from_help(text: str) -> tuple[dict[str, bool], set[str]]:
     return longs, shorts
 
 
+# Options of the tables that an older git lacks (`git clone -h` has no
+# `--revision` before 2.49): the table may hold them, this git need not.
+NEWER_OPTIONS = {"clone": {"--revision"}, "init": set()}
+
+
 @pytest.mark.discovery
 @pytest.mark.parametrize("cmd", ["clone", "init"])
 def test_new_repo_options_match_git(cmd: str) -> None:
-    """[98] NEW_REPO_OPTIONS is git's own list: same long options, same
-    ones taking a value, same short ones with a value. A new option of a
-    future git fails here; its prefixes would otherwise be misread."""
+    """[98] NEW_REPO_OPTIONS is git's own list: every option of this git is
+    in the table with the same arity (a new option of a future git fails
+    here; its prefixes would otherwise be misread), and the table holds
+    nothing this git lacks but NEWER_OPTIONS. A `--no-x` the help lists on
+    its own (`--no-tags`, git ≤ 2.48) is the negation of the table's `--x`,
+    which is how _long_option reads it."""
     want_long, want_short = _options_from_help(_help(cmd, "-h"))
     longs, shorts = gg_mod.NEW_REPO_OPTIONS[cmd]
-    assert longs == want_long
+    for name in list(want_long):
+        base = "--" + name[5:]
+        if name.startswith("--no-") and name not in longs and base in longs:
+            assert gg_mod._long_option(name, longs) == (base, True)
+            want_long[base] = want_long.pop(name)
+    for name, takes in want_long.items():
+        assert name in longs, name
+        assert longs[name] == takes, name
+    assert set(longs) - set(want_long) <= NEWER_OPTIONS[cmd], sorted(set(longs) - set(want_long))
     assert set(shorts) == want_short
 
 
