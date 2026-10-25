@@ -180,7 +180,16 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    `--work-tree`/`GIT_WORK_TREE` alone leaves discovery to the cwd ([18])
    and then names the tree, before `core.worktree`, as
    setup_explicit_git_dir does; the discovered tree was checked instead
-   ([72]). A missing one is refused.
+   ([72]). A missing one is refused. A `GIT_DIR` that is no git directory
+   (missing, or a directory without a valid HEAD, objects and refs) leaves
+   git outside any repository, as setup_explicit_git_dir does: nothing is
+   checked, no local config exists for git. The global option `--bare` is
+   a `GIT_DIR` too: git sets it to the cwd as it is at that point (after the
+   `-C` before it), unless one is already set, and a `--git-dir` overwrites
+   it; taken for an inert flag, gitguard checked the `.git` of the cwd while
+   git read a `config` laid out in the tree's root ([97]). Every global flag
+   gitguard lets through is checked against git's choice of gitdir
+   (`tests/test_claims.py`).
    `GIT_COMMON_DIR` enters the recognition as it enters git's: `objects`
    and `refs` are looked up there, so a lone `HEAD` makes any directory a
    gitdir — refused as bare ([54]). Without them, a `core.worktree` in the config (common `config`, then
@@ -214,8 +223,22 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    / `strip()` made gitguard check a repository git never opens ([53],
    `test_gitfile_read_like_git`, `test_commondir_read_like_git`).
 3. **`check_structure`** (refuses before anything else):
-   - `core.splitIndex` (`sharedindex.*` present): explicit refusal, the
-     gitlinks live in a file `index_gitlinks` does not read ([31]).
+   - `core.splitIndex` (`sharedindex.*` present, or the index's `link`
+     extension): explicit refusal, the gitlinks live in a file
+     `index_gitlinks` does not read ([31]). The parser applies git's own
+     rule to the index extensions: a signature starting with a lowercase
+     letter is required, git dies on one it does not know, because it
+     changes what the entries mean — so does gitguard
+     (`KNOWN_REQUIRED_EXTENSIONS`: `sdir` only). A future one is a refusal,
+     not a blind spot.
+   - **Sparse index** (`sdir`): a directory outside the cone is one entry,
+     mode 040000, naming a tree whose gitlinks the parser cannot see
+     (objects are not read). git expands that entry once the directory is
+     on disk; the sandbox wrote the tree, a sparse index and a repository
+     there, and `git status` ran its fsmonitor ([87]). A sparse directory
+     present on disk is walked for a nested `.git` (`index_nested`), the
+     same rule as at a gitlink; an absent one, the normal state, costs
+     nothing.
    - **`Repo.gitfiles`** = nested `.git` declared in `.gitmodules`
      (`gitmodules_gits`) ∪ targeted by an **index gitlink** (`index_gitlinks`,
      a DIRC v2/3/4 parser, never calling git; a gitlink names its directory
@@ -286,6 +309,24 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
      link, whose hash holds its target string and the content it reaches,
      so repointing it or a link behind it is seen. A link to a directory
      stays refused, its content would escape the fingerprint.
+   - a watched file must be its **only name** (`_hard_link`): git writes
+     many files of the gitdir in place, by name — `COMMIT_EDITMSG`,
+     `MERGE_MSG`, `FETCH_HEAD`, the sequencer's files, a reflog it appends
+     to — and they are volatile; `.git/COMMIT_EDITMSG` hard-linked to
+     `hooks/commit-msg` passed the check with the trusted bytes, then
+     `commit --amend` wrote the sandbox's message into the hook and ran it
+     ([88]). A symlink there was refused; a hard link is a regular file to
+     lstat. Checked inside the tree, the gitdir and the common dir only:
+     the sandbox can only `link()` what its mount holds, so both names of
+     a link it made lie there; a program the global config names elsewhere
+     (Homebrew ships hard-linked binaries, on the same volume as `$HOME`
+     on macOS) is left alone, nothing the sandbox writes shares its inode.
+   - every file of the repository git reads (config, gitfile, `commondir`,
+     HEAD, index, todo files) goes through `read_file`: opened
+     `O_NONBLOCK`, anything but a regular file refused at once (a FIFO, a
+     socket, a device, a symlink to one; `/dev/null` reads empty). A FIFO in
+     place of `.git/config` blocked gitguard for ever — fail closed, but a
+     denial of service that pushes the user toward the real git ([99]).
    - an unreadable directory makes gitguard **refuse** (`os.walk(onerror=…)`)
      instead of being seen as empty. A directory that **vanished** during the
      walk (`FileNotFoundError`) is ignored: it holds nothing any more.
@@ -398,10 +439,18 @@ is **opened as receive-pack opens it**, a port of `enter_repo`: `<p>/.git`,
 without the environment (git clears it for the transport); the config and
 hooks/ are the common dir's, its relative values (`core.hooksPath =
 .husky/_`) resolve against its gitdir, where enter_repo chdirs ([67]) — and
-so do the DIR_KEYS values of the global and system config, which git reads
-in the remote too, and in every submodule's tree; the environment's and
-`-c`'s in the submodules only, where git carries GIT_CONFIG_PARAMETERS
-([68]) — a
+so do the values of the global and system config, which git reads in the
+remote too, and in every submodule's tree; the environment's and `-c`'s in
+the submodules only, where git carries GIT_CONFIG_PARAMETERS ([68]). Every
+key, not the DIR_KEYS alone: a global `hook.<n>.command = ./scripts/pc.sh`
+(git 2.54) ran `sub/scripts/pc.sh` during `submodule update` ([92]). Read
+again there, a token counts only as an explicit relative path (`./x`,
+`scripts/x`): a bare word is run from the PATH, an absolute one was seen
+at the root, and every word of the global config (`user.name = t`) matched
+a file of each submodule. Not covered: a bare-word *argument* of a global
+program (`sh pc.sh`) in a submodule, the [71]/[74] boundary; aliases are
+not read again (git runs one where the user types it, and a git run from a
+submodule is checked with it as root) — a
 `file://` URL is read as parse_connect_url reads it — percent-decoded
 whole, the host part dropped (`file://host/p`, `file://[a/b]/p`) ([69]) — and
 `remote.pushDefault`, `branch.<b>.pushRemote` and `branch.<b>.remote` are
@@ -480,7 +529,25 @@ relative `include.path` from there is ignored, as git refuses it. The `-c` and
 `--config-env` an **alias** carries (`ci = -c core.hooksPath=.githooks
 commit`) are that config too: git applies them on every run of the alias,
 so they go through the same reading, from whichever file defines the alias
-([80]).
+([80]), in either form git reads: `[alias] ci = …` or, since git 2.54,
+`[alias "ci"] command = …` ([90]).
+
+**How a value names a path, as git reads it.** A pathname value (git's
+`git_config_pathname`: `core.hooksPath`, `init.templateDir`…) may start
+with `:(optional)` (git 2.52): the path, the variable unset when it does
+not exist; exactly that prefix, once, case-sensitive — `:(Optional)x` is a
+path. gitguard watched `<root>/:(optional).githooks` ([91]). Not for
+`include.path`, which git opens as written. A relative `include.path`
+inside an included file resolves against that file **as git opened it**:
+through a symlink, the link's directory, not the target's ([94]); the files
+are queued as opened, canonicalised only to be hashed. One file is read
+once per (file, base, origin), not once: a `~/team.gitconfig` included by
+the superproject's config and a submodule's has its relative values
+resolved in each, and one included by the local and the global config
+keeps its global origin ([93]). A token is a candidate after each letter
+of a leading short option too (`ssh -F./c`, `-vF./c`: `-v`, then `-F`
+holding the rest): the whole word was dropped and ssh read a file nobody
+watched ([96]).
 
 ## Display and sanitization
 
@@ -605,6 +672,13 @@ basename without `.git`). After git succeeds, `save_trust` is called
   sandbox can write. (clone's own `-c` is applied after the template: no
   effect, verified with git 2.50);
 - `--bare`, `--mirror`, `--separate-git-dir`.
+The options are read as git's parse-options reads them (`NEW_REPO_OPTIONS`,
+`_long_option`): any unique prefix of a long option is that option, `--no-`
+forms negate, a short cluster ends at its first letter taking a value.
+`--templ=<dir>` copied the template's hooks and the new repository was
+trusted with them ([98]); anything that may stand for `--template`, an
+ambiguous prefix included, now counts as it. The table is held to `git
+clone -h` and `git init -h` of the git under test (`tests/test_claims.py`).
 With a template we warn and leave a manual `gitguard trust`; bare, mirror
 and `--separate-git-dir` are silently left alone (a bare repository cannot
 be trusted at all).
@@ -738,9 +812,13 @@ root (= the user's uid) plants hook, config and include in one go; as uid
 ## Nested repositories: the gitlink is the barrier, no walk of the tree
 
 gitguard never walks the work tree looking for nested `.git`. git opens a
-nested repository only when a gitlink references it in the index, which
-gitguard always reads (`index_gitlinks`), and the `git add -A` that creates
-this gitlink executes nothing by itself — verified for `add -A`, `add .`,
+nested repository through a gitlink: those of the index, which gitguard
+always reads (`index_gitlinks`; a sparse directory of a sparse index is
+looked at on disk, [87]), and those a command brings from a tree (below:
+[66], [77]–[79], [86]; [89] still open). This section first said "only
+once a gitlink references it in the index": that premise was wrong seven
+times, so read every "never" here as a claim to test. The `git add -A`
+that creates an index gitlink executes nothing by itself — verified for `add -A`, `add .`,
 `add <dir>`, `stash -u/-a`, `commit -i`, `status`, `diff`, `clean`, `grep`,
 `ls-files -o` (git 2.50). This assumption is **tested**:
 `tests/test_nested.py::test_first_add_does_not_execute` (with a positive
@@ -811,18 +889,25 @@ open: every command it missed was a bypass ([77] came right after [66]),
 and a future git can add an autostash or a status summary to another
 command. Since 2026-10-24 the default is inverted: the switch is on
 unless the command is known to be harmless *and* to show the option's
-effect. `SWITCH_EXEMPT` = `status`, `diff`, `commit`, `config`, `var`:
+effect. `SWITCH_EXEMPT` = `status`, `diff`, `config`, `var`:
 probed on git 2.50 with a dirty submodule, every form of each command,
-with and without the option — status (long, `--short`, `--porcelain`),
-diff (`--submodule=short/log` too) and commit (`--dry-run`, the message
-template) report the submodule's dirty tree, `config --list`, `config
-<key>` and `var -l` list the command-line config; `submodule summary` and
-`status`, `describe --dirty`, `show`, `stash`, `add`, `ls-files` and the
-diff plumbing are unchanged. None of the five writes a gitlink from a tree
-(commit writes the index from the work tree). A command missing from the
-exemption costs a line of output, never a bypass; a wrong exemption is a
-five-entry list to audit. What changes for the user: `status`, `diff`,
-`commit` and `config` behave as before, directly or through an alias every
+with and without the option — status (long, `--short`, `--porcelain`) and
+diff (`--submodule=short/log` too) report the submodule's dirty tree,
+`config --list`, `config <key>` and `var -l` list the command-line config;
+`submodule summary` and `status`, `describe --dirty`, `show`, `stash`,
+`add`, `ls-files` and the diff plumbing are unchanged. None of the four
+writes a gitlink into an index. `commit` was exempt too, "it writes the
+index from the work tree" — which is how a gitlink gets in ([86], review
+of 2026-10-24): `commit -a`, a pathspec or `-i` stage a tracked file the
+sandbox replaced by a repository (typechange 100644 → 160000), a partial
+commit (`commit <path>`, `-o`, `--amend <path>`) resets a temporary index
+from a HEAD the sandbox moved to a commit with a gitlink, and the message
+template (or `--dry-run`, `-v`) then ran `git status` in it. Each
+exemption is now a claim with a test: every [86] form against each exempt
+command (`tests/test_commands.py`). A command missing from the exemption
+costs a line of output, never a bypass; a wrong exemption is a bypass.
+What changes for the user: `status`, `diff` and `config` behave as
+before, directly or through an alias every
 definition of which resolves to one of them; every other command, a
 shell alias (`!git status`) and a word gitguard does not know (a typo
 help.autocorrect fixes, an alias it cannot resolve) get the switch — the
@@ -877,7 +962,8 @@ into the tree was not watched.
 
 ## Tests
 
-**`python3 -m pytest`** (~800 tests, expected failures [44], [71], [74] — accepted limitations —, ~130 s),
+**`python3 -m pytest`** (~1060 tests, expected failures [44], [71], [74] — accepted limitations — and
+the open [89], [95]; ~180 s, ~40 s with `-n 8` on the command line),
 to run before any change:
 
 - `tests/attacks/` — **the attack corpus**, one module per family (`gitdir`,
@@ -928,6 +1014,14 @@ to run before any change:
   are marked `xfail(strict=True)`: the suite stays green, a fix makes the
   test XPASS so the mark gets removed and the scenario promoted to
   `tests/attacks/`. See "Known limitations" for the list.
+- `tests/test_claims.py` — **gitguard's closed lists of claims about git,
+  held to git**: each global flag of `GLOBAL_FLAGS` leaves the gitdir where
+  git puts it ([97]), every form of each `SWITCH_EXEMPT` command leaves a
+  gitlink brought from a tree alone ([86]), `NEW_REPO_OPTIONS` is `git
+  clone -h` / `git init -h` ([98]), the indexes git writes carry no
+  required extension the parser refuses ([87]). Each of these lists fell
+  in a review because the tests checked the known attacks, not the claim;
+  a list added to gitguard.py gets its test here.
 - `tests/conftest.py` — fixtures: `gg` (isolated environment: HOME, state,
   global config in `tmp_path`), `repo` (clean trusted repository), `subsrc`.
   The scenarios are built with `REAL_GIT`, the first `git` (or `git.real`)
@@ -962,12 +1056,14 @@ Rule: any new vector or false positive discovered must first become a test.
 
 ## Adversarial review playbook
 
-gitguard has been through thirteen adversarial review passes (the numbered
-catalogue in `tests/attacks/__init__.py` is their output: 83 bypasses and
+gitguard has been through fourteen adversarial review passes (the numbered
+catalogue in `tests/attacks/__init__.py` is their output: 99 bypasses and
 false positives, two of them RCEs found after the tool was believed solid,
 [58]–[65] from the tenth and eleventh, replayed and fixed on 2026-10-22;
 [66]–[70], [72], [73], [75], [76] from the twelfth, fixed on 2026-10-23;
-[77]–[83] from the thirteenth, fixed on 2026-10-24;
+[77]–[83] from the thirteenth, fixed on 2026-10-24; [84], [85] from a
+design review; [86]–[99] from the fourteenth (six agents, 2026-10-24),
+fixed on 2026-10-25 but [89] and [95], open;
 [44], [71] and [74] are accepted limitations, see "Known limitations"; the ninth pass was the
 promotion of the git-parity `xfail`s [46]–[50]).
 The method that worked, for the next pass — by a human or by agents that know
@@ -1036,7 +1132,13 @@ exclusion rules, not the catalogue):
   merge, rebase, stash, bisect, gc, maintenance, worktrees, submodules,
   LFS, hooksPath managers); a tool that cries wolf gets `trust`ed blindly.
 
-**Lessons distilled.** Mirror git's discovery order exactly rather than
+**Lessons distilled.** A closed list in gitguard.py ("these flags are
+inert", "these commands never enter a gitlink", "these are clone's
+options") is a claim about git: give it a test with git as the oracle
+(`tests/test_claims.py`) when it is written — [86], [97] and [98] were
+each a list entry nobody checked. A principle fixed for one key or one
+case ([68] for DIR_KEYS) is a bypass for the next ([92], [93]): apply it
+to the unit it is about (the file, its base, its origin). Mirror git's discovery order exactly rather than
 approximating it; treat every exclusion as a potential blind spot and
 cross-check the code paths that assume "already fingerprinted"; anchor
 exclusions to a position, never to a bare name; hash what a link designates,
@@ -1133,6 +1235,19 @@ content; fail closed on anything the parser cannot make sense of.
   the sh readings are not extended for further variants of this shape
   unless a review shows a realistic one.** [67]–[70], [72], [73], [75],
   [76] from the same review are fixed.
+- **Open [89]** (review of 2026-10-24): the submodule content diff. With
+  `diff.submodule = diff` (global) or `--submodule=diff`, `git show`, `log
+  -p` and `diff <rev> <rev>` of a commit bringing a gitlink to a repository
+  planted in the tree run `git diff` inside it, honouring its config
+  (`diff.external`). The switch only drops the dirty-tree probe; the
+  command-line option outranks any `-c`. Needs that setting or option from
+  the user. xfail record: `test_submodule_content_diff_enters_a_planted_repository`.
+- **Open [95]**, the [44] boundary for config: a tracked `.gitconfig` the
+  trusted `.git/config` includes (`include.path = ../.gitconfig`). The
+  sandbox commits a new version and moves a branch; `git merge` checks it
+  out, then its `git maintenance run --auto` reads it. Decision pending:
+  an accepted limitation with a `trust` warning, as [44]. xfail record:
+  `test_merge_checks_out_a_tracked_include_then_reads_it`.
 - `git --work-tree=<other> …` changes the set of hooks git runs, so the
   fingerprint differs from the repository's own tree ([72]): the tree is
   blessed with `GIT_WORK_TREE=<other> gitguard trust` (same state key),

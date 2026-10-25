@@ -116,9 +116,10 @@ NOTIFY_SEND = "/usr/bin/notify-send"     # absolute: a PATH entry may live in th
 OSASCRIPT = "/usr/bin/osascript"
 INCLUDE_DEPTH = 10      # git: MAX_INCLUDE_DEPTH = 10
 # No walk of the work tree looking for nested `.git`: git opens a nested
-# repository only once a gitlink references it in the index, which is read
-# at every command (`index_gitlinks`), and the `git add -A` that creates the
-# gitlink executes nothing by itself (tests/nested_git_is_a_threat.sh,
+# repository through a gitlink — of the index, read at every command
+# (`index_gitlinks`, sparse directories included [87]), or brought by the
+# command from a tree, which the switch covers ([66], [86]; [89] open) —
+# and the `git add -A` that creates an index gitlink executes nothing by itself (tests/nested_git_is_a_threat.sh,
 # test_first_add_does_not_execute). The command that FOLLOWS the `add` is
 # refused. A walk (`GITGUARD_SCAN_TREE`, removed 2026-10-18) only closed the
 # window between that `add` and the next wrapped command — a window only a
@@ -437,6 +438,46 @@ def _parse_config_text(text: str, where: str) -> list[tuple[str, str, str]]:
     raise Refuse(f"{where}: bad config line {src.line - (1 if src.eof else 0)} (git refuses it too)")
 
 
+def read_file(p: Path) -> bytes:
+    """The bytes of a file of the repository that git reads (config, gitfile,
+    commondir, index, todo files…), never blocking. Opened O_NONBLOCK, then
+    fstat: a FIFO in place of `.git/config` blocked gitguard in read() for
+    ever — fail closed, but a denial of service that pushes the user toward
+    the real git — so anything but a regular file is refused at once (a
+    FIFO, a socket, a device, a symlink to one). /dev/null reads empty, as
+    for git (`GIT_CONFIG_GLOBAL=/dev/null`). A directory or a missing file
+    raises the OSError read_bytes() raised. [99]"""
+    fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if stat.S_ISDIR(st.st_mode):
+            raise IsADirectoryError(f"{p}: is a directory")
+        if not stat.S_ISREG(st.st_mode):
+            if stat.S_ISCHR(st.st_mode) and st.st_rdev == os.stat(os.devnull).st_rdev:
+                return b""
+            raise Refuse(f"{p} is not a regular file (a FIFO, a socket or a device): git "
+                         f"would read it, gitguard cannot check it without blocking")
+        chunks = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def is_file(p: Path) -> bool:
+    """`p.is_file()` for a file git reads: a FIFO, a socket or a device there
+    is refused rather than skipped (git would read it, read_file). [99]"""
+    try:
+        st = p.stat()
+    except OSError:
+        return False
+    if stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode):
+        return stat.S_ISREG(st.st_mode)
+    read_file(p)                     # refuses; /dev/null: nothing to read
+    return False
+
+
 def parse_git_config(path: Path) -> list[tuple[str, str, str]]:
     """Return [(section, key, value)], section lower-cased with its subsection
     ("includeIf.gitdir:x"), key lower-cased, exactly as git reads them. Never
@@ -446,7 +487,7 @@ def parse_git_config(path: Path) -> list[tuple[str, str, str]]:
     a lone CR into a newline, where git sees whitespace inside the value
     (`hooksPath = .githooks<CR>x = y` is one value for git). [52]"""
     try:
-        text = path.read_bytes().decode(errors="surrogateescape")
+        text = read_file(path).decode(errors="surrogateescape")
     except OSError:
         return []
     if "\0" in text:
@@ -520,11 +561,8 @@ class Repo:
         those referenced by an index gitlink, wherever they are
         (`node_modules/pkg` included). [6] [14] [24]"""
         out = set(gitmodules_gits(self.root))
-        for rel in index_gitlinks(self.index, Path(str(self.key) + ".idx"),
-                                  object_id_size(self.common)):
-            g = self.root / rel / ".git"
-            if g.exists() or g.is_symlink():
-                out.add(g)
+        out |= index_nested(self.root, *index_entries(self.index, Path(str(self.key) + ".idx"),
+                                                      object_id_size(self.common)))
         return sorted(out)
 
 
@@ -563,8 +601,7 @@ def _validate_headref(p: Path) -> bool:
     if stat.S_ISLNK(st.st_mode):
         return os.readlink(p).startswith("refs/")
     try:
-        with open(p, "rb") as fh:
-            buf = fh.read(255).split(b"\0", 1)[0]
+        buf = read_file(p)[:255].split(b"\0", 1)[0]
     except OSError:
         return False
     if buf.startswith(b"ref:") and buf[4:].lstrip(b" \t\r\n").startswith(b"refs/"):
@@ -628,10 +665,17 @@ def find_root(cwd: Path) -> Path | None:
         # --git-dir / GIT_DIR: git discovers nothing, the tree is GIT_WORK_TREE,
         # else core.worktree (relative to the gitdir), else the cwd. Always
         # taking the cwd made gitguard check all of $HOME. [28]
+        gd = Path(os.environ["GIT_DIR"])
+        # A GIT_DIR that is no git directory (missing, or a directory without
+        # a valid HEAD, objects and refs): setup_explicit_git_dir leaves git
+        # outside any repository (it dies, or a command such as `init` runs
+        # repository-less) and no local config is read. `git --bare init` in
+        # an empty directory. [97] A gitfile is followed by git: not here.
+        if not gd.exists() or (gd.is_dir() and not is_bare_gitdir(gd)):
+            return None
         wt = os.environ.get("GIT_WORK_TREE")
         if wt:
             return Path(wt).resolve()
-        gd = Path(os.environ["GIT_DIR"])
         env = env_common_dir()
         wt = _core_worktree(gd, env or gd, env is not None or (gd / "commondir").is_file())
         return cwd.resolve() if wt is None else wt
@@ -719,7 +763,7 @@ def _read_path_file(p: Path) -> str:
     git, which then finds no repository there and dies. Reading them more
     leniently made gitguard check a repository git never opens. NUL: git
     truncates (C string), refused here. [53]"""
-    buf = p.read_bytes()
+    buf = read_file(p)
     if b"\0" in buf:
         raise Refuse(f"{p}: NUL byte")
     return buf.rstrip(b"\r\n").decode(errors="surrogateescape")
@@ -835,7 +879,13 @@ def gitmodules_gits(root: Path) -> list[Path]:
 
 
 def index_gitlinks(index: Path, cache: Path | None = None, oid_size: int = 20) -> list[str]:
-    """Paths recorded as gitlinks (mode 160000) in the index file (`Repo.index`:
+    """The gitlinks of `index_entries`."""
+    return index_entries(index, cache, oid_size)[0]
+
+
+def index_entries(index: Path, cache: Path | None = None,
+                  oid_size: int = 20) -> tuple[list[str], list[str]]:
+    """(gitlinks, sparse directories) of an index file. Paths recorded as gitlinks (mode 160000) in the index file (`Repo.index`:
     `.git/index`, or `GIT_INDEX_FILE`), read by parsing it — never via `git`,
     which would read the config we judge.
 
@@ -857,14 +907,19 @@ def index_gitlinks(index: Path, cache: Path | None = None, oid_size: int = 20) -
     `oid_size`: bytes of an object id in the entries, from the repository's
     object format (`object_id_size`): 20 for SHA-1, 32 for SHA-256. A record
     without it was written for SHA-1 (a SHA-256 index was always refused,
-    never cached). [63]"""
+    never cached). [63]
+
+    Sparse directories: with a sparse index (`index.sparse`, the `sdir`
+    extension) a directory outside the cone is one entry, mode 040000,
+    naming a tree — whose gitlinks the parser cannot see (objects are not
+    read). Returned for the caller to look on disk (`index_nested`). [87]"""
     p = index
     try:
-        data = p.read_bytes()
+        data = read_file(p)
     except OSError:
-        return []
+        return [], []
     if len(data) < 12 or data[:4] != b"DIRC":
-        return []
+        return [], []
     digest = hashlib.sha256(data).hexdigest()
     records: dict = {}
     if cache is not None:
@@ -876,27 +931,52 @@ def index_gitlinks(index: Path, cache: Path | None = None, oid_size: int = 20) -
                 hit = records.get(str(p))
                 if (isinstance(hit, dict) and hit.get("sha256") == digest
                         and hit.get("oid", 20) == oid_size
-                        and isinstance(hit.get("gitlinks"), list)
-                        and all(isinstance(x, str) for x in hit["gitlinks"])):
-                    return list(hit["gitlinks"])
+                        and all(isinstance(hit.get(k), list)
+                                and all(isinstance(x, str) for x in hit[k])
+                                for k in ("gitlinks", "sparse"))):
+                    return list(hit["gitlinks"]), list(hit["sparse"])
         except (OSError, ValueError):
             records = {}
-    out = _parse_index_gitlinks(data, p, oid_size)
+    out, sparse = _parse_index_gitlinks(data, p, oid_size)
     if cache is not None:
         try:
             keep = {k: v for k, v in records.items()
                     if isinstance(k, str) and k != str(p) and os.path.exists(k)}
-            keep[str(p)] = {"sha256": digest, "oid": oid_size, "gitlinks": out}
+            keep[str(p)] = {"sha256": digest, "oid": oid_size, "gitlinks": out, "sparse": sparse}
             tmp = Path(str(cache) + ".tmp")
             tmp.write_text(json.dumps({"v": INDEX_CACHE_VERSION, "indexes": keep}))
             os.replace(tmp, cache)
         except OSError:
             pass
+    return out, sparse
+
+
+def index_nested(tree: Path, gitlinks: list[str], sparse: list[str]) -> set[Path]:
+    """The nested `.git` an index points git to, under `tree`: at each
+    gitlink, and anywhere inside a sparse directory that is on disk — git
+    expands that entry into the tree's own entries, gitlinks included,
+    once the directory exists (a sandbox writes the tree, a sparse index
+    and the repository; `git status` then ran its fsmonitor). A sparse
+    directory is normally absent from the disk: the walk costs nothing
+    then. [87]"""
+    out = set()
+    for rel in gitlinks:
+        g = tree / rel / ".git"
+        if g.exists() or g.is_symlink():
+            out.add(g)
+    for rel in sparse:
+        d = tree / rel
+        if d.is_dir() and not d.is_symlink():
+            for dirpath, dirnames, filenames in os.walk(d, onerror=_walk_error):
+                if ".git" in dirnames or ".git" in filenames:
+                    out.add(Path(dirpath) / ".git")
+                dirnames[:] = [n for n in dirnames if n != ".git"]
     return out
 
 
-# 2: entry names checked by verify_path [55]; 1 (unversioned) never checked them.
-INDEX_CACHE_VERSION = 2
+# 3: sparse directories recorded [87]; 2: entry names checked by verify_path
+# [55]; 1 (unversioned) never checked them.
+INDEX_CACHE_VERSION = 3
 
 
 # ------------------------------------------------- index entry names [55]
@@ -1152,7 +1232,7 @@ def object_id_size(gitdir: Path) -> int:
     return 32 if fmt == "sha256" else 20
 
 
-def _parse_index_gitlinks(data: bytes, p: Path, oid_size: int = 20) -> list[str]:
+def _parse_index_gitlinks(data: bytes, p: Path, oid_size: int = 20) -> tuple[list[str], list[str]]:
     # Fixed part of an entry: ctime, mtime, dev, ino, mode, uid, gid, size
     # (40 bytes), the object id (20 or 32), the flags (2). It was fixed at 62:
     # every SHA-256 index was refused as forged. [63]
@@ -1162,7 +1242,7 @@ def _parse_index_gitlinks(data: bytes, p: Path, oid_size: int = 20) -> list[str]
     if version not in (2, 3, 4):
         raise Refuse(f"unsupported git index version ({version}): cannot check "
                      f"nested repositories of {p}")
-    out, off, prev = [], 12, b""
+    out, sparse, off, prev = [], [], 12, b""
     entries: list[tuple[bytes, int]] = []
     for _ in range(count):
         if off + fixed > len(data):
@@ -1203,10 +1283,40 @@ def _parse_index_gitlinks(data: bytes, p: Path, oid_size: int = 20) -> list[str]
         entries.append((name, mode))
         if mode & 0xF000 == 0xE000:      # 0160000: gitlink
             out.append(name.decode(errors="surrogateescape"))
+        elif mode & 0xF000 == 0x4000:    # 040000: a sparse directory [87]
+            sparse.append(name.decode(errors="surrogateescape"))
+    # The extensions first: a split index stores its replaced entries with
+    # an empty name, which forged_entry took for a forged one.
+    _check_index_extensions(data, off, p, oid_size)
     bad = forged_entry(entries)
     if bad is not None:
         raise Refuse(forged_index_hint(p, bad))
-    return out
+    return out, sparse
+
+
+# Index extensions whose signature starts with a lowercase letter are
+# required: git dies on one it does not know (read_index_extension: "index
+# uses %.4s extension, which we do not understand"), because they change
+# what the entries mean. The same rule here, so that a future one is a
+# refusal, not a blind spot: `sdir` (sparse directories, read above) and
+# `link` (split index: the entries live in a sharedindex file, check_split_index).
+KNOWN_REQUIRED_EXTENSIONS = {b"sdir"}
+
+
+def _check_index_extensions(data: bytes, off: int, p: Path, oid_size: int) -> None:
+    """Walk the extensions after the entries (signature, 32-bit size, data),
+    up to the trailing checksum. [87]"""
+    end = len(data) - oid_size
+    while off + 8 <= end:
+        sig, size = data[off:off + 4], int.from_bytes(data[off + 4:off + 8], "big")
+        if not b"A"[0] <= sig[0] <= b"Z"[0] and sig not in KNOWN_REQUIRED_EXTENSIONS:
+            if sig == b"link":
+                raise Refuse(f"core.splitIndex not supported ({p} is a split index): run "
+                             f"`git update-index --no-split-index` and retry")
+            raise Refuse(f"{p}: index extension {sig!r} gitguard does not know; git "
+                         f"requires it to read the entries (a newer git?), so their "
+                         f"gitlinks cannot be checked")
+        off += 8 + size
 
 
 def _decode_varint(data: bytes, off: int) -> tuple[int, int]:
@@ -1274,9 +1384,9 @@ def check_rebase_todo(repo: Repo) -> None:
         return
     roots = dict.fromkeys([*gitdir_roots(repo.gitdir), *gitdir_roots(repo.common)])
     for p in (r / rel for r in roots for rel in TODO_FILES):
-        if not p.is_file():
+        if not is_file(p):
             continue
-        for line in p.read_text(errors="surrogateescape").splitlines():
+        for line in read_file(p).decode(errors="surrogateescape").splitlines():
             # git accepts any blank after the command word (`exec<TAB>cmd`). [35]
             word = (line.split(None, 1) or [""])[0]
             if word in ("exec", "x"):
@@ -1287,13 +1397,13 @@ def check_rebase_todo(repo: Repo) -> None:
     for r in roots:
         for rel in STRATEGY_FILES:
             p = r / rel
-            if p.is_file():
+            if is_file(p):
                 # Exactly as git reads it (read_oneliner): only ONE trailing
                 # newline is trimmed. No strip(): `ort\t` is not `ort`, git execs
                 # `git-merge-ort<TAB>`.
                 # Bytes, not read_text(): universal newlines would turn a lone
                 # CR (`ort\r`, a different name for git) into the newline we trim.
-                name = p.read_bytes().decode(errors="surrogateescape")
+                name = read_file(p).decode(errors="surrogateescape")
                 if name.endswith("\n"):          # strbuf_trim_trailing_newline
                     name = name[:-1]
                     if name.endswith("\r"):
@@ -1346,15 +1456,11 @@ def check_indexes(repo: Repo) -> None:
         # its own `modules/<x>/config`.
         cd = r / "commondir"
         fmt_dir = _resolve_existing(r / _read_path_file(cd), cd) if cd.is_file() else r
-        links = index_gitlinks(r / "index", cache, object_id_size(fmt_dir))
+        links = index_entries(r / "index", cache, object_id_size(fmt_dir))
         tree = trees.get(r)
         if tree is None:
             continue
-        nested = set(gitmodules_gits(tree))
-        for rel in links:
-            g = tree / rel / ".git"
-            if g.exists() or g.is_symlink():
-                nested.add(g)
+        nested = set(gitmodules_gits(tree)) | index_nested(tree, *links)
         for n in sorted(nested):
             check_nested_git(n, r)
 
@@ -1610,13 +1716,13 @@ def iter_global_config() -> Iterator[tuple[Path, str, str, str]]:
     for _ in range(INCLUDE_DEPTH + 1):
         nxt = []
         for f in queue:
-            if f in seen or not f.is_file():
+            if f in seen or not is_file(f):
                 continue
             seen.add(f)
             for section, key, value in parse_git_config(f):
                 yield f, section, key, value
                 if section.startswith("include") and key == "path":
-                    nxt.append(_expand2(value, f.parent)[1])
+                    nxt.append(_expand2(value, f.parent)[0])     # as opened [94]
         queue = nxt
 
 
@@ -1675,10 +1781,11 @@ class ConfigScan:
         self.refs: list[tuple[str, Path]] = []
         self.remote_names: set[str] = set()
         self.cmd = CmdConfig()
-        # DIR_KEYS values of global origin and of the environment / `-c`:
-        # resolved again against each local remote and submodule. [68]
-        self.global_dirs: list[tuple[str, str, str]] = []
-        self.env_dirs: list[tuple[str, str, str]] = []
+        # Values of global origin and of the environment / `-c` (an alias's
+        # `-c` included): resolved again against each local remote and
+        # submodule. [68] [92]
+        self.global_vals: list[tuple[str, str, str]] = []
+        self.env_vals: list[tuple[str, str, str]] = []
         self.remote_bases: set[Path] = set()
         self.nxt: list[tuple[Path, Path, bool, bool]] = []    # config files found while reading
         self.tokens_seen: set[tuple[str, Path]] = set()
@@ -1743,24 +1850,31 @@ class ConfigScan:
             out[p] = "ext"
 
     def consider(self, section: str, key: str, value: str, base: Path, cfdir: Path | None,
-                 remotes: bool, glob: bool = False) -> None:
+                 remotes: bool, glob: bool = False, relocated: bool = False) -> None:
         """One config entry. `base`: the directory its relative values resolve
         against (the root, a submodule's tree, a remote's gitdir); `cfdir`:
         the directory of the file it comes from (None: environment or
         command line); `remotes`: follow the remotes it names; `glob`: the
-        entry is of global origin (system, global, XDG, their includes)."""
+        entry is of global origin (system, global, XDG, their includes);
+        `relocated`: a global or `-c` value read again against another base
+        than the root (run)."""
         repo = self.repo
         # `git push <name>` resolves <name> through the repository's config
         # (local, global, environment: those whose base is the root), not a
         # submodule's: there, `<name>` is a path.
         if base == repo.root and section.startswith("remote.") and key in ("url", "pushurl"):
             self.remote_names.add(section[len("remote."):])
-        if section == "alias":
+        # `[alias] ci = …`, or since git 2.54 `[alias "ci"] command = …`: the
+        # subsection form was read as an unknown section, its `-c` never
+        # seen. [90]
+        alias = key if section == "alias" else (
+            section[len("alias."):] if section.startswith("alias.") and key == "command" else None)
+        if alias is not None:
             command, pairs = _alias_parts(value)
             if base == repo.root:
                 words = _shell_alias_words(value) if value.startswith("!") else {command} - {None}
                 if words:
-                    self.cmd.aliases.setdefault(key, set()).update(w for w in words if w)
+                    self.cmd.aliases.setdefault(alias.lower(), set()).update(w for w in words if w)
             # `alias.ci = -c core.hooksPath=.githooks commit`: git applies the
             # alias's `-c` when it runs, so `.githooks` is a hooks directory
             # like one named on the command line — and travels like it:
@@ -1770,12 +1884,18 @@ class ConfigScan:
                 sk = _split_config_key(k)
                 if sk is not None:
                     val = "true" if v is None else v
-                    if sk in DIR_KEYS and base == repo.root:
-                        self.env_dirs.append((*sk, val))
-                    self.consider(*sk, val, base, None, remotes, False)
+                    if base == repo.root:
+                        self.env_vals.append((*sk, val))
+                    self.consider(*sk, val, base, None, remotes, False, relocated)
+        if glob and alias is None:
+            self.global_vals.append((section, key, value))
         if (section, key) in DIR_KEYS:
-            if glob:
-                self.global_dirs.append((section, key, value))
+            # `:(optional)<path>` (git 2.52, a pathname value): the path,
+            # the variable unset when it does not exist. Exactly that prefix,
+            # once (`:(Optional)` is a path). Not for include.path, which
+            # git opens as written. [91]
+            if value.startswith(OPTIONAL_PREFIX):
+                value = value[len(OPTIONAL_PREFIX):]
             literal, p = _expand2(value, base)
             if p == repo.root:
                 # A hooks directory at the root of the tree: every top-level
@@ -1799,9 +1919,12 @@ class ConfigScan:
             # includes must come from files").
             if cfdir is None and not _expand2(value, Path("/"))[0].is_absolute():
                 return
+            # Queued as git opens it, not canonical: an include inside it is
+            # relative to that path's directory — a symlink's, not its
+            # target's. [94]
             literal, p = _expand2(value, cfdir or base)
-            if p.is_file():
-                self.nxt.append((p, base, remotes, glob))
+            if is_file(p):
+                self.nxt.append((literal, base, remotes, glob))
             self.add(literal, p)
         elif remotes and ((section.startswith("remote.") and key in ("url", "pushurl"))
                           or (section == "remote" and key == "pushdefault")
@@ -1830,7 +1953,14 @@ class ConfigScan:
         elif _data_key(section, key):
             return                       # a file read as data, never run [56]
         else:
-            for tok in _value_tokens(value):
+            for tok in _glued_values(_value_tokens(value)):
+                # Read again against a submodule or a remote, a token is a
+                # candidate only as an explicit relative path (`./x`,
+                # `scripts/x`): a bare word is run from the PATH, an absolute
+                # path was seen at the root, and every word of the global
+                # config (`user.name = t`) matched a file of each submodule. [92]
+                if relocated and ("/" not in tok or tok.startswith(("/", "~"))):
+                    continue
                 # The same token comes back from value to value (aliases
                 # share their words): each one costs a resolve(). Once per
                 # base is enough, add() is idempotent.
@@ -1883,35 +2013,43 @@ class ConfigScan:
         sub_configs = _submodule_configs(repo)
         queue += [(f, b, True, False) for f, b in sub_configs]
         sub_bases = {b for _, b in sub_configs}
-        seen: set[Path] = set()
+        # A file is read once per (file, base, origin), not once: one file
+        # included by the superproject's config and a submodule's (a
+        # `~/team.gitconfig`) has its relative values resolved in each; one
+        # included by the local and the global config keeps its global
+        # origin. [93]
+        seen: set[tuple[Path, Path, bool]] = set()
 
         # Config git takes from its environment and command line (GIT_CONFIG_*,
         # `-c`): not writable by the sandbox, but its values may name paths in
         # the volume, which git honours like any other. [48]
         for section, key, value in env_config():
-            if (section, key) in DIR_KEYS:
-                self.env_dirs.append((section, key, value))
+            self.env_vals.append((section, key, value))
             self.consider(section, key, value, repo.root, None, True)
         # +1: the first round consumes the base files; git then follows
         # INCLUDE_DEPTH levels of includes. With range(INCLUDE_DEPTH) the 10th
         # level was hashed but never parsed. [17]
         for _ in range(INCLUDE_DEPTH + 1):
             for cf, base, remotes, glob in queue:
-                if cf in seen or not cf.is_file():
+                if (cf.resolve(), base, glob) in seen or not is_file(cf):
                     continue
-                seen.add(cf)
+                seen.add((cf.resolve(), base, glob))
                 for section, key, value in parse_git_config(cf):
                     self.consider(section, key, value, base, cf.parent, remotes, glob)
             queue, self.nxt = self.nxt, []
-        # The global DIR_KEYS values, resolved where git will resolve them next:
-        # in each local remote (push) and each submodule; the environment's in
-        # the submodules only. [68]
+        # The global values, resolved where git will resolve them next: in
+        # each local remote (push) and each submodule; the environment's in
+        # the submodules only. [68] Every key, not DIR_KEYS alone: a global
+        # `hook.<n>.command = ./scripts/pc.sh` (git 2.54) runs
+        # `sub/scripts/pc.sh` during `submodule update`. [92] Aliases are
+        # not: git runs one where the user types it, and a git run from a
+        # submodule is checked with that submodule as its root.
         for base in self.remote_bases - {repo.root}:
-            for section, key, value in self.global_dirs:
-                self.consider(section, key, value, base, None, False)
+            for section, key, value in self.global_vals:
+                self.consider(section, key, value, base, None, False, relocated=True)
         for base in sub_bases - {repo.root}:
-            for section, key, value in [*self.global_dirs, *self.env_dirs]:
-                self.consider(section, key, value, base, None, False)
+            for section, key, value in [*self.global_vals, *self.env_vals]:
+                self.consider(section, key, value, base, None, False, relocated=True)
         self.refs = sorted(((scope, p) for p, scope in out.items()), key=lambda t: str(t[1]))
         return self
 
@@ -1974,11 +2112,10 @@ def _local_remote(url: str, base: Path) -> tuple[Path, Path, Path, list[Path]] |
         return None
     files: list[Path] = []
     gd = cand
-    if cand.is_file():
+    if is_file(cand):
         try:
-            with open(cand, "rb") as fh:
-                if fh.read(8) != b"gitdir: ":
-                    return None
+            if read_file(cand)[:8] != b"gitdir: ":
+                return None
         except OSError:
             return None
         gd = read_gitfile(cand)              # git dies on a broken one: refused
@@ -2030,6 +2167,7 @@ def _submodule_configs(repo: Repo) -> list[tuple[Path, Path]]:
 # hooks copied into every new repository). For any other value, only files
 # count.
 DIR_KEYS = {("core", "hookspath"), ("init", "templatedir")}
+OPTIONAL_PREFIX = ":(optional)"         # git 2.52, interpolate_path's callers [91]
 
 # Keys whose value is a path to a file git (or ssh-keygen, curl) reads as
 # data and never runs: a signing key, a template, patterns. Not watched. The
@@ -2125,6 +2263,23 @@ def _value_tokens(value: str) -> set[str]:
     return {t.lstrip("!").strip("\"'") for t in toks}
 
 
+def _glued_values(toks: set[str]) -> set[str]:
+    """`toks` and, for a short-option word, what may be its value glued to
+    it: ssh reads `-F./ssh_config`, `-vF./c` (a cluster: `-v`, then `-F`
+    holding the rest) or `-i~/.ssh/k` — an option word was dropped whole,
+    hiding the file. A candidate after each letter of the leading run (the
+    option letters), not after every character. `--opt=path` is split on
+    `=` already. [96]"""
+    out = set(toks)
+    for t in toks:
+        if t.startswith("-") and not t.startswith("--"):
+            i = 1
+            while i < len(t) and t[i].isalnum():
+                i += 1
+                out.add(t[i:])
+    return out
+
+
 def _expand2(value: str, base: Path) -> tuple[Path, Path]:
     """(literal path, canonical path) — the literal detects symlinks, the
     canonical one is hashed. Like git's interpolate_path: `~/x` is $HOME/x,
@@ -2163,14 +2318,16 @@ class Entry:
 
 
 def _hash_into(h: "hashlib._Hash", p: Path) -> None:
-    with open(p, "rb") as fh:
+    # O_NONBLOCK: lstat said regular, a FIFO swapped in since must not block. [99]
+    with open(p, "rb", opener=lambda f, fl: os.open(f, fl | os.O_NONBLOCK)) as fh:
         for chunk in iter(lambda: fh.read(1 << 16), b""):
             h.update(chunk)
 
 
-def _hash_file(p: Path) -> tuple[str, str, str] | None:
+def _hash_file(p: Path, link_zones: tuple[Path, ...] = ()) -> tuple[str, str, str] | None:
     """(kind, mode, sha) of a watched file or symlink; None otherwise
-    (FIFO, socket, directory…)."""
+    (FIFO, socket, directory…). A regular file (or a link's target) inside
+    one of `link_zones` with another name is refused (_hard_link)."""
     st = p.lstat()
     if stat.S_ISLNK(st.st_mode):
         # A link is fingerprinted by its target string AND by the content of
@@ -2186,18 +2343,41 @@ def _hash_file(p: Path) -> tuple[str, str, str] | None:
         if tst is not None and stat.S_ISDIR(tst.st_mode):
             raise Refuse(f"symlink to a directory in a watched zone: {p}")
         if tst is not None and stat.S_ISREG(tst.st_mode):
+            _hard_link(p.resolve(), tst, link_zones)
             h.update(b"\0target:")
             _hash_into(h, p)
         return "l", "l", h.hexdigest()
     if not stat.S_ISREG(st.st_mode):
         return None
+    _hard_link(p, st, link_zones)
     h = hashlib.sha256()
     _hash_into(h, p)
     return "f", f"{stat.S_IMODE(st.st_mode):o}", h.hexdigest()
 
 
-def _mk(scope: str, rel: str, p: Path) -> Entry | None:
-    r = _hash_file(p)
+def _hard_link(p: Path, st: os.stat_result, link_zones: tuple[Path, ...]) -> None:
+    """A watched file must be its only name. Its bytes are checked under
+    this path, but git writes many files of the gitdir in place, by name —
+    COMMIT_EDITMSG, MERGE_MSG, FETCH_HEAD, the sequencer's files, a reflog
+    it appends to — and those are volatile: `.git/COMMIT_EDITMSG` linked to
+    `hooks/commit-msg` passed the check with the trusted bytes, then `git
+    commit --amend` wrote the sandbox's message into the hook and ran it.
+    A symlink there is refused; a hard link is a regular file to lstat.
+    Only inside the tree, the gitdir and the common dir (`link_zones`): the
+    sandbox can only link() what its mount holds, so both names of a link it
+    made lie there. A program the global config names elsewhere may have
+    other names — Homebrew ships hard-linked binaries, on the same volume
+    as $HOME on macOS — and is left alone: nothing the sandbox writes shares
+    its inode. A symlink is judged by its target's path (`p` resolved). [88]"""
+    if st.st_nlink > 1 and any(p == z or z in p.parents for z in link_zones):
+        raise Refuse(f"hard link in a watched zone: {p} has {st.st_nlink} names, and git "
+                     f"writes files of the gitdir by name (COMMIT_EDITMSG, a reflog…), which "
+                     f"would rewrite it. Replace it by a copy (copy it aside, move the copy "
+                     f"over it), inspect it, then `gitguard trust`.")
+
+
+def _mk(scope: str, rel: str, p: Path, link_zones: tuple[Path, ...] = ()) -> Entry | None:
+    r = _hash_file(p, link_zones)
     return Entry(scope, rel, *r) if r else None
 
 
@@ -2268,10 +2448,14 @@ def gitdir_paths(base: Path) -> Iterator[tuple[str, Path]]:
                 yield prefix + name, d / name
 
 
-def walk_gitdir(base: Path, scope: str) -> Iterator[Entry]:
-    """Fingerprint of the gitdir: everything but the volatile (deny-by-default)."""
+def walk_gitdir(base: Path, scope: str, link_zones: tuple[Path, ...] | None = None) -> Iterator[Entry]:
+    """Fingerprint of the gitdir: everything but the volatile (deny-by-default).
+    `link_zones`: where a hard link is refused (_hard_link), by default the
+    gitdir itself."""
+    if link_zones is None:
+        link_zones = (base,)
     for rel, path in gitdir_paths(base):
-        e = _mk(scope, rel, path)
+        e = _mk(scope, rel, path, link_zones)
         if e:
             yield e
 
@@ -2312,20 +2496,22 @@ def _walk_error(exc: OSError) -> None:
     raise Refuse(f"unreadable directory, cannot check: {exc.filename} ({exc.strerror})")
 
 
-def walk_tree(scope: str, base: Path, start: Path, repo: Repo | None = None) -> Iterator[Entry]:
+def walk_tree(scope: str, base: Path, start: Path, repo: Repo | None = None,
+              link_zones: tuple[Path, ...] = ()) -> Iterator[Entry]:
     for p in walk_all(start, repo):
         rel = str(p.relative_to(base)) if scope == "wt" else str(p)
-        e = _mk(scope, rel, p)
+        e = _mk(scope, rel, p, link_zones)
         if e:
             yield e
 
 
 def manifest(repo: Repo, refs: list[tuple[str, Path]]) -> dict[tuple[str, str], Entry]:
-    entries: list[Entry] = list(walk_gitdir(repo.gitdir, "local"))
+    zones = tuple({repo.gitdir, repo.common, repo.root})
+    entries: list[Entry] = list(walk_gitdir(repo.gitdir, "local", zones))
     if repo.common != repo.gitdir:
-        entries += walk_gitdir(repo.common, "common")
+        entries += walk_gitdir(repo.common, "common", zones)
     for scope, p in refs:
-        entries += walk_tree(scope, repo.root, p, repo)
+        entries += walk_tree(scope, repo.root, p, repo, zones)
     # The system and global config files are parsed (config_refs) for the
     # paths they name, never hashed: the sandbox cannot write them, and
     # whoever can (HOME mounted) can write the state directory too. Hashing
@@ -3063,7 +3249,7 @@ GLOBAL_WITH_ARG = {"-c", "--config-env", "--namespace", "-C", "--git-dir", "--wo
 GLOBAL_WITH_EQ = ("--config-env=", "--namespace=", "--git-dir=", "--work-tree=",
                   "--attr-source=", "--shallow-file=", "--super-prefix=", "--exec-path=",
                   "--list-cmds=")
-GLOBAL_FLAGS = {"-p", "--paginate", "-P", "--no-pager", "--no-replace-objects", "--bare",
+GLOBAL_FLAGS = {"-p", "--paginate", "-P", "--no-pager", "--no-replace-objects",
                 "--literal-pathspecs", "--no-literal-pathspecs", "--glob-pathspecs",
                 "--noglob-pathspecs", "--icase-pathspecs", "--no-optional-locks",
                 "--no-advice", "--no-lazy-fetch", "--exec-path", "--html-path",
@@ -3107,6 +3293,17 @@ def split_global_options(args: list[str], cwd: Path) -> GlobalOpts:
     i = 0
     while i < len(args):
         a = args[i]
+        if a == "--bare":
+            # `setenv(GIT_DIR, getcwd(), 0)` (handle_options): the cwd as it
+            # is at this point (after the `-C` before it), unless a GIT_DIR is
+            # already there; a `--git-dir` overwrites it, before or after.
+            # Taken for an inert flag, gitguard discovered the repository
+            # from the cwd and checked its `.git`, while git read the
+            # `config` a sandbox laid out at the root of the tree. [97]
+            i += 1
+            if gitdir is None and not os.environ.get("GIT_DIR"):
+                gitdir = str(cwd.resolve())
+            continue
         if a in GLOBAL_WITH_ARG:
             if i + 1 >= len(args):
                 raise Refuse(f"option {a} without an argument")
@@ -3161,9 +3358,44 @@ def apply_global_options(args: list[str]) -> Path:
     return orig
 
 
-CLONE_WITH_ARG = {"-o", "-b", "--branch", "--origin", "-u", "--upload-pack", "--reference",
-                  "--depth", "--jobs", "-j", "--config", "--filter", "--shared",
-                  "--object-format", "--initial-branch", "--ref-format", "--template"}
+# The options of `git clone` and `git init` (git 2.50 and 2.54, `git clone
+# -h`, `git init -h`; test_new_repo_options_match_git holds these tables to
+# the git under test): each long option, True when it takes a separate
+# value (`--branch x`; `--shared[=<perm>]` only an attached one), then the
+# short options that take one. parse-options accepts any unique prefix of a
+# long option, `--no-` forms included: `--templ=<dir>` is `--template`. [98]
+NEW_REPO_OPTIONS: dict[str, tuple[dict[str, bool], str]] = {
+    "clone": ({**dict.fromkeys(
+        ["--verbose", "--quiet", "--progress", "--reject-shallow", "--no-checkout",
+         "--checkout", "--bare", "--mirror", "--local", "--no-hardlinks", "--hardlinks",
+         "--shared", "--recurse-submodules", "--recursive", "--dissociate",
+         "--single-branch", "--tags", "--shallow-submodules", "--ipv4", "--ipv6",
+         "--also-filter-submodules", "--remote-submodules", "--sparse"], False),
+        **dict.fromkeys(
+        ["--jobs", "--template", "--reference", "--reference-if-able", "--origin",
+         "--branch", "--revision", "--upload-pack", "--depth", "--shallow-since",
+         "--shallow-exclude", "--separate-git-dir", "--ref-format", "--config",
+         "--server-option", "--filter", "--bundle-uri"], True)}, "jobuc"),
+    "init": ({**dict.fromkeys(["--bare", "--shared", "--quiet"], False),
+              **dict.fromkeys(["--template", "--separate-git-dir", "--initial-branch",
+                               "--object-format", "--ref-format"], True)}, "b"),
+}
+
+
+def _long_option(name: str, longs: dict[str, bool]) -> tuple[str | None, bool]:
+    """(the long option `name` stands for, negated?) as parse-options reads
+    it: itself, else the one option it is a unique prefix of; `--no-x` is
+    x negated unless `--no-x` is an option of its own (`--no-checkout`).
+    None: unknown or ambiguous (git dies)."""
+    for cand, neg in ((name, False), ("--" + name[5:], True) if name.startswith("--no-") else (None, False)):
+        if cand is None:
+            continue
+        if cand in longs:
+            return cand, neg
+        hits = [o for o in longs if o.startswith(cand)]
+        if len(hits) == 1:
+            return hits[0], neg
+    return None, False
 
 
 def _template_dir_configured(cli_config: list[str]) -> bool:
@@ -3189,21 +3421,30 @@ def parse_new_repo(args: list[str]) -> tuple[str, Path] | None:
     if not o.rest or o.rest[0] not in ("clone", "init"):
         return None
     sub, rest, positional, bare, template = o.rest[0], o.rest[1:], [], False, False
+    longs, shorts = NEW_REPO_OPTIONS[sub]
     j = 0
     while j < len(rest):
         a = rest[j]
         if a == "--":
             positional += rest[j + 1:]; break
-        if a.startswith("--template"):
-            template = True; j += 2 if a == "--template" else 1
-        elif a in ("--bare", "--mirror"):
-            bare = True; j += 1
-        elif a.startswith("--separate-git-dir"):
-            return None
-        elif a in CLONE_WITH_ARG:
-            j += 2
-        elif a.startswith("-"):
-            j += 1
+        if a.startswith("--"):
+            name, eq, _ = a.partition("=")
+            opt, neg = _long_option(name, longs)
+            # Anything that may stand for --template counts as it, ambiguous
+            # prefixes included (git dies on those): fail closed. [98]
+            if opt == "--template" or (opt is None and len(name) > 2
+                                       and "--template".startswith(name)):
+                template = not neg
+            elif opt in ("--bare", "--mirror"):
+                bare = not neg
+            elif opt == "--separate-git-dir" and not neg:
+                return None
+            j += 2 if opt is not None and longs[opt] and not neg and not eq else 1
+        elif a.startswith("-") and len(a) > 1:
+            # A cluster (`-qb main`): the first letter that takes a value
+            # ends it, holding the rest of the word or the next argument.
+            k = next((i for i, c in enumerate(a[1:], 1) if c in shorts), None)
+            j += 2 if k == len(a) - 1 else 1
         else:
             positional.append(a); j += 1
     if template or _template_dir_configured(o.config + o.config_env):
@@ -3477,15 +3718,20 @@ def _shell_alias_words(value: str) -> set[str]:
 # visible. Fail closed. The gitlink is written; the next command is refused.
 IGNORE_SUBMODULE_DIRT = "diff.ignoreSubmodules=dirty"
 # Probed on git 2.50 with a dirty submodule, every form of each command,
-# with and without the option: status (long, --short, --porcelain), diff
-# (--submodule=short/log too) and commit (--dry-run, the message template)
-# report the submodule's dirty tree; `config --list`, `config <key>` and
-# `var -l` list the command-line config. Unchanged: submodule summary and
-# status, describe --dirty, show, stash, add, ls-files, the diff plumbing.
-# None of the five writes a gitlink from a tree (commit writes the index
-# from the work tree). A command missing here costs a line of output,
-# never a bypass.
-SWITCH_EXEMPT = frozenset({"status", "diff", "commit", "config", "var"})
+# with and without the option: status (long, --short, --porcelain) and diff
+# (--submodule=short/log too) report the submodule's dirty tree; `config
+# --list`, `config <key>` and `var -l` list the command-line config.
+# Unchanged: submodule summary and status, describe --dirty, show, stash,
+# add, ls-files, the diff plumbing. None of the four writes a gitlink into
+# an index. `commit` was exempt on the ground that it writes the index from
+# the work tree: that is how a gitlink gets in — `commit -a` (or a pathspec)
+# stages a tracked file the sandbox replaced by a repository, a partial
+# commit resets a temporary index from a HEAD the sandbox moved — and its
+# message template then entered it. Its dry run and template no longer
+# report a submodule's dirty tree. [86] A command missing here costs a line
+# of output, never a bypass; a command added here is a claim to prove
+# (tests/test_commands.py, the [86] forms against each exempt command).
+SWITCH_EXEMPT = frozenset({"status", "diff", "config", "var"})
 
 
 class CmdConfig:

@@ -599,3 +599,112 @@ def attack_lfsconfig_rewritten(gg: GG, repo: Path, tmp_path: Path) -> None:
     gg.trust(repo)
     write_exec(repo / "t.sh", "#!/bin/sh\ntouch /tmp/evil\n")
     (repo / ".lfsconfig").write_text('[lfs "customtransfer.x"]\n\tpath = ./t.sh\n')
+
+
+# ------------------------------------------- adversarial review of 2026-10-24 (2)
+OK_HOOK = "#!/bin/sh\nexit 0\n"
+
+
+def _evil(tmp_path: Path) -> str:
+    return f"#!/bin/sh\ntouch '{tmp_path}/RAN'\n"
+
+
+def attack_alias_subsection_config_hookspath(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[90] `[alias "ci"] command = -c core.hooksPath=.githooks commit`
+    (git 2.54): the subsection form of the alias of [80], parsed as section
+    `alias.ci`, key `command`, never read as an alias"""
+    write_exec(repo / ".githooks/pre-commit", OK_HOOK)
+    assert gg.git("config", "alias.ci.command", "-c core.hooksPath=.githooks commit", cwd=repo).rc == 0
+    gg.trust(repo)
+    write_exec(repo / ".githooks/pre-commit", _evil(tmp_path))
+
+
+def attack_optional_hookspath_local(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[91] `core.hooksPath = :(optional).githooks` (git 2.52+): git
+    strips the prefix and runs `.githooks/<hook>`; gitguard watched
+    `<root>/:(optional).githooks`, which does not exist"""
+    write_exec(repo / ".githooks/post-checkout", OK_HOOK)
+    assert gg.git("config", "core.hooksPath", ":(optional).githooks", cwd=repo).rc == 0
+    gg.trust(repo)
+    write_exec(repo / ".githooks/post-checkout", _evil(tmp_path))
+
+
+def attack_optional_hookspath_global(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[91] the same from ~/.gitconfig, the use case of `:(optional)`:
+    "the repository's .githooks when there is one\""""
+    write_exec(repo / ".githooks/post-checkout", OK_HOOK)
+    assert gg.git("config", "--global", "core.hooksPath", ":(optional).githooks").rc == 0
+    gg.trust(repo)
+    write_exec(repo / ".githooks/post-checkout", _evil(tmp_path))
+
+
+def attack_global_config_hook_relative_in_submodule(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[92] a global config hook with a relative command
+    (`hook.conv.command = ./scripts/pc.sh`, git 2.54) runs in every
+    repository git enters: `git submodule update` runs `sub/scripts/pc.sh`.
+    The [68] re-resolution against each base covers DIR_KEYS only"""
+    from tests.attacks._helpers import add_submodule, submodule_source_with
+    submodule_source_with(gg, tmp_path, {"scripts/pc.sh": OK_HOOK})
+    assert gg.git("config", "--global", "hook.conv.command", "./scripts/pc.sh").rc == 0
+    assert gg.git("config", "--global", "hook.conv.event", "post-checkout").rc == 0
+    sub = add_submodule(gg, repo, tmp_path)
+    gg.trust(repo)
+    write_exec(sub / "scripts/pc.sh", _evil(tmp_path))
+
+
+def attack_shared_include_in_superproject_and_submodule(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[93] one file (`~/team.gitconfig`: core.hooksPath = .githooks)
+    included by the superproject's config and by the submodule's: parsed
+    once (`seen` keyed by path, not by base), its relative hooksPath
+    resolved against the root only; git applies it in `sub/` too"""
+    from tests.attacks._helpers import add_submodule, submodule_source_with
+    team = Path(gg.env["HOME"]) / "team.gitconfig"
+    team.write_text("[core]\n\thooksPath = .githooks\n")
+    submodule_source_with(gg, tmp_path, {".githooks/post-checkout": OK_HOOK})
+    sub = add_submodule(gg, repo, tmp_path)
+    assert gg.git("config", "include.path", "~/team.gitconfig", cwd=sub).rc == 0
+    assert gg.git("config", "include.path", "~/team.gitconfig", cwd=repo).rc == 0
+    gg.trust(repo)
+    write_exec(sub / ".githooks/post-checkout", _evil(tmp_path))
+
+
+def attack_relative_include_inside_symlinked_include(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[94] a relative `include.path = local.inc` inside an included
+    file that is a symlink (`shared/team.inc -> real/team.inc`): git resolves
+    it against the directory of the file as opened (`shared/local.inc`),
+    gitguard against the target's (`shared/real/local.inc`)"""
+    import os
+    shared = tmp_path / "vol-shared"
+    (shared / "real").mkdir(parents=True)
+    (shared / "real/team.inc").write_text("[include]\n\tpath = local.inc\n")
+    os.symlink("real/team.inc", shared / "team.inc")
+    assert gg.git("config", "include.path", str(shared / "team.inc"), cwd=repo).rc == 0
+    gg.trust(repo)
+    write_exec(shared / "pwn.sh", _evil(tmp_path) + "exit 1\n")
+    (shared / "local.inc").write_text(f"[core]\n\tfsmonitor = {shared / 'pwn.sh'}\n")
+
+
+def attack_ssh_config_glued_to_short_option(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[96] `core.sshCommand = ssh -F./deploy/ssh_config`: the path
+    glued to a short option is one token starting with `-`, dropped; ssh
+    reads the file, a ProxyCommand planted there runs on `git fetch`"""
+    (repo / "deploy").mkdir()
+    (repo / "deploy/ssh_config").write_text("Host *\n\tBatchMode yes\n")
+    assert gg.git("config", "core.sshCommand", "ssh -F./deploy/ssh_config", cwd=repo).rc == 0
+    assert gg.git("remote", "add", "origin", "ssh://deploy.invalid/r.git", cwd=repo).rc == 0
+    gg.trust(repo)
+    (repo / "deploy/ssh_config").write_text(
+        f"Host *\n\tProxyCommand sh -c \"touch '{tmp_path}/RAN'; exit 1\"\n")
+
+
+def attack_ssh_config_glued_in_option_cluster(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[96] the same in a cluster, `ssh -vF./deploy/ssh_config` (`-v`, then
+    `-F` holding the rest of the word): found replaying the first fix, which
+    only took what follows `-F`"""
+    (repo / "deploy").mkdir()
+    (repo / "deploy/ssh_config").write_text("Host *\n\tBatchMode yes\n")
+    assert gg.git("config", "core.sshCommand", "ssh -vF./deploy/ssh_config", cwd=repo).rc == 0
+    assert gg.git("remote", "add", "origin", "ssh://deploy.invalid/r.git", cwd=repo).rc == 0
+    gg.trust(repo)
+    (repo / "deploy/ssh_config").write_text(
+        f"Host *\n\tProxyCommand sh -c \"touch '{tmp_path}/RAN'; exit 1\"\n")

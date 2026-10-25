@@ -9,7 +9,7 @@ the host runs it. gitguard is detection; `safe.bareRepository=explicit` and
 a global `core.hooksPath` are the prevention layers it assumes.
 
 **`DESIGN.md` is the design record** (threat model, every check and why,
-ruled-out alternatives, the 57 bypasses). Read the section named below
+ruled-out alternatives, the catalogue of 99 bypasses). Read the section named below
 before touching the matching code; it is long because every paragraph was
 paid for by a bypass.
 
@@ -87,7 +87,7 @@ are honoured as git honours them.
 
 ## Tests
 
-`python3 -m pytest` (~1000 tests, expected failures: [44], [71], [74], the accepted limitations, ~180 s), before
+`python3 -m pytest` (~1060 tests, expected failures: [44], [71], [74], the accepted limitations, and the open [89], [95]; ~180 s), before
 any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
 && venv/bin/pip install pytest`.
 
@@ -98,6 +98,9 @@ any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
 - `tests/test_legit.py` — ordinary git must stay silent (false-positive guard).
 - `tests/test_git_parity.py` — git as the oracle for every reader; a known
   gap is `xfail(strict=True)`, promoted to `tests/attacks/` once fixed.
+- `tests/test_claims.py` — every closed list of claims about git in
+  gitguard.py (`GLOBAL_FLAGS`, `SWITCH_EXEMPT`, `NEW_REPO_OPTIONS`, index
+  extensions) held to git as the oracle; a new list gets its test there.
 - `tests/test_commands.py`, `test_nested.py`, `test_prompt.py` (pty),
   `test_pending.py`, `test_unit.py`.
 - The scenarios use `REAL_GIT` (conftest): on a machine where `git` *is*

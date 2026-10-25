@@ -479,6 +479,96 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      about a setting that was in place. Same review. Fix: the global files
      and their includes read by one iterator (iter_global_config), also
      used by _template_dir_configured.
+[86] `commit` in SWITCH_EXEMPT, on the ground that it never writes
+     a gitlink from a tree. It does: `commit -a` (or a pathspec, `-i`)
+     after the sandbox replaced a tracked file by a repository stages the
+     typechange 100644 → 160000; a partial commit (`commit <path>`, `-o`,
+     `-v`, `--dry-run`, `--amend <path>`) resets a temporary index from a
+     HEAD the sandbox moved to a commit with a gitlink. Either way the
+     message template's status enters the planted repository and runs its
+     fsmonitor, in the command whose check passed. `-m` renders no
+     template. `-c diff.ignoreSubmodules=dirty` keeps git out (checked):
+     commit left the exemption.
+[87] sparse index (`sdir` extension): a directory outside the cone
+     is one 040000 entry naming a tree; the index parser reads entries one
+     by one and never sees the gitlink inside that tree (objects are not
+     read). The sandbox writes the tree, a sparse `.git/index` and the
+     nested repository: git expands the entry once the directory is on
+     disk, `git status` runs the planted fsmonitor. Needs a cone
+     sparse-checkout. Fix: a sparse directory present on disk is walked for
+     a nested `.git` (index_nested); an unknown required index extension
+     (lowercase signature, which git dies on) is refused.
+[88] hard links. `.git/COMMIT_EDITMSG` (volatile) linked to the
+     trusted `hooks/commit-msg` (or to a hook of the tree, a local
+     core.hooksPath): at the check the hook's bytes are the trusted ones;
+     `git commit --amend` writes the sandbox's commit message into that
+     inode, then runs it. A symlink there is refused; a hard link is a
+     regular file to lstat, and st_nlink is never looked at. A global
+     core.hooksPath outside the volume stops the first form only. Fix: a
+     watched file of the tree, the gitdir or the common dir with another name is
+     refused (_hard_link).
+[89] OPEN — the submodule content diff. With `diff.submodule = diff`
+     (global) or `--submodule=diff`, `git show`/`log -p`/`diff <rev> <rev>`
+     of a commit bringing a gitlink to a planted repository run `git diff`
+     inside it, honouring its diff.external. `diff.ignoreSubmodules=dirty`
+     only drops the dirty-tree probe; `diff` is exempt from it anyway.
+[90] the subsection form of an alias, `[alias "ci"] command = -c
+     core.hooksPath=.githooks commit` (git 2.54): parsed as section
+     `alias.ci`, key `command`, never read as an alias, so the `-c` of
+     [80] is not seen and `.githooks` is not watched. Fix: read as alias.
+[91] `core.hooksPath = :(optional).githooks` (git 2.52+, local or
+     global): git strips the `:(optional)` prefix of a pathname value;
+     gitguard watched `<root>/:(optional).githooks`, which does not exist.
+     Program keys are caught by accident (the sh split on `()`). Fix: the
+     prefix stripped (once, case-sensitive, as git) from DIR_KEYS values;
+     not from include.path, which git opens as written.
+[92] a global config-based hook with a relative command
+     (`hook.<n>.command = ./scripts/pc.sh`, git 2.54) runs in every
+     repository git enters, a submodule during `git submodule update`
+     included. The [68] re-resolution against each base covers DIR_KEYS
+     only; a relative program token of global origin is resolved against
+     the root. Fix: every global value (aliases aside) is re-resolved.
+[93] one config file included by the superproject's config and by
+     a submodule's (`~/team.gitconfig`, core.hooksPath = .githooks) is
+     parsed once: `seen` is keyed by path, not by (path, base), and its
+     relative hooksPath is never resolved in `sub/`. Same for two
+     submodules, or a file included by the local and the global config
+     (the global flag of [68] is lost). Fix: read once per (file, base,
+     origin).
+[94] a relative include inside an included file that is a symlink:
+     git resolves it against the directory of the file as opened (the
+     link's), gitguard against the target's. The sandbox writes the file
+     git reads, gitguard watches another. Fix: included files are queued as
+     opened.
+[95] OPEN — variant of [44] for config: a tracked `.gitconfig` the trusted
+     `.git/config` includes (`include.path = ../.gitconfig`). The sandbox
+     writes objects and a ref only; `git merge` checks the new file out,
+     then spawns `git maintenance run --auto`, which reads it and starts
+     its `pager.maintenance` on the user's terminal. Decision pending:
+     accepted limitation with a `trust` warning, like [44], or more.
+[96] a path glued to a short option (`core.sshCommand = ssh
+     -F./deploy/ssh_config`) is one token starting with `-`, dropped;
+     ssh reads the file, a ProxyCommand planted there runs on `git fetch`.
+     Fix: `-X<path>` yields the candidate `<path>`.
+[97] `git --bare <cmd>`: git takes the cwd as its gitdir
+     (handle_options sets GIT_DIR); gitguard took `--bare` for an inert
+     flag, discovered the repository from the cwd and checked its `.git`,
+     while git read a `config` the sandbox laid out in the tree's root.
+     Fix: `--bare` sets the gitdir as git does; a GIT_DIR that is no git
+     directory means no repository (`git --bare init` still runs).
+[98] git's parse-options accepts any unique prefix of a long
+     option: `init`/`clone --templ=<dir>` copy the template's hooks, but
+     parse_new_repo recognised `--template` only and auto-trusted the new
+     repository with them ([42]). Fix: clone's and init's options read as
+     parse-options reads them (NEW_REPO_OPTIONS, held to `git <cmd> -h`).
+[99] `.git/config` replaced by a FIFO: the config reader blocks in
+     read() for ever. Fail closed (git never runs), but a denial of service
+     that pushes the user toward the real git; a file git reads that is not
+     a regular file is to be refused at once: read_file, O_NONBLOCK.
+     [86]–[99] found by an
+     adversarial review (six agents, 2026-10-24), replayed against git 2.50
+     and 2.54; not yet against 2.47.3 (Debian VM). All fixed on
+     2026-10-25 but [89] and [95], still open.
 """
 from __future__ import annotations
 

@@ -209,3 +209,12 @@ def attack_gitlink_in_submodule_index_gitfile_outside(gg: GG, repo: Path, tmp_pa
     assert gg.git("update-index", "--add", "--cacheinfo", f"160000,{sha},inner", cwd=sub).rc == 0
     (sub / "inner").mkdir()
     (sub / "inner/.git").write_text(f"gitdir: {evil / '.git'}\n")
+
+
+def attack_sparse_index_hides_gitlink(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[87] sparse index: the gitlink `vendor/evil` sits in a 040000
+    directory entry (`sdir`) the index parser does not expand; git expands
+    it once `vendor/` is on disk and `git status` runs the planted fsmonitor
+    (positive control: test_commands)"""
+    from tests.attacks._helpers import payload, plant_sparse_gitlink
+    plant_sparse_gitlink(gg, repo, tmp_path, str(payload(tmp_path)))

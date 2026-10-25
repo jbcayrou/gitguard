@@ -8,6 +8,12 @@ resolved from the PATH): same overhead within 3 ms on the small repository,
 head to head against the `73b0d1c` script on the same machine state. The
 tables below are the original measurements.
 
+Re-checked on 2026-10-25 after the fixes of [86]–[99] (global values read
+again in each submodule, hard-link and FIFO checks, sparse directories):
+`gitguard` alone, median of 25, against the previous commit on the same
+machine state — 39.4 → 40.4 ms on a one-file repository, 62.5 → 64.9 ms on
+one with 10 submodules and a global config of 30 aliases and a config hook.
+
 ## Environment
 
 - Apple M4 Pro, macOS (Darwin 27.0), APFS

@@ -249,8 +249,9 @@ def test_walk_error_ignores_vanished_dir_but_refuses_permission() -> None:
 
 
 # --------------------------------------------------------------- index_gitlinks
-def _index_v2(entries: list[tuple[int, bytes]]) -> bytes:
-    """Minimal DIRC v2 index: (mode, name) per entry, no extension."""
+def _index_v2(entries: list[tuple[int, bytes]], ext: bytes = b"") -> bytes:
+    """Minimal DIRC v2 index: (mode, name) per entry, then `ext` (raw
+    extensions: signature, size, data)."""
     import hashlib
     body = b"DIRC" + (2).to_bytes(4, "big") + len(entries).to_bytes(4, "big")
     for mode, name in entries:
@@ -258,7 +259,41 @@ def _index_v2(entries: list[tuple[int, bytes]]) -> bytes:
         e += len(name).to_bytes(2, "big") + name
         e += b"\0" * (((len(e) + 8) & ~7) - len(e))
         body += e
+    body += ext
     return body + hashlib.sha1(body).digest()
+
+
+def _ext(sig: bytes, data: bytes = b"") -> bytes:
+    return sig + len(data).to_bytes(4, "big") + data
+
+
+def test_index_sparse_directories_and_extensions(tmp_path: Path) -> None:
+    """[87] a sparse directory (mode 040000, `sdir`) is returned for the
+    caller to look on disk; an optional extension (uppercase signature) is
+    skipped, a required one gitguard does not know is refused as git dies
+    on it, `link` (split index) too."""
+    idx = tmp_path / "index"
+    idx.write_bytes(_index_v2([(0o100644, b"src/a"), (0o040000, b"vendor/")],
+                              _ext(b"TREE", b"xx") + _ext(b"sdir")))
+    assert gg_mod.index_entries(idx) == ([], ["vendor/"])
+    idx.write_bytes(_index_v2([(0o160000, b"v")], _ext(b"UNTR", b"abc") + _ext(b"EOIE", b"x" * 24)))
+    assert gg_mod.index_entries(idx) == (["v"], [])
+    idx.write_bytes(_index_v2([(0o160000, b"v")], _ext(b"zzzz")))
+    with pytest.raises(Refuse, match="does not know"):
+        gg_mod.index_entries(idx)
+    idx.write_bytes(_index_v2([(0o160000, b"v")], _ext(b"link", b"\0" * 20)))
+    with pytest.raises(Refuse, match="splitIndex"):
+        gg_mod.index_entries(idx)
+
+
+def test_index_nested_walks_a_sparse_directory_on_disk(tmp_path: Path) -> None:
+    """[87] a nested `.git` at any depth of a sparse directory present on
+    disk; nothing for an absent one, nor below a `.git`."""
+    (tmp_path / "vendor/a/evil/.git/x/.git").mkdir(parents=True)
+    (tmp_path / "vendor/b").mkdir()
+    (tmp_path / "vendor/b/.git").write_text("gitdir: ../../.git/modules/b\n")
+    got = gg_mod.index_nested(tmp_path, [], ["vendor/", "absent/"])
+    assert got == {tmp_path / "vendor/a/evil/.git", tmp_path / "vendor/b/.git"}
 
 
 @pytest.mark.parametrize("entries, expected", [
@@ -292,7 +327,8 @@ def test_index_gitlinks_cache(tmp_path: Path) -> None:
     assert rec["gitlinks"] == ["vendor"] and len(rec["sha256"]) == 64
     def put(gitlinks, sha=rec["sha256"], v=gg_mod.INDEX_CACHE_VERSION):
         cache.write_text(json.dumps({"v": v, "indexes": {str(idx): {"sha256": sha,
-                                                                    "gitlinks": gitlinks}}}))
+                                                                    "gitlinks": gitlinks,
+                                                                    "sparse": []}}}))
     # Consistent cache: reused as is (we tamper with it to prove it).
     put(["from-cache"])
     assert gg_mod.index_gitlinks(idx, cache) == ["from-cache"]
@@ -300,6 +336,8 @@ def test_index_gitlinks_cache(tmp_path: Path) -> None:
     cache.write_text(json.dumps({"sha256": rec["sha256"], "gitlinks": ["v1"]}))
     assert gg_mod.index_gitlinks(idx, cache) == ["vendor"]
     put(["old"], v=1)
+    assert gg_mod.index_gitlinks(idx, cache) == ["vendor"]
+    put(["old"], v=2)                           # before [87]: no sparse directories
     assert gg_mod.index_gitlinks(idx, cache) == ["vendor"]
     # Modified index: the cache no longer matches, re-parsed and rewritten.
     idx.write_bytes(_index_v2([(0o100644, b"f"), (0o160000, b"other")]))
@@ -557,12 +595,13 @@ def _cmd(aliases: dict | None = None):
 
 
 def test_exempt_from_switch() -> None:
-    """[66] [78] [79] the switch is the default; exempt: status, diff, commit,
-    config, and an alias every definition of which resolves to one of them."""
+    """[66] [78] [79] the switch is the default; exempt: status, diff, config,
+    var, and an alias every definition of which resolves to one of them;
+    commit is not since [86]."""
     f = gg_mod.exempt_from_switch
-    for w in ("status", "diff", "commit", "config", "Status", "DIFF"):
+    for w in ("status", "diff", "config", "var", "Status", "DIFF"):
         assert f([w], _cmd()), w
-    for w in ("checkout", "switch", "stash", "merge", "rebase", "pull", "cherry-pick", "revert",
+    for w in ("commit", "checkout", "switch", "stash", "merge", "rebase", "pull", "cherry-pick", "revert",
               "reset", "show", "log", "add", "push", "submodule", "worktree", "nonsense", "", "-p"):
         assert not f([w], _cmd()), w
     assert not f([], _cmd())
@@ -628,3 +667,18 @@ def test_with_ignored_submodule_dirt() -> None:
         "-C", "x", "--no-pager", "-c", "a=b", "-c", "diff.ignoreSubmodules=dirty", "checkout", "main"]
     assert gg_mod.with_ignored_submodule_dirt(["stash"], ["stash"]) == [
         "-c", "diff.ignoreSubmodules=dirty", "stash"]
+
+
+@pytest.mark.parametrize("tok, want", [
+    ("-F./c", {"./c"}),
+    ("-vF./c", {"F./c", "./c"}),
+    ("-i~/.ssh/k", {"~/.ssh/k"}),
+    ("-ikey", {"key", "ey", "y", ""}),
+    ("--file=./c", set()),               # split on `=` by _value_tokens
+    ("./c", set()),
+    ("-", set()),
+])
+def test_glued_values(tok: str, want: set[str]) -> None:
+    """[96] a short-option word yields its possible glued values, one after
+    each letter of its leading run, never one per character."""
+    assert gg_mod._glued_values({tok}) - {tok} == want

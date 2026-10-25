@@ -1421,3 +1421,469 @@ def test_work_tree_alone_to_a_missing_directory_is_refused(gg: GG, repo: Path, t
     gg.trust(repo)
     r = gg.run("git", f"--work-tree={tmp_path}/nope", "status", cwd=repo)
     assert r.blocked and "GIT_WORK_TREE" in r.err, r.text
+
+
+# ------------------------------- adversarial review of 2026-10-24 (second pass)
+# Findings [86]–[99] (adversarial review of 2026-10-24, second pass): each
+# test of gitguard has a positive control that runs the same planting with
+# the real git and must pass (if git stops doing it, the test may be moot).
+# The attacks refused at the check live in tests/attacks/ ([87] [88]
+# [90]–[94] [96]); their controls are here, calling the attack function
+# itself (its payload touches tmp_path/RAN). Still open, xfail(strict):
+# [89] and [95].
+from tests.attacks import config_scope as _cs, nested as _nested, symlinks as _links  # noqa: E402
+from tests.attacks._helpers import git_has  # noqa: E402
+from tests.conftest import GITGUARD  # noqa: E402
+
+EDITOR = "sh -c 'echo msg > \"$1\"' x"      # the user writes a message
+
+
+def _nested_repo(gg: GG, d: Path, mark: Path) -> None:
+    """A repository at `d` whose core.fsmonitor touches `mark`."""
+    assert gg.git("init", "-q", str(d)).rc == 0
+    (d / "s").write_text("s\n")
+    gg.git("add", "s", cwd=d)
+    gg.git("commit", "-qm", "s", cwd=d)
+    write_exec(d / ".git/fsm.sh", f"#!/bin/sh\ntouch '{mark}'\n")
+    gg.git("config", "core.fsmonitor", str(d / ".git/fsm.sh"), cwd=d)
+
+
+def _typechange_to_repo(gg: GG, repo: Path, mark: Path) -> None:
+    """[86] The sandbox replaces the tracked file `f` by a repository (no
+    gitlink in the index yet: the check passes) and edits another file, so
+    the user has something to commit."""
+    (repo / "g").write_text("g\n")
+    gg.git("add", "g", cwd=repo)
+    gg.git("commit", "-qm", "g", cwd=repo)
+    gg.trust(repo)
+    (repo / "f").unlink()
+    _nested_repo(gg, repo / "f", mark)
+    (repo / "g").write_text("g2\n")
+
+
+# commit forms that stage the typechange, then render the message template
+# (or the --dry-run/-v status): git enters the new gitlink. `-m` renders none.
+COMMIT_TYPECHANGE = {
+    "all": ["commit", "-a"],
+    "all_verbose": ["commit", "-a", "-v"],
+    "all_dry_run": ["commit", "-a", "--dry-run"],
+    "pathspec": ["commit", "f", "g"],
+    "include": ["commit", "-i", "f"],
+}
+
+
+@pytest.mark.parametrize("form", list(COMMIT_TYPECHANGE))
+def test_commit_stages_a_typechange_to_a_planted_repository(gg: GG, repo: Path, tmp_path: Path,
+                                                            form: str) -> None:
+    """[86] `commit` was in SWITCH_EXEMPT on the ground that it never
+    writes a gitlink from a tree; `commit -a` (or a pathspec) does, when the
+    sandbox replaced a tracked file by a repository: the typechange 100644 →
+    160000 is staged, then the message template's status entered it and ran
+    its fsmonitor, in the command whose check passed. Commit now gets the
+    switch."""
+    mark = tmp_path / "RAN"
+    _typechange_to_repo(gg, repo, mark)
+    assert not mark.exists() and not gg.check(repo).blocked
+    gg.env["GIT_EDITOR"] = EDITOR
+    gg.run("git", *COMMIT_TYPECHANGE[form], cwd=repo)
+    assert not mark.exists(), "the planted repository's fsmonitor ran during the commit"
+
+
+@pytest.mark.parametrize("form", list(COMMIT_TYPECHANGE))
+def test_commit_typechange_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path,
+                                                    form: str) -> None:
+    """[86] positive control: the real git runs the planted fsmonitor."""
+    mark = tmp_path / "RAN"
+    _typechange_to_repo(gg, repo, mark)
+    gg.env["GIT_EDITOR"] = EDITOR
+    gg.git(*COMMIT_TYPECHANGE[form], cwd=repo)
+    assert mark.exists(), f"git no longer enters the typechanged repository with {form}: may be moot"
+
+
+@pytest.mark.parametrize("form", list(COMMIT_TYPECHANGE))
+def test_commit_typechange_switch_keeps_git_out(gg: GG, repo: Path, tmp_path: Path,
+                                                form: str) -> None:
+    """[86] the switch the other commands get is enough here: with `-c
+    diff.ignoreSubmodules=dirty` the real git does not enter the new
+    gitlink."""
+    mark = tmp_path / "RAN"
+    _typechange_to_repo(gg, repo, mark)
+    gg.env["GIT_EDITOR"] = EDITOR
+    gg.git("-c", "diff.ignoreSubmodules=dirty", *COMMIT_TYPECHANGE[form], cwd=repo)
+    assert not mark.exists()
+
+
+# partial commits build a temporary index from HEAD: a gitlink the sandbox
+# committed (objects, refs: volatile) is in it, and the template enters it.
+COMMIT_FROM_HEAD = {
+    "pathspec": ["commit", "a"],
+    "only": ["commit", "-o", "a"],
+    "verbose": ["commit", "-v", "a"],
+    "dry_run": ["commit", "--dry-run", "a"],
+    "amend": ["commit", "--amend", "a"],
+}
+
+
+def _gitlink_in_head(gg: GG, tmp_path: Path, mark: Path) -> Path:
+    r = _two_branches(gg, tmp_path)
+    gg.trust(r)
+    _plant_gitlink(gg, r, mark, ref="refs/heads/feature")     # the branch the user is on
+    (r / "a").write_text("b\n")
+    return r
+
+
+@pytest.mark.parametrize("form", list(COMMIT_FROM_HEAD))
+def test_partial_commit_enters_a_gitlink_from_head(gg: GG, tmp_path: Path, form: str) -> None:
+    """[86] the sandbox moves the current branch to a commit with a
+    gitlink `vendor/x` on its planted repository; the index has none, the
+    check passes. `git commit a` resets a temporary index from HEAD,
+    gitlink included, and its message template ran `git status` in
+    `vendor/x`; with the switch it does not."""
+    mark = tmp_path / "RAN"
+    r = _gitlink_in_head(gg, tmp_path, mark)
+    assert not mark.exists() and not gg.check(r).blocked
+    gg.env["GIT_EDITOR"] = EDITOR
+    gg.run("git", *COMMIT_FROM_HEAD[form], cwd=r)
+    assert not mark.exists(), "the planted repository's fsmonitor ran during the commit"
+
+
+@pytest.mark.parametrize("form", list(COMMIT_FROM_HEAD))
+def test_partial_commit_control_real_git_runs_it(gg: GG, tmp_path: Path, form: str) -> None:
+    """[86] positive control: the real git runs the planted fsmonitor."""
+    mark = tmp_path / "RAN"
+    r = _gitlink_in_head(gg, tmp_path, mark)
+    gg.env["GIT_EDITOR"] = EDITOR
+    gg.git(*COMMIT_FROM_HEAD[form], cwd=r)
+    assert mark.exists(), f"git no longer enters the gitlink from HEAD with {form}: may be moot"
+
+
+# (the user's command, global config): git shows the submodule's content by
+# running `git diff` inside it, which `diff.ignoreSubmodules=dirty` does not stop.
+SUBMODULE_DIFF = {
+    "show_global": (["show", "main"], ["diff.submodule=diff"]),
+    "log_p_global": (["log", "-p", "-1", "main"], ["diff.submodule=diff"]),
+    "diff_revs_global": (["diff", "feature", "main"], ["diff.submodule=diff"]),
+    "show_flag": (["show", "--submodule=diff", "main"], []),
+    "log_p_flag": (["log", "-p", "--submodule=diff", "-1", "main"], []),
+}
+
+
+def _gitlink_with_diff_driver(gg: GG, tmp_path: Path, mark: Path, config: list) -> Path:
+    r = _two_branches(gg, tmp_path)
+    _set_global(gg, r, config)
+    gg.trust(r)
+    _plant_gitlink(gg, r, mark)
+    x = r / "vendor/x"
+    write_exec(x / ".git/ext.sh", f"#!/bin/sh\ntouch '{mark}'\n")
+    gg.git("config", "diff.external", str(x / ".git/ext.sh"), cwd=x)
+    return r
+
+
+@pytest.mark.xfail(strict=True, reason="[89] OPEN")
+@pytest.mark.parametrize("form", list(SUBMODULE_DIFF))
+def test_submodule_content_diff_enters_a_planted_repository(gg: GG, tmp_path: Path, form: str) -> None:
+    """[89] OPEN — the planting of [66], the nested repository's diff.external
+    as payload. With `diff.submodule = diff` (global) or `--submodule=diff`,
+    show/log -p/diff of the sandbox's commit run `git diff` inside
+    `vendor/x`, honouring its config: the switch only drops the dirty-tree
+    probe (match_stat_with_submodule), and `diff` is exempt from it."""
+    mark = tmp_path / "RAN"
+    cmd, config = SUBMODULE_DIFF[form]
+    r = _gitlink_with_diff_driver(gg, tmp_path, mark, config)
+    assert not mark.exists() and not gg.check(r).blocked
+    gg.run("git", *cmd, cwd=r)
+    assert not mark.exists(), "the planted repository's diff driver ran"
+
+
+@pytest.mark.parametrize("form", list(SUBMODULE_DIFF))
+def test_submodule_content_diff_control_real_git_runs_it(gg: GG, tmp_path: Path, form: str) -> None:
+    """[89] positive control: the real git, with the switch gitguard adds
+    today, still runs the planted diff driver."""
+    mark = tmp_path / "RAN"
+    cmd, config = SUBMODULE_DIFF[form]
+    r = _gitlink_with_diff_driver(gg, tmp_path, mark, config)
+    gg.git("-c", "diff.ignoreSubmodules=dirty", *cmd, cwd=r)
+    assert mark.exists(), f"git no longer diffs inside the submodule with {form}: may be moot"
+
+
+def _on_tty(argv: list[str], env: dict, cwd: Path) -> bytes:
+    """Run `argv` with stdin, stdout and stderr on a pseudo-terminal (the
+    user typing the command): git starts its pager only on a terminal."""
+    import pty
+    import select
+    import subprocess
+    import time
+    master, slave = pty.openpty()
+    p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=slave, stdout=slave, stderr=slave,
+                         close_fds=True)
+    os.close(slave)
+    out, deadline = b"", time.monotonic() + 30
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([master], [], [], 0.2)
+        if ready:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        elif p.poll() is not None:
+            break
+    p.wait(timeout=30)
+    os.close(master)
+    return out
+
+
+def _tracked_include_branch(gg: GG, tmp_path: Path, mark: Path) -> Path:
+    """[95] The user: a tracked project config `.gitconfig`, included from
+    `.git/config` (`include.path = ../.gitconfig`), trusted. The sandbox:
+    objects and a ref only — a branch `agent` whose `.gitconfig` sets
+    `pager.maintenance`."""
+    r = tmp_path / "r"
+    gg.git("init", "-q", str(r))
+    (r / ".gitconfig").write_text("[alias]\n\tst = status\n")
+    gg.git("add", ".gitconfig", cwd=r)
+    gg.git("commit", "-qm", "init", cwd=r)
+    gg.git("config", "include.path", "../.gitconfig", cwd=r)
+    gg.trust(r)
+    import subprocess
+    run = lambda text, *a: subprocess.run(["git", *a], cwd=r, env=gg.env, input=text,
+                                          capture_output=True, text=True, check=True).stdout.strip()
+    blob = run(f"[pager]\n\tmaintenance = touch '{mark}'; cat\n", "hash-object", "-w", "--stdin")
+    tree = run(f"100644 blob {blob}\t.gitconfig\n", "mktree")
+    c = run("", "commit-tree", "-p", "HEAD", "-m", "agent work", tree)
+    gg.git("update-ref", "refs/heads/agent", c, cwd=r)
+    return r
+
+
+@pytest.mark.xfail(strict=True, reason="[95] OPEN — variant of [44], decision pending")
+def test_merge_checks_out_a_tracked_include_then_reads_it(gg: GG, tmp_path: Path) -> None:
+    """[95] OPEN — variant of [44] for config: a tracked file the trusted
+    config includes. Nothing in the fingerprint changes (objects, refs);
+    `git merge --ff-only agent` checks the new `.gitconfig` out, then spawns
+    `git maintenance run --auto`, which reads it and starts its "pager" on
+    the user's terminal."""
+    mark = tmp_path / "RAN"
+    r = _tracked_include_branch(gg, tmp_path, mark)
+    assert not gg.check(r).blocked
+    _on_tty([sys.executable, str(GITGUARD), "git", "merge", "-q", "--ff-only", "agent"], gg.env, r)
+    assert not mark.exists(), "pager.maintenance from the sandbox's branch ran during the merge"
+
+
+def test_tracked_include_control_real_git_runs_it(gg: GG, tmp_path: Path) -> None:
+    """[95] positive control: the real git, on a terminal, runs it."""
+    mark = tmp_path / "RAN"
+    r = _tracked_include_branch(gg, tmp_path, mark)
+    _on_tty(["git", "merge", "-q", "--ff-only", "agent"], gg.env, r)
+    assert mark.exists(), "the merge no longer reads the checked-out include: [95] may be moot"
+
+
+def _gitdir_at_root(repo: Path, mark: Path) -> None:
+    """[97] The sandbox lays a gitdir out in the root of the tree (untracked
+    files): HEAD, objects/, refs/, a config with an alias."""
+    (repo / "HEAD").write_text("ref: refs/heads/main\n")
+    (repo / "objects").mkdir()
+    (repo / "refs").mkdir()
+    (repo / "config").write_text(f"[core]\n\tbare = true\n[alias]\n\tlg = !touch '{mark}'\n")
+
+
+def test_bare_option_opens_the_cwd_as_gitdir(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[97] `git --bare <cmd>` makes git take the cwd as its gitdir
+    (handle_options sets GIT_DIR); gitguard took `--bare` for an inert flag,
+    found the repository from the cwd and checked its trusted `.git`."""
+    mark = tmp_path / "RAN"
+    _gitdir_at_root(repo, mark)
+    assert not gg.check(repo).blocked
+    gg.run("git", "--bare", "lg", cwd=repo)
+    assert not mark.exists(), "git ran the config of the gitdir planted in the tree"
+
+
+def test_bare_option_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[97] positive control."""
+    mark = tmp_path / "RAN"
+    _gitdir_at_root(repo, mark)
+    gg.git("--bare", "lg", cwd=repo)
+    assert mark.exists(), "git --bare no longer opens the cwd: [97] may be moot"
+
+
+TEMPLATE_ABBREVS = ["--templ", "--templa", "--templat"]
+
+
+def _new_repo_with_template(gg: GG, tmp_path: Path, cmd: str, opt: str) -> list[str]:
+    tpl = _tpl(tmp_path)
+    src = [str(make_source(gg, tmp_path))] if cmd == "clone" else []
+    return [cmd, "-q", f"{opt}={tpl}", *src, "c"]
+
+
+@pytest.mark.parametrize("opt", TEMPLATE_ABBREVS)
+@pytest.mark.parametrize("cmd", ["init", "clone"])
+def test_template_option_abbreviated_no_autotrust(gg: GG, tmp_path: Path, cmd: str, opt: str) -> None:
+    """[98] git's parse-options accepts any unique prefix of a long
+    option: `--templ=<dir>` copies the template's hooks, but parse_new_repo
+    recognised `--template` only, and auto-trusted the new repository with
+    them ([42])."""
+    res = gg.run("git", *_new_repo_with_template(gg, tmp_path, cmd, opt), cwd=tmp_path)
+    assert res.rc == 0, res.text
+    assert gg.check(tmp_path / "c").blocked
+
+
+@pytest.mark.parametrize("opt", TEMPLATE_ABBREVS)
+@pytest.mark.parametrize("cmd", ["init", "clone"])
+def test_template_option_abbreviated_control(gg: GG, tmp_path: Path, cmd: str, opt: str) -> None:
+    """[98] positive control: the real git takes the abbreviation for
+    `--template` and copies the hook."""
+    assert gg.git(*_new_repo_with_template(gg, tmp_path, cmd, opt), cwd=tmp_path).rc == 0
+    assert (tmp_path / "c/.git/hooks/post-checkout").exists()
+
+
+def _fifo_at(repo: Path, rel: str) -> None:
+    p = repo / rel
+    if p.exists():
+        p.unlink()
+    os.mkfifo(p)
+
+
+def _fifo_include(repo: Path, rel: str) -> None:
+    os.mkfifo(repo / ".git/team.inc")
+    with open(repo / ".git/config", "a") as f:
+        f.write("[include]\n\tpath = team.inc\n")
+
+
+def _symlink_to_fifo(repo: Path, rel: str) -> None:
+    os.mkfifo(repo.parent / "fifo")
+    (repo / rel).unlink()
+    os.symlink(repo.parent / "fifo", repo / rel)
+
+
+FIFO_PLANTINGS = {
+    "config": (_fifo_at, ".git/config"),
+    "index": (_fifo_at, ".git/index"),
+    "HEAD": (_fifo_at, ".git/HEAD"),
+    "include": (_fifo_include, ""),
+    "symlink_config": (_symlink_to_fifo, ".git/config"),
+}
+
+
+@pytest.mark.parametrize("where", list(FIFO_PLANTINGS))
+def test_fifo_is_refused_not_waited_on(gg: GG, repo: Path, where: str) -> None:
+    """[99] a FIFO in place of a file git reads (`.git/config`, the index,
+    HEAD, an included file, or a symlink to a FIFO): the reader blocked in
+    open() for ever. Fail closed (git never ran) but a denial of service
+    that pushes the user toward the real git. Refused at once now, with the
+    file named (or, for HEAD, no repository: git finds none either)."""
+    import subprocess
+    plant, rel = FIFO_PLANTINGS[where]
+    plant(repo, rel)
+    r = subprocess.run([sys.executable, str(GITGUARD)], cwd=repo, env=gg.env,
+                       capture_output=True, text=True, timeout=5)
+    assert r.returncode != 0, r.stdout + r.stderr
+    if where != "HEAD":
+        assert "not a regular file" in r.stderr, r.stderr
+
+
+def test_dev_null_global_config_is_read_as_empty(gg: GG, repo: Path) -> None:
+    """[99] the one device git reads like a file: GIT_CONFIG_GLOBAL=/dev/null
+    (a common idiom) still reads empty, not refused."""
+    gg.env["GIT_CONFIG_GLOBAL"] = os.devnull
+    r = gg.run("git", "status", cwd=repo)
+    assert r.rc == 0 and "On branch" in r.out, r.text
+
+
+# ----------------------- positive controls of the attacks [87] [88] [90]–[94] [96]
+def test_sparse_index_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[87] the sparse index hides the gitlink from gitguard's parser, not
+    from git: `git status` expands it and runs the planted fsmonitor."""
+    from gitguard import index_gitlinks
+    _nested.attack_sparse_index_hides_gitlink(gg, repo, tmp_path)
+    assert index_gitlinks(repo / ".git/index") == []
+    gg.git("status", cwd=repo)
+    assert (tmp_path / "RAN").exists(), "git no longer expands the sparse entry: [87] may be moot"
+
+
+def test_hardlink_hook_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[88] `git commit --amend --no-edit` writes the sandbox's message into
+    the hook's inode and runs it."""
+    _links.attack_hardlink_commit_editmsg_to_hook(gg, repo, tmp_path)
+    gg.git("commit", "-q", "--amend", "--no-edit", cwd=repo)
+    assert (tmp_path / "RAN").exists(), "git no longer writes COMMIT_EDITMSG in place: [88] may be moot"
+
+
+def test_hardlink_tree_hook_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[88] the same with the hook in the tree."""
+    _links.attack_hardlink_commit_editmsg_to_tree_hook(gg, repo, tmp_path)
+    gg.git("commit", "-q", "--amend", "--no-edit", cwd=repo)
+    assert (tmp_path / "RAN").exists()
+
+
+def test_hardlink_is_what_runs_the_message(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[88] counter-control: the same commit without the link — git does not
+    execute a commit message."""
+    from tests.attacks._helpers import hardlink_editmsg_to_hook, payload
+    hook = repo / ".git/hooks/commit-msg"
+    write_exec(hook, "#!/bin/sh\nexit 0\n")
+    hardlink_editmsg_to_hook(gg, repo, hook, str(payload(tmp_path)))
+    (repo / ".git/COMMIT_EDITMSG").unlink()                 # the link removed
+    gg.git("commit", "-q", "--amend", "--no-edit", cwd=repo)
+    assert not (tmp_path / "RAN").exists()
+
+
+@pytest.mark.skipif(not git_has("alias_subsection"), reason="git without `[alias \"x\"] command`")
+def test_alias_subsection_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[90] git 2.54 runs `git ci` with the alias's hooksPath."""
+    _cs.attack_alias_subsection_config_hookspath(gg, repo, tmp_path)
+    (repo / "f").write_text("b\n")
+    gg.git("ci", "-qam", "x", cwd=repo)
+    assert (tmp_path / "RAN").exists()
+
+
+@pytest.mark.skipif(not git_has("optional_path"), reason="git without `:(optional)` paths")
+@pytest.mark.parametrize("scope", ["local", "global"])
+def test_optional_hookspath_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path,
+                                                     scope: str) -> None:
+    """[91] git 2.52+ strips `:(optional)` and runs `.githooks/post-checkout`."""
+    getattr(_cs, f"attack_optional_hookspath_{scope}")(gg, repo, tmp_path)
+    gg.git("checkout", "-q", "-b", "x", cwd=repo)
+    assert (tmp_path / "RAN").exists()
+
+
+def _submodule_update(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """Leave the submodule one commit behind (that checkout runs the hook
+    too: the mark is cleared after it), then `git submodule update`."""
+    gg.git("checkout", "-q", "HEAD~1", cwd=repo / "sub")
+    (tmp_path / "RAN").unlink(missing_ok=True)
+    gg.git("submodule", "-q", "update", cwd=repo)
+
+
+@pytest.mark.skipif(not git_has("config_hooks"), reason="git without config-based hooks")
+def test_global_config_hook_submodule_control_real_git_runs_it(gg: GG, repo: Path,
+                                                               tmp_path: Path) -> None:
+    """[92] git 2.54 runs the global config hook in the submodule's tree."""
+    _cs.attack_global_config_hook_relative_in_submodule(gg, repo, tmp_path)
+    _submodule_update(gg, repo, tmp_path)
+    assert (tmp_path / "RAN").exists()
+
+
+def test_shared_include_submodule_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[93] git applies the shared include's hooksPath in the submodule."""
+    _cs.attack_shared_include_in_superproject_and_submodule(gg, repo, tmp_path)
+    _submodule_update(gg, repo, tmp_path)
+    assert (tmp_path / "RAN").exists()
+
+
+def test_symlinked_include_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[94] git reads `shared/local.inc`, next to the link."""
+    _cs.attack_relative_include_inside_symlinked_include(gg, repo, tmp_path)
+    gg.git("status", cwd=repo)
+    assert (tmp_path / "RAN").exists()
+
+
+@pytest.mark.parametrize("attack", [_cs.attack_ssh_config_glued_to_short_option,
+                                    _cs.attack_ssh_config_glued_in_option_cluster])
+def test_glued_ssh_option_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path,
+                                                   attack) -> None:
+    """[96] ssh reads the glued `-F` file, alone or in a cluster: its
+    ProxyCommand runs."""
+    attack(gg, repo, tmp_path)
+    gg.git("fetch", "-q", "origin", cwd=repo)
+    assert (tmp_path / "RAN").exists()

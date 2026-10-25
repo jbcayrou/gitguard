@@ -1,4 +1,5 @@
-"""Symlinks: redirection of .git, refs/, hooks, and links added at depth."""
+"""Symlinks: redirection of .git, refs/, hooks, and links added at depth.
+Hard links: a volatile file sharing the inode of a watched one. [88]"""
 from __future__ import annotations
 
 import os
@@ -112,3 +113,26 @@ def attack_lost_found_symlink_for_fsck(gg: GG, repo: Path, tmp_path: Path) -> No
                          check=True).stdout.strip()
     (repo / ".git/lost-found/other").mkdir(parents=True)
     (repo / ".git/lost-found/other" / sha).symlink_to("../../hooks/post-commit")
+
+
+def attack_hardlink_commit_editmsg_to_hook(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[88] `.git/COMMIT_EDITMSG` (volatile) hard-linked to the trusted
+    `hooks/commit-msg`: the hook's bytes are unchanged at the check, `git
+    commit --amend` writes the sandbox's message into that inode, then runs
+    it (positive control: test_commands)"""
+    from tests.attacks._helpers import hardlink_editmsg_to_hook, payload
+    hook = repo / ".git/hooks/commit-msg"
+    write_exec(hook, "#!/bin/sh\nexit 0\n")
+    gg.trust(repo)
+    hardlink_editmsg_to_hook(gg, repo, hook, str(payload(tmp_path)))
+
+
+def attack_hardlink_commit_editmsg_to_tree_hook(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[88] the same into a hook of the tree (local core.hooksPath =
+    .githooks, a husky layout): a global core.hooksPath is no help there"""
+    from tests.attacks._helpers import hardlink_editmsg_to_hook, payload
+    hook = repo / ".githooks/commit-msg"
+    write_exec(hook, "#!/bin/sh\nexit 0\n")
+    gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
+    gg.trust(repo)
+    hardlink_editmsg_to_hook(gg, repo, hook, str(payload(tmp_path)))

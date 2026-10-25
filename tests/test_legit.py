@@ -520,6 +520,26 @@ def test_global_program_path_that_is_a_symlink(gg: GG, repo: Path, tmp_path: Pat
     assert not gg.check(repo).blocked
 
 
+def test_global_program_path_that_is_a_hard_link(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[88] `gpg.program = /opt/homebrew/bin/gpg` where the binary has other
+    names (Homebrew's Cellar hard-links some, on the same volume as $HOME
+    on macOS), a hard-linked dotfile: the hard-link refusal covers the tree
+    and the gitdir only — the sandbox can link nothing else — so a program
+    named outside them is watched by its bytes, never refused."""
+    real = tmp_path / "opt/Cellar/gpg/bin/gpg"
+    write_exec(real, "#!/bin/sh\nexit 0\n")
+    other = tmp_path / "opt/Cellar/gpg/bin/gpg2"
+    os.link(real, other)
+    link = tmp_path / "opt/bin/gpg"           # Homebrew's symlink to the Cellar
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real)
+    for prog in (real, link):
+        gg.git("config", "--global", "gpg.program", str(prog))
+        r = gg.run("trust", cwd=repo)
+        assert r.rc == 0, r.text
+        assert not gg.check(repo).blocked, gg.check(repo).text
+
+
 def test_linked_worktree_of_a_submodule(gg: GG, repo: Path, tmp_path: Path) -> None:
     """[76] `git -C sub worktree add ../subwt`: git ignores the
     common config's core.worktree in a linked worktree; open_repo applied
@@ -592,11 +612,12 @@ def test_stash_pop_in_a_repository_with_a_submodule(gg: GG, repo: Path, subsrc: 
 
 
 def test_exempt_commands_still_report_a_dirty_submodule(gg: GG, repo: Path, subsrc: Path) -> None:
-    """[66] the switch is the default; status, diff, commit and config — also
+    """[66] the switch is the default; status, diff and config — also
     through an alias of theirs — run without it, so a submodule whose own
     tree is dirty is still reported and `git config --list` shows nothing
-    gitguard added. Through a shell alias (`!git status`, not resolved) the
-    switch is on: the dirt goes unreported there, the documented price."""
+    gitguard added. Through a shell alias (`!git status`, not resolved) and
+    in commit's dry run and template ([86]) the switch is on: the dirt goes
+    unreported there, the documented price."""
     assert gg.git("submodule", "add", "-q", str(subsrc), "sub", cwd=repo).rc == 0
     gg.git("commit", "-qm", "sub", cwd=repo)
     gg.git("config", "--global", "alias.st", "status", cwd=repo)
@@ -604,9 +625,11 @@ def test_exempt_commands_still_report_a_dirty_submodule(gg: GG, repo: Path, subs
     gg.git("config", "--global", "alias.sst", "!git status", cwd=repo)
     gg.trust(repo)
     (repo / "sub/s").write_text("dirty\n")
-    for args in (["status"], ["st"], ["s"], ["commit", "--dry-run"]):
+    for args in (["status"], ["st"], ["s"]):
         r = gg.run("git", *args, cwd=repo)
         assert r.rc in (0, 1) and "modified content" in r.out, (args, r.text)
+    r = gg.run("git", "commit", "--dry-run", cwd=repo)
+    assert r.rc in (0, 1) and "Changes not staged" not in r.out, r.text
     r = gg.run("git", "status", "--short", cwd=repo)
     assert " m sub" in r.out, r.text
     r = gg.run("git", "diff", "--submodule=log", cwd=repo)

@@ -358,7 +358,7 @@ refused (git itself reads it against two different directories in one run).
   git dies on in a config file is refused.
 
 `DESIGN.md` holds the design notes, the review method and the catalogue of
-the 57 bypasses and false positives found so far (`tests/attacks/`).
+the 99 bypasses and false positives found so far (`tests/attacks/`).
 
 ## Tests
 
