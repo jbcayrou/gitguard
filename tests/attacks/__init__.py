@@ -569,6 +569,19 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      adversarial review (six agents, 2026-10-24), replayed against git 2.50
      and 2.54; not yet against 2.47.3 (Debian VM). All fixed on
      2026-10-25 but [89] and [95], still open.
+[100] False positives from the inventory of git's source (tests/inventory.py,
+     2026-10-26): every name git opens under a gitdir, held to gitguard's
+     tables by test_claims.py. Four edit buffers at the gitdir root were
+     neither volatile nor read: `ADD_EDIT.patch` (`add -e`), `NOTES_EDITMSG`
+     (`notes add|edit`) when the editor fails (`:cq`), `REPLACE_EDITOBJ`
+     (`replace --edit`) when the editor changes nothing — the next command
+     was refused, every time, until a `trust`. `MERGE_LABELS` and
+     `rebased-patches` are the same class. And three pathname keys git reads
+     as data (`fsck.skipList`, `fetch.fsck.skipList`, `receive.fsck.skipList`,
+     `http.sslCAPath`) were not in DATA_KEYS: the [56] trap for a file of
+     object ids. The method, not a review, found them: the bottom-up
+     catalogue above took fourteen passes to cover a universe git's source
+     enumerates under five signatures (DESIGN.md, "Tests").
 """
 from __future__ import annotations
 

@@ -681,3 +681,22 @@ def test_sparse_checkout_patterns(gg: GG, repo: Path) -> None:
     assert not gg.check(repo).blocked, gg.check(repo).text
     assert gg.git("sparse-checkout", "reapply", cwd=repo).rc == 0
     assert not gg.check(repo).blocked
+
+
+def test_editor_aborted_leaves_edit_buffers(gg: GG, repo: Path) -> None:
+    """[100] `add -e` and `notes add` with an editor that fails (`:cq`),
+    `replace --edit` with one that changes nothing, leave ADD_EDIT.patch,
+    NOTES_EDITMSG and REPLACE_EDITOBJ at the gitdir root: data git never
+    runs; the next command used to be refused. Found by the inventory of
+    git's source (tests/inventory.py), not by a review."""
+    gg.env["GIT_EDITOR"] = "false"
+    (repo / "f").write_text("b\n")
+    gg.git("add", "-e", cwd=repo)
+    gg.git("notes", "add", "HEAD", cwd=repo)
+    gg.env["GIT_EDITOR"] = "true"
+    gg.git("replace", "--edit", "HEAD", cwd=repo)
+    left = [n for n in ("ADD_EDIT.patch", "NOTES_EDITMSG", "REPLACE_EDITOBJ")
+            if (repo / ".git" / n).exists()]
+    assert left, "git left no edit buffer behind: scenario void"
+    r = gg.check(repo)
+    assert not r.blocked, (left, r.text)

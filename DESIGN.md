@@ -283,7 +283,8 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
      joined names, ~30 ms once on a 96k-entry index, then cached. The way
      out named by the refusal: delete the index, `git reset` rebuilds it
      from the commits, which git validates.
-   - `check_rebase_todo`: no `exec`/`x` line in `rebase-merge/git-rebase-todo`,
+   - `check_volatile_readers` (`VOLATILE_READERS`, one reader per volatile
+     file git reads back as instructions): no `exec`/`x` line in `rebase-merge/git-rebase-todo`,
      `rebase-apply/git-rebase-todo` or `sequencer/todo` — these files live in
      volatile directories (git rewrites them at every step, they cannot be
      fingerprinted) but git executes their `exec` lines. Any blank after the
@@ -351,17 +352,29 @@ stash, bisect, notes, gc, repack, fsck do not alert. On a false positive for
 an ordinary git operation, **add the file to the exclusion list**, never go
 back to an inclusion list.
 
-The exclusions are **anchored**: a name from `VOLATILE_DIRS` only counts
-directly under a gitdir root — the gitdir itself or a `modules/<x>` /
-`worktrees/<x>`, recognised by the presence of a `HEAD` or `commondir` during
-the top-down walk (`_child_root`). Without this anchoring, a submodule named
-`lfs`, `refs`, `pack`… made its whole gitdir invisible ([15]). Same for
-`objects/pack`, `objects/??`, `objects/info/commit-graphs` and the volatile
-files, which only count at their real position. A nested root is only
-recognised **under `modules/` or `worktrees/`** of a root (a forged
-`.git/hooks/HEAD` made `hooks/` a root, [29]); and `VOLATILE_RELPATHS`
-(`info/refs`, `objects/info/packs`…) is tested relative to the closest root,
-not to the gitdir base (`git gc` in a submodule alerted, [26]).
+The exclusions are **anchored by construction**: `VOLATILE_DIRS` and
+`VOLATILE_FILES` hold paths relative to a gitdir root — the gitdir itself
+or a `modules/<x>` / `worktrees/<x>`, recognised by the presence of a
+`HEAD` or `commondir` during the top-down walk (`_child_root`) — and the
+walk looks each entry up by its path from the closest root (`refs`,
+`objects/pack`, `objects/info/commit-graphs`, `info/refs`…; `objects/??`
+by pattern). Without this anchoring, a submodule named `lfs`, `refs`,
+`pack`… made its whole gitdir invisible ([15]); a relative path tested
+against the gitdir base instead of the closest root alerted on `git gc`
+in a submodule ([26]). A nested root is only recognised **under
+`modules/` or `worktrees/`** of a root (a forged `.git/hooks/HEAD` made
+`hooks/` a root, [29]). The volatile files git reads back as instructions
+(todo lists, a merge strategy) each have a reader in `VOLATILE_READERS`
+(`check_volatile_readers`): neither hashed nor ignored.
+
+The universe these tables classify is git's own. `tests/inventory/` holds
+every name git opens under a gitdir, taken from git's source
+(`GIT_PATH_FUNC`, `repo_git_path`), and `test_claims.py` requires each one
+to be volatile here, read by a reader, or hashed on purpose (`config`,
+`info/attributes`, `objects/info/alternates`…). The four edit buffers an
+aborted editor leaves at the root (`ADD_EDIT.patch`, `NOTES_EDITMSG`,
+`REPLACE_EDITOBJ`, [100]) came out of that list on the first run, not out
+of a review.
 
 ## What the fingerprint watches outside the gitdir
 
@@ -587,7 +600,7 @@ refusal message.
 `_validate_headref` / `is_bare_gitdir` / `find_root` (discovery, git's
 order); `Repo` (root/gitdir/common/anchor, `nested` and `gitfiles` cached) →
 `open_repo` (gitfile, commondir, `core.worktree`);
-`check_structure` (refuses; `check_split_index`, `check_rebase_todo`);
+`check_structure` (refuses; `check_split_index`, `check_volatile_readers`);
 `ConfigScan` (one pass over every config source: `refs`, what the config
 makes git read outside the gitdir; `remote_names`; `cmd`, the aliases;
 `add` records a path, `consider` reads one entry, `run` orders the
@@ -602,7 +615,7 @@ in the only safe order (scan, structure, fingerprint) for every caller —
 was computed and shown. `gitdir_paths` is the **only** walk of the
 gitdir (volatile pruned): the fingerprint and the control-character scan of
 `check_structure` both use it. The volatile rules live **once** in
-`_child_root` / `_zone` / `_volatile_dir` / `_volatile_file`, shared by
+`_child_root` / `_volatile_dir` / `_volatile_file`, shared by
 `walk_gitdir` and `gitdir_excluded` (two copies had drifted apart: flaw [22]).
 `Manifest` (version/root/refs/entries, `current`) ← `load_manifest`;
 `load_pending` / `update_pending` (flock on the state directory) / `record_pending` / `caller_chain` /
@@ -1021,7 +1034,27 @@ to run before any change:
   clone -h` / `git init -h` ([98]), the indexes git writes carry no
   required extension the parser refuses ([87]). Each of these lists fell
   in a review because the tests checked the known attacks, not the claim;
-  a list added to gitguard.py gets its test here.
+  a list added to gitguard.py gets its test here. The second half holds
+  the lists to **the inventory** (below): every gitdir name, pathname key,
+  hook and global option git's source names is classified, and a corpus
+  of program keys (`PROGRAM_KEYS`, curated: git has no single signature
+  for "a value it runs") proves the generic rule reaches each value syntax.
+- `tests/inventory.py` and `tests/inventory/git-<ver>.txt` — **git's
+  universe, from its source**: the names git opens under a gitdir
+  (`GIT_PATH_FUNC`, `repo_git_path`), the config keys it reads through
+  `git_config_pathname`, the hooks of `githooks.adoc`, the options of
+  `git.c`. The bypass catalogue grew one case at a time for fourteen
+  passes ([19] [51] [55] [83] [88] each a gitdir name nobody had listed,
+  [56] a pathname key, [97] a global option) because that universe was
+  never written down; five regular expressions over git's source
+  enumerate it. The snapshot is committed, the suite does not need git's
+  source. **On a git upgrade**: clone the release, `python3
+  tests/inventory.py <src> > tests/inventory/git-<ver>.txt`, `diff` the
+  two snapshots, classify every new line (volatile, reader, hashed,
+  DATA_KEYS, DIR_KEYS, a global option), then `pytest -m discovery` and
+  the full suite. `:(optional)` ([91]), `hook.<name>.command` ([92]) and
+  the subsection alias ([90]) were release changes a review found; the
+  diff shows them first.
 - `tests/conftest.py` — fixtures: `gg` (isolated environment: HOME, state,
   global config in `tmp_path`), `repo` (clean trusted repository), `subsrc`.
   The scenarios are built with `REAL_GIT`, the first `git` (or `git.real`)
@@ -1144,6 +1177,33 @@ cross-check the code paths that assume "already fingerprinted"; anchor
 exclusions to a position, never to a bare name; hash what a link designates,
 not just where it points; a directory is never watched unless git reads its
 content; fail closed on anything the parser cannot make sense of.
+
+## The command that writes what it then reads
+
+Six entries of the catalogue are one class, found one at a time: [44] (a
+tracked hook checked out, then run), [66] and [77] (a gitlink checked out
+or re-applied by an autostash, then entered by the status), [86] (a
+gitlink staged by `commit -a`, then entered by the message template),
+[88] (a hard link filled by `commit --amend`, then run as the hook), [95]
+(a tracked include checked out by `merge`, then read by its
+`maintenance`). gitguard checks, then git runs: whatever git **writes
+during the command and reads back before it ends** is outside the
+fingerprint by construction — refs and objects are volatile, the tree is
+not walked, and the state at the check is the trusted one. Not a flaw of
+one check, the boundary of a check-then-exec design.
+
+The rule for a new member of the class: if git has a switch that keeps it
+from reading what it wrote (`-c diff.ignoreSubmodules=dirty` for the
+gitlink, [66]), the switch goes on every command with a closed exemption
+(`SWITCH_EXEMPT`, each entry held to git in `test_claims.py`); if the file
+is a link, the structure check refuses it ([88]); otherwise it is an
+accepted limitation with a `trust`-time warning ([44], [95]), and the
+prevention layer is the answer (a global `core.hooksPath` outside every
+tree, `safe.bareRepository=explicit`, a mount the sandbox cannot write
+`.git/` on). Finding the next member is a reading of a command's flow in
+git's source (`builtin/<cmd>.c`: what it writes under the gitdir or the
+tree, what it reads after), not a grep: the inventory lists the files, not
+the order.
 
 ## Known limitations (do not "fix" without thinking)
 

@@ -39,7 +39,7 @@ paid for by a bypass.
   (`DESIGN.md`, "Nested repositories").
 - **The state directory stays outside the repository.**
 - **Exclusions are anchored** to a position under a gitdir root, never to a
-  bare name (`_child_root`, `_zone`).
+  bare name (`_child_root`, paths relative to a root in `VOLATILE_*`).
 - **A directory is watched only for keys git reads it from** (`DIR_KEYS`);
   one that contains the repository, at depth 1 only;
   a file is not watched for keys git reads as data (`DATA_KEYS`).
@@ -72,8 +72,8 @@ are honoured as git honours them.
 | topic | code | DESIGN.md section |
 |---|---|---|
 | discovery, gitfile, commondir, `core.worktree` | `find_root`, `is_bare_gitdir`, `open_repo`, `_core_worktree` (section "discovery", `pytest -m discovery` after a git upgrade) | What the script checks, 1–2 |
-| structural refusals (nested `.git`, index names, todo files, symlinks, perms) | `check_structure`, `check_indexes`, `check_rebase_todo` | What the script checks, 3 |
-| what is hashed in the gitdir | `walk_gitdir`, `_child_root`, `_zone`, `_volatile_*` | What the fingerprint watches in the gitdir |
+| structural refusals (nested `.git`, index names, todo files, symlinks, perms) | `check_structure`, `check_indexes`, `check_volatile_readers`, `VOLATILE_READERS` | What the script checks, 3 |
+| what is hashed in the gitdir | `walk_gitdir`, `_child_root`, `_volatile_*`, `VOLATILE_DIRS`, `VOLATILE_FILES` (paths relative to a gitdir root) | What the fingerprint watches in the gitdir |
 | paths the config makes git read | `ConfigScan` (`add`, `consider`, `run`), `config_refs`, `DIR_KEYS`, `DATA_KEYS`, `global_config_files`, `iter_global_config`, `env_config` | What the fingerprint watches outside the gitdir |
 | the check pipeline (scan → structure → fingerprint) | `inspect`, `Inspection`, `save_trust` | Organization of gitguard.py |
 | config parser | `_Src`, `_parse_value`, `parse_git_config` | same, "Config files parsed" |
@@ -83,6 +83,7 @@ are honoured as git honours them.
 | passthroughs that read no repository | `TRANSPORT`, `main` | Which git runs |
 | the gitlink brought by the command (the switch on every command, the exemption, aliases) | `SWITCH_EXEMPT`, `CmdConfig`, `exempt_from_switch`, `_alias_parts`, `with_ignored_submodule_dirt` | Nested repositories |
 | performance | PERF.md | Nested repositories (end) |
+| what git writes then reads in one command ([44] [66] [77] [86] [88] [95]) | `SWITCH_EXEMPT`, `_hard_link` | The command that writes what it then reads |
 | accepted limitations [44], [71], [74], out-of-scope cases | — | Known limitations |
 
 ## Tests
@@ -101,6 +102,11 @@ any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
 - `tests/test_claims.py` — every closed list of claims about git in
   gitguard.py (`GLOBAL_FLAGS`, `SWITCH_EXEMPT`, `NEW_REPO_OPTIONS`, index
   extensions) held to git as the oracle; a new list gets its test there.
+  Its second half holds the lists to `tests/inventory/git-<ver>.txt`,
+  git's universe taken from its source by `tests/inventory.py` (gitdir
+  names, pathname keys, hooks, global options): every item must be
+  classified. **On a git upgrade**: regenerate the snapshot from the
+  release's source, diff, classify the new lines (DESIGN.md, "Tests").
 - `tests/test_commands.py`, `test_nested.py`, `test_prompt.py` (pty),
   `test_pending.py`, `test_unit.py`.
 - The scenarios use `REAL_GIT` (conftest): on a machine where `git` *is*

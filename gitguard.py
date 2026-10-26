@@ -129,42 +129,41 @@ INCLUDE_DEPTH = 10      # git: MAX_INCLUDE_DEPTH = 10
 # Volatile: what git rewrites during normal operation. Everything else in the
 # gitdir is watched (deny-by-default inversion, see DESIGN.md).
 #
-# These names are **anchored**: they only count directly under a gitdir root
-# (the gitdir itself, or `modules/<x>/`, `worktrees/<x>/`, recognised by the
-# presence of a HEAD or commondir file). Otherwise a submodule named `lfs` or
-# `refs` would make its whole gitdir invisible — bypass found in review.
+# Every entry is a path **relative to a gitdir root** (the gitdir itself, or
+# `modules/<x>/`, `worktrees/<x>/`, recognised by the presence of a HEAD or
+# commondir file, _child_root): `refs` is `<root>/refs` and nothing else,
+# `objects/pack` is under the root's `objects/`. Anchoring by construction:
+# a submodule named `lfs` or `refs` made its whole gitdir invisible when the
+# names applied at any depth [15]; `info/refs` tested against the gitdir base
+# instead of the closest root alerted on `git gc` in a submodule [26]. The
+# universe these tables classify is git's own: tests/inventory/ lists every
+# name git opens under a gitdir, test_claims.py holds each one to an entry
+# here, a reader (VOLATILE_READERS) or a deliberate hash.
 # `reftable`: the refs of a `--ref-format=reftable` repository (tables and
 # tables.list, rewritten on every ref update, like refs/ and packed-refs;
 # nothing git runs). Fingerprinted, every commit alerted. [64]
 VOLATILE_DIRS = {"refs", "logs", "lfs", "rr-cache", "rebase-merge", "rebase-apply",
-                 "sequencer", "filter-repo", "reftable"}
-VOLATILE_UNDER_OBJECTS = {"pack"}
-VOLATILE_UNDER_OBJECTS_INFO = {"commit-graphs"}
+                 "sequencer", "filter-repo", "reftable",
+                 "objects/pack", "objects/info/commit-graphs"}
+# `ADD_EDIT.patch`, `NOTES_EDITMSG`, `REPLACE_EDITOBJ`: the edit buffers of
+# `add -e`, `notes add|edit`, `replace --edit`, left behind when the editor
+# fails (`:cq`) or changes nothing; `MERGE_LABELS` and `rebased-patches`, the
+# same class (data git applies to the index or the objects, both volatile,
+# never a program). Every following command was refused. [100]
 VOLATILE_FILES = {"index", "HEAD", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "MERGE_MSG",
                   "MERGE_MODE", "MERGE_RR", "MERGE_AUTOSTASH", "AUTO_MERGE", "REBASE_HEAD",
                   "CHERRY_PICK_HEAD", "REVERT_HEAD", "SQUASH_MSG", "COMMIT_EDITMSG",
                   "TAG_EDITMSG", "packed-refs", "shallow", "gc.log", "gc.pid",
-                  "commit-graph", "multi-pack-index", "locked", "EDIT_DESCRIPTION"}
-# Volatile files located elsewhere than a gitdir root, by relative path.
-VOLATILE_RELPATHS = {"info/refs", "objects/info/packs", "objects/info/commit-graph",
-                     "objects/info/multi-pack-index", "info/sparse-checkout"}
-# Rebase/cherry-pick todo lists live in volatile directories and may contain
-# `exec <cmd>` lines that git runs: handled separately (check_rebase_todo),
-# they cannot be part of the fingerprint since git rewrites them at every step.
-TODO_FILES = ("rebase-merge/git-rebase-todo", "rebase-apply/git-rebase-todo",
-              "sequencer/todo")
-# `.git/rebase-merge/strategy` holds the merge strategy name of an interrupted
-# interactive/merge rebase. On `rebase --continue` git passes it straight to
-# the merge machinery, which, for a name it does not know as a builtin, execs
-# `git-merge-<name>` from the exec-path/PATH — without the "available strategies"
-# validation a plain `git merge -s <name>` applies. A non-fingerprintable
-# volatile file turned into a command, exactly like the todo `exec` lines, so
-# check_rebase_todo refuses any value outside git's builtin set. [51]
-STRATEGY_FILES = ("rebase-merge/strategy",)
-# cherry-pick/revert keep theirs in a config-format file, `[options] strategy`.
-SEQUENCER_OPTS = "sequencer/opts"
+                  "commit-graph", "multi-pack-index", "locked", "EDIT_DESCRIPTION",
+                  "ADD_EDIT.patch", "NOTES_EDITMSG", "REPLACE_EDITOBJ", "MERGE_LABELS",
+                  "rebased-patches",
+                  "info/refs", "objects/info/packs", "objects/info/commit-graph",
+                  "objects/info/multi-pack-index", "info/sparse-checkout"}
+OBJECT_FANOUT = re.compile(r"^objects/[0-9a-f]{2}$")
+# Volatile files git reads back as instructions cannot be hashed (rewritten
+# at every step) and cannot be ignored: each has a reader that refuses what
+# would run — VOLATILE_READERS, after the readers. [19] [51]
 BUILTIN_MERGE_STRATEGIES = {"ort", "recursive", "resolve", "octopus", "ours", "subtree"}
-OBJECT_FANOUT = re.compile(r"^[0-9a-f]{2}$")
 
 
 # ------------------------------------------------------------------ display
@@ -1371,49 +1370,71 @@ def gitdir_roots(base: Path) -> Iterator[Path]:
                 stack.append(c)
 
 
-def check_rebase_todo(repo: Repo) -> None:
-    """Rebase/cherry-pick todo lists live in volatile directories (git rewrites
-    them at every step, so they cannot be part of the fingerprint) but accept
-    `exec <cmd>` lines that git runs verbatim. The container can inject some
-    during an in-progress rebase: refuse their presence, unless the user runs
-    `--exec` rebases themselves. Also in submodules and linked worktrees:
-    `submodule foreach 'git rebase --continue'` runs an unwrapped git. [36]
-    Same for a planted merge strategy (`rebase-merge/strategy`,
-    `sequencer/opts`), which git turns into `git-merge-<name>`. [51]"""
+def _read_todo(p: Path) -> None:
+    """Rebase/cherry-pick todo lists accept `exec <cmd>` lines that git runs
+    verbatim. The container can inject some during an in-progress rebase:
+    refuse their presence, unless the user runs `--exec` rebases themselves."""
+    for line in read_file(p).decode(errors="surrogateescape").splitlines():
+        # git accepts any blank after the command word (`exec<TAB>cmd`). [35]
+        word = (line.split(None, 1) or [""])[0]
+        if word in ("exec", "x"):
+            raise Refuse(
+                f"`exec` line in {p}: git would run it on the next "
+                f"`rebase --continue`. Check this file; if this rebase is really "
+                f"yours, retry with GITGUARD_ALLOW_REBASE_EXEC=1.")
+
+
+def _read_strategy_file(p: Path) -> None:
+    """`rebase-merge/strategy`: the merge strategy name of an interrupted
+    interactive/merge rebase. On `rebase --continue` git passes it straight to
+    the merge machinery, which, for a name it does not know as a builtin,
+    execs `git-merge-<name>` from the exec-path/PATH — without the "available
+    strategies" validation a plain `git merge -s <name>` applies. [51]
+    Exactly as git reads it (read_oneliner): only ONE trailing newline is
+    trimmed. No strip(): `ort\t` is not `ort`, git execs `git-merge-ort<TAB>`.
+    Bytes, not read_text(): universal newlines would turn a lone CR (`ort\r`,
+    a different name for git) into the newline we trim."""
+    name = read_file(p).decode(errors="surrogateescape")
+    if name.endswith("\n"):          # strbuf_trim_trailing_newline
+        name = name[:-1]
+        if name.endswith("\r"):
+            name = name[:-1]
+    _check_strategy(p, name)
+
+
+def _read_sequencer_opts(p: Path) -> None:
+    """cherry-pick/revert keep their strategy in a config-format file,
+    `[options] strategy`. [51]"""
+    for sect, key, value in parse_git_config(p):
+        if sect == "options" and key == "strategy":
+            _check_strategy(p, value)
+
+
+# Volatile files git reads back as instructions, relative to a gitdir root,
+# each with the reader that refuses what would run. Checked under every
+# root, submodules and linked worktrees included: `submodule foreach 'git
+# rebase --continue'` runs an unwrapped git there. [36]
+VOLATILE_READERS = {
+    "rebase-merge/git-rebase-todo": _read_todo,
+    "rebase-apply/git-rebase-todo": _read_todo,
+    "sequencer/todo": _read_todo,
+    "rebase-merge/strategy": _read_strategy_file,
+    "sequencer/opts": _read_sequencer_opts,
+}
+
+
+def check_volatile_readers(repo: Repo) -> None:
+    """Each file of VOLATILE_READERS present under any gitdir root, read by
+    its reader; GITGUARD_ALLOW_REBASE_EXEC skips them all (the user's own
+    `--exec` rebase or custom strategy)."""
     if os.environ.get("GITGUARD_ALLOW_REBASE_EXEC"):
         return
     roots = dict.fromkeys([*gitdir_roots(repo.gitdir), *gitdir_roots(repo.common)])
-    for p in (r / rel for r in roots for rel in TODO_FILES):
-        if not is_file(p):
-            continue
-        for line in read_file(p).decode(errors="surrogateescape").splitlines():
-            # git accepts any blank after the command word (`exec<TAB>cmd`). [35]
-            word = (line.split(None, 1) or [""])[0]
-            if word in ("exec", "x"):
-                raise Refuse(
-                    f"`exec` line in {p}: git would run it on the next "
-                    f"`rebase --continue`. Check this file; if this rebase is really "
-                    f"yours, retry with GITGUARD_ALLOW_REBASE_EXEC=1.")
     for r in roots:
-        for rel in STRATEGY_FILES:
+        for rel, read in VOLATILE_READERS.items():
             p = r / rel
             if is_file(p):
-                # Exactly as git reads it (read_oneliner): only ONE trailing
-                # newline is trimmed. No strip(): `ort\t` is not `ort`, git execs
-                # `git-merge-ort<TAB>`.
-                # Bytes, not read_text(): universal newlines would turn a lone
-                # CR (`ort\r`, a different name for git) into the newline we trim.
-                name = read_file(p).decode(errors="surrogateescape")
-                if name.endswith("\n"):          # strbuf_trim_trailing_newline
-                    name = name[:-1]
-                    if name.endswith("\r"):
-                        name = name[:-1]
-                _check_strategy(p, name)
-        p = r / SEQUENCER_OPTS
-        if p.is_file():
-            for sect, key, value in parse_git_config(p):
-                if sect == "options" and key == "strategy":
-                    _check_strategy(p, value)
+                read(p)
 
 
 def _check_strategy(p: Path, name: str) -> None:
@@ -1488,7 +1509,7 @@ def check_structure(repo: Repo, refs: list[tuple[str, Path]]) -> None:
     check_indexes(repo)
     for n in repo.gitfiles:
         check_nested_git(n, repo.common)
-    check_rebase_todo(repo)
+    check_volatile_readers(repo)
     # Control characters in a name: fake line / spoofed display. Only names
     # that enter the fingerprint (hence get displayed) matter: the non-volatile
     # gitdir, walked once even when commondir == gitdir. Descending into
@@ -2182,8 +2203,11 @@ DATA_KEYS = {("user", "signingkey"), ("gpg.ssh", "allowedsignersfile"), ("gpg.ss
              ("core", "excludesfile"), ("core", "attributesfile"), ("commit", "template"),
              ("blame", "ignorerevsfile"), ("mailmap", "file"), ("diff", "orderfile"),
              ("format", "signaturefile"), ("sendemail", "aliasesfile"),
-             ("http", "sslcert"), ("http", "sslkey"), ("http", "sslcainfo"),
-             ("http", "cookiefile"), ("http", "pinnedpubkey")}
+             ("http", "sslcert"), ("http", "sslkey"), ("http", "sslcainfo"), ("http", "sslcapath"),
+             ("http", "cookiefile"), ("http", "pinnedpubkey"),
+             # git's own pathname keys (tests/inventory/, [pathname]): the
+             # fsck skip lists are object ids, read, never run. [100]
+             ("fsck", "skiplist"), ("fetch.fsck", "skiplist"), ("receive.fsck", "skiplist")}
 
 
 def _data_key(section: str, key: str) -> bool:
@@ -2394,57 +2418,46 @@ def _child_root(d: Path, parent_root: Path) -> Path:
     return parent_root
 
 
-def _zone(d: Path, root: Path) -> tuple[bool, bool, bool]:
-    """Position of `d` relative to its gitdir root: (is the root, is its
-    `objects/`, is its `objects/info/`). Volatile exclusions only apply at
-    these positions — a submodule named `refs` or `pack` must not vanish from
-    the fingerprint."""
-    at_root = d == root
-    in_objects = d.name == "objects" and d.parent == root
-    in_objects_info = d.name == "info" and d.parent.name == "objects" and d.parent.parent == root
-    return at_root, in_objects, in_objects_info
+def _volatile_dir(rel: str) -> bool:
+    """`rel`: the directory relative to its closest gitdir root (_child_root),
+    so that a name only counts at its position — a submodule named `refs` or
+    `pack` must not vanish from the fingerprint. [15]"""
+    return rel in VOLATILE_DIRS or bool(OBJECT_FANOUT.match(rel))
 
 
-def _volatile_dir(name: str, at_root: bool, in_objects: bool, in_objects_info: bool) -> bool:
-    return ((at_root and name in VOLATILE_DIRS)
-            or (in_objects and (name in VOLATILE_UNDER_OBJECTS or bool(OBJECT_FANOUT.match(name))))
-            or (in_objects_info and name in VOLATILE_UNDER_OBJECTS_INFO))
-
-
-def _volatile_file(name: str, rel: str, at_root: bool, is_symlink: bool) -> bool:
+def _volatile_file(rel: str, is_symlink: bool) -> bool:
     """`rel` is relative to the closest gitdir root (not to the base): a
     submodule's `info/refs` is `modules/<x>/info/refs` seen from the base, and
     `git gc` in that submodule used to alert. [26]"""
     if is_symlink:
         return False                     # a symlink is always an entry, even *.lock
-    return (name.endswith(".lock")
-            or (at_root and (name in VOLATILE_FILES or name.startswith("BISECT_")))
-            or rel in VOLATILE_RELPATHS)      # rel: relative to the closest root [26]
+    return (rel.endswith(".lock") or rel in VOLATILE_FILES
+            or (rel.startswith("BISECT_") and "/" not in rel))
 
 
 def gitdir_paths(base: Path) -> Iterator[tuple[str, Path]]:
     """(relative path, path) of everything the gitdir contains outside the
     volatile zones: files and symlinks (a symlink to a directory is an entry,
     never followed). The only walk of the gitdir — fingerprint and name scan
-    both use it. The rules live in _volatile_dir/_volatile_file, shared with
-    gitdir_excluded: two copies of the same rule had drifted apart ([22])."""
+    both use it. The rules are VOLATILE_DIRS/VOLATILE_FILES through
+    _volatile_dir/_volatile_file, shared with gitdir_excluded: two copies of
+    the same rule had drifted apart ([22])."""
     roots: dict[Path, Path] = {base: base}     # directory → closest gitdir root
     for dirpath, dirnames, filenames in os.walk(base, onerror=_walk_error):
         d = Path(dirpath)
         root = roots[base] if d == base else _child_root(d, roots[d.parent])
         roots[d] = root
-        zone = _zone(d, root)
         prefix = "" if d == base else str(d.relative_to(base)) + "/"
         rprefix = "" if d == root else str(d.relative_to(root)) + "/"
         keep = []
         for name in dirnames:
             if (d / name).is_symlink():
                 filenames.append(name)        # a symlink is an entry
-            elif not _volatile_dir(name, *zone):
+            elif not _volatile_dir(rprefix + name):
                 keep.append(name)
         dirnames[:] = keep
         for name in filenames:
-            if not _volatile_file(name, rprefix + name, zone[0], (d / name).is_symlink()):
+            if not _volatile_file(rprefix + name, (d / name).is_symlink()):
                 yield prefix + name, d / name
 
 
@@ -2471,11 +2484,11 @@ def gitdir_excluded(p: Path, base: Path) -> bool:
     cur = root = base
     for i, name in enumerate(parts):
         last = i == len(parts) - 1
-        zone = _zone(cur, root)
         nxt = cur / name
-        if (not last or nxt.is_dir()) and _volatile_dir(name, *zone):
+        rel = str(nxt.relative_to(root))
+        if (not last or nxt.is_dir()) and _volatile_dir(rel):
             return True
-        if last and _volatile_file(name, str(nxt.relative_to(root)), zone[0], nxt.is_symlink()):
+        if last and _volatile_file(rel, nxt.is_symlink()):
             return True
         cur = nxt
         if cur.is_dir():

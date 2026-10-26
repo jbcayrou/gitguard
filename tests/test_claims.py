@@ -252,3 +252,150 @@ def test_sparse_index_is_read_split_index_refused(gg: GG, repo: Path) -> None:
     assert gg.git("update-index", "--split-index", cwd=repo).rc == 0
     with pytest.raises(gg_mod.Refuse, match="splitIndex"):
         gg_mod.index_entries(repo / ".git/index")
+
+
+# ====================================== the inventory: git's own universe
+# tests/inventory/git-<ver>.txt (tests/inventory.py, from git's source) names
+# everything git opens under a gitdir, every config key it reads as a path,
+# its hooks and its global options. The bypass catalogue grew one case at a
+# time because that universe was never written down ([19] [51] [55] [83]
+# [88] each a gitdir name, [56] a pathname key, [97] a global option). Here
+# every item must be classified; an item git knows and gitguard does not
+# fails first. On a git upgrade: regenerate, diff, classify the new lines.
+INVENTORY = sorted((Path(__file__).parent / "inventory").glob("git-*.txt"))[-1]
+
+
+def _inventory(section: str) -> list[str]:
+    items, cur = [], None
+    for line in INVENTORY.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            cur = line.strip("[]")
+        elif cur == section:
+            items.append(line)
+    assert items, section
+    return items
+
+
+# Gitdir names git opens that gitguard hashes on purpose, or refuses: the
+# classification that is neither "volatile" nor "read as instructions".
+GITDIR_HASHED = {
+    "config": "the trusted config itself",
+    "config.worktree": "per-worktree config (extensions.worktreeConfig), parsed like config",
+    "info/exclude": "ignore patterns: git reads, never rewrites; a change is the sandbox's",
+    "info/attributes": "filters and drivers are defined here: the pivot [13]",
+    "objects/info/alternates": "object directories git reads: watched, [13]",
+    "modules": "submodule gitdirs, walked as roots (_child_root)",
+    "worktrees": "linked worktrees, walked as roots (_child_root)",
+    "info/rev-cache": "no writer left in git: deny by default",
+    "lost-found/%s/%s": "fsck --lost-found writes blob content through a planted symlink: kept watched [83]",
+    "info/fast-import/%s": "fast-import crash reports: written once, never by an ordinary command",
+    "fast_import_crash_%": "same",
+    "next-index-%": "temporary index of a partial commit, renamed or unlinked by the command",
+    "shallow_XXXXXX": "temporary, renamed over `shallow` (volatile) or unlinked",
+    "sharedindex_XXXXXX": "temporary of the split index",
+    "sharedindex.%s": "split index: refused (check_split_index) [31]",
+}
+
+
+def _volatile_at(rel: str) -> bool:
+    parts = rel.split("/")
+    return any(gg_mod._volatile_dir("/".join(parts[:i])) for i in range(1, len(parts))) \
+        or gg_mod._volatile_dir(rel) or gg_mod._volatile_file(rel, False)
+
+
+@pytest.mark.parametrize("name", _inventory("gitdir"))
+def test_every_gitdir_name_git_opens_is_classified(name: str) -> None:
+    """Every name under [gitdir] is volatile (VOLATILE_DIRS/VOLATILE_FILES,
+    at its anchored position), read as instructions (VOLATILE_READERS), or
+    hashed/refused on purpose (GITDIR_HASHED). An unclassified name is a
+    future [19] (instructions in a volatile zone) or a future [100] (a
+    false positive on an ordinary command)."""
+    if name in gg_mod.VOLATILE_READERS:
+        return
+    if _volatile_at(name):
+        return
+    assert name in GITDIR_HASHED, f"{name}: git opens it under a gitdir, gitguard has no classification"
+
+
+def test_every_reader_file_is_volatile() -> None:
+    """A reader is for a file the fingerprint cannot hold: each one must
+    sit in a volatile zone (otherwise the hash already covers it)."""
+    for rel in gg_mod.VOLATILE_READERS:
+        assert _volatile_at(rel), rel
+
+
+# Pathname keys git runs rather than reads: the generic program rule covers
+# them (any token that is an existing file is watched), not DATA_KEYS.
+PATHNAME_PROGRAMS = {"core.fsmonitor": "a hook path git runs (the non-boolean form)"}
+
+
+@pytest.mark.parametrize("key", _inventory("pathname"))
+def test_every_pathname_key_is_classified(key: str) -> None:
+    """Every key git reads through git_config_pathname is a directory git
+    reads hooks from (DIR_KEYS), a file git reads as data (DATA_KEYS, never
+    watched: the [56] trap) or a program (PATHNAME_PROGRAMS)."""
+    section, _, k = key.rpartition(".")
+    if (section, k) in gg_mod.DIR_KEYS or gg_mod._data_key(section, k):
+        return
+    assert key in PATHNAME_PROGRAMS, f"{key}: a pathname key gitguard has not classified"
+
+
+@pytest.mark.parametrize("hook", _inventory("hooks"))
+def test_every_hook_under_a_tree_hookspath_is_watched(gg: GG, repo: Path, hook: str) -> None:
+    """[1] for every hook git documents: under a core.hooksPath in the tree,
+    rewriting it is seen."""
+    from tests.conftest import write_exec
+    p = repo / ".githooks" / hook
+    write_exec(p)
+    assert gg.git("config", "core.hooksPath", ".githooks", cwd=repo).rc == 0
+    gg.trust(repo)
+    assert not gg.check(repo).blocked
+    p.write_text("#!/bin/sh\ntouch RAN\n")
+    assert gg.check(repo).blocked, hook
+
+
+def test_inventory_global_options_are_known() -> None:
+    """[97] every option git.c's handle_options compares `cmd` to is one
+    gitguard interprets (the `git --help` oracle above sees only the usage
+    text; the source names them all)."""
+    opts = set(_inventory("options"))
+    known = (gg_mod.GLOBAL_FLAGS | gg_mod.GLOBAL_WITH_ARG | gg_mod.GLOBAL_STOP | {"--bare"}
+             | {o.rstrip("=") for o in gg_mod.GLOBAL_WITH_EQ})
+    assert opts <= known, sorted(opts - known)
+
+
+# Config keys whose value git runs: no single signature in git's source (the
+# inventory has no [program] section), curated from Documentation/config.
+# The rule in gitguard is generic — any token of any value that is an
+# existing file is watched, no list — and this corpus proves it reaches each
+# key's value syntax (`!` aliases, `%f` placeholders, a `-c` pair).
+PROGRAM_KEYS = {
+    "core.sshCommand": "{p}", "core.pager": "{p}", "core.editor": "{p}",
+    "sequence.editor": "{p}", "core.askPass": "{p}", "core.fsmonitor": "{p}",
+    "core.alternateRefsCommand": "{p}", "core.gitProxy": "{p}",
+    "gpg.program": "{p}", "gpg.ssh.program": "{p}", "gpg.ssh.defaultKeyCommand": "{p}",
+    "diff.external": "{p}", "diff.x.command": "{p}", "diff.x.textconv": "{p}",
+    "merge.x.driver": "{p} %O %A %B", "filter.x.clean": "{p} %f",
+    "filter.x.smudge": "{p} %f", "filter.x.process": "{p}",
+    "credential.helper": "{p}", "alias.x": "!{p}", "hook.x.command": "{p}",
+    "uploadpack.packObjectsHook": "{p}", "tar.tgz.command": "{p}",
+    "remote.origin.uploadpack": "{p}", "remote.origin.receivepack": "{p}",
+    "mergetool.x.cmd": "{p}", "difftool.x.cmd": "{p}", "interactive.diffFilter": "{p}",
+    "sendemail.sendmailCmd": "{p}", "sendemail.smtpServer": "{p}",
+    "browser.x.cmd": "{p}", "man.x.cmd": "{p}", "instaweb.browser": "{p}",
+    "pager.log": "{p}", "maintenance.x.command": "{p}",
+}
+
+
+@pytest.mark.parametrize("key", sorted(PROGRAM_KEYS))
+def test_program_key_naming_a_tree_script_is_watched(gg: GG, repo: Path, key: str) -> None:
+    from tests.conftest import write_exec
+    write_exec(repo / "t.sh")
+    assert gg.git("config", key, PROGRAM_KEYS[key].format(p="./t.sh"), cwd=repo).rc == 0
+    gg.trust(repo)
+    assert not gg.check(repo).blocked
+    (repo / "t.sh").write_text("#!/bin/sh\ntouch RAN\n")
+    assert gg.check(repo).blocked, key
