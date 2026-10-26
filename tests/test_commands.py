@@ -1429,8 +1429,8 @@ def test_work_tree_alone_to_a_missing_directory_is_refused(gg: GG, repo: Path, t
 # the real git and must pass (if git stops doing it, the test may be moot).
 # The attacks refused at the check live in tests/attacks/ ([87] [88]
 # [90]–[94] [96]); their controls are here, calling the attack function
-# itself (its payload touches tmp_path/RAN). Still open, xfail(strict):
-# [89] and [95].
+# itself (its payload touches tmp_path/RAN). Accepted limitation, xfail(strict)
+# kept as the record: [89]; still open: [95].
 from tests.attacks import config_scope as _cs, nested as _nested, symlinks as _links  # noqa: E402
 from tests.attacks._helpers import git_has  # noqa: E402
 from tests.conftest import GITGUARD  # noqa: E402
@@ -1579,20 +1579,35 @@ def _gitlink_with_diff_driver(gg: GG, tmp_path: Path, mark: Path, config: list) 
     return r
 
 
-@pytest.mark.xfail(strict=True, reason="[89] OPEN")
+@pytest.mark.xfail(strict=True, reason="[89] accepted limitation (DESIGN.md, Known limitations)")
 @pytest.mark.parametrize("form", list(SUBMODULE_DIFF))
 def test_submodule_content_diff_enters_a_planted_repository(gg: GG, tmp_path: Path, form: str) -> None:
-    """[89] OPEN — the planting of [66], the nested repository's diff.external
-    as payload. With `diff.submodule = diff` (global) or `--submodule=diff`,
-    show/log -p/diff of the sandbox's commit run `git diff` inside
-    `vendor/x`, honouring its config: the switch only drops the dirty-tree
-    probe (match_stat_with_submodule), and `diff` is exempt from it."""
+    """[89] accepted limitation, the record — the planting of [66], the
+    nested repository's diff.external as payload. With `diff.submodule =
+    diff` (global) or `--submodule=diff`, show/log -p/diff of the sandbox's
+    commit run `git diff` inside `vendor/x`, honouring its config: the
+    switch only drops the dirty-tree probe (match_stat_with_submodule), and
+    `diff` is exempt from it. Decided 2026-10-26: a setting the user chose,
+    rare, the `log` form is the way out; `trust` warns
+    (test_trust_warns_submodule_content_diff)."""
     mark = tmp_path / "RAN"
     cmd, config = SUBMODULE_DIFF[form]
     r = _gitlink_with_diff_driver(gg, tmp_path, mark, config)
     assert not mark.exists() and not gg.check(r).blocked
     gg.run("git", *cmd, cwd=r)
     assert not mark.exists(), "the planted repository's diff driver ran"
+
+
+def test_trust_warns_submodule_content_diff(gg: GG, repo: Path) -> None:
+    """[89] accepted limitation made visible: `diff.submodule = diff` in the
+    global config warns at trust; the repository's own `log` outranks it
+    and silences the warning; a plain repository never warns."""
+    assert "diff.submodule = diff" not in gg.run("trust", cwd=repo).err
+    gg.git("config", "--global", "diff.submodule", "diff")
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0 and "diff.submodule = diff is set" in r.err, r.text
+    gg.git("config", "diff.submodule", "log", cwd=repo)
+    assert "diff.submodule = diff" not in gg.run("trust", cwd=repo).err
 
 
 @pytest.mark.parametrize("form", list(SUBMODULE_DIFF))

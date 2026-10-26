@@ -84,11 +84,11 @@ are honoured as git honours them.
 | the gitlink brought by the command (the switch on every command, the exemption, aliases) | `SWITCH_EXEMPT`, `CmdConfig`, `exempt_from_switch`, `_alias_parts`, `with_ignored_submodule_dirt` | Nested repositories |
 | performance | PERF.md | Nested repositories (end) |
 | what git writes then reads in one command ([44] [66] [77] [86] [88] [95]) | `SWITCH_EXEMPT`, `_hard_link` | The command that writes what it then reads |
-| accepted limitations [44], [71], [74], out-of-scope cases | — | Known limitations |
+| accepted limitations [44], [71], [74], [89], out-of-scope cases | — | Known limitations |
 
 ## Tests
 
-`python3 -m pytest` (~1060 tests, expected failures: [44], [71], [74], the accepted limitations, and the open [89], [95]; ~180 s), before
+`python3 -m pytest` (~1260 tests, expected failures: [44], [71], [74], [89], the accepted limitations, and the open [95]; ~180 s), before
 any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
 && venv/bin/pip install pytest`.
 

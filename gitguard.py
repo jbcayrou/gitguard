@@ -118,7 +118,7 @@ INCLUDE_DEPTH = 10      # git: MAX_INCLUDE_DEPTH = 10
 # No walk of the work tree looking for nested `.git`: git opens a nested
 # repository through a gitlink — of the index, read at every command
 # (`index_gitlinks`, sparse directories included [87]), or brought by the
-# command from a tree, which the switch covers ([66], [86]; [89] open) —
+# command from a tree, which the switch covers ([66], [86]; [89] accepted) —
 # and the `git add -A` that creates an index gitlink executes nothing by itself (tests/nested_git_is_a_threat.sh,
 # test_first_add_does_not_execute). The command that FOLLOWS the `add` is
 # refused. A walk (`GITGUARD_SCAN_TREE`, removed 2026-10-18) only closed the
@@ -1808,6 +1808,9 @@ class ConfigScan:
         self.global_vals: list[tuple[str, str, str]] = []
         self.env_vals: list[tuple[str, str, str]] = []
         self.remote_bases: set[Path] = set()
+        # `diff.submodule` by origin (global or not): the repository's value
+        # outranks the global one, last wins within an origin. [89]
+        self.diff_submodule: dict[bool, str] = {}
         self.nxt: list[tuple[Path, Path, bool, bool]] = []    # config files found while reading
         self.tokens_seen: set[tuple[str, Path]] = set()
 
@@ -1885,6 +1888,8 @@ class ConfigScan:
         # submodule's: there, `<name>` is a path.
         if base == repo.root and section.startswith("remote.") and key in ("url", "pushurl"):
             self.remote_names.add(section[len("remote."):])
+        if base == repo.root and not relocated and (section, key) == ("diff", "submodule"):
+            self.diff_submodule[glob] = value
         # `[alias] ci = …`, or since git 2.54 `[alias "ci"] command = …`: the
         # subsection form was read as an unknown section, its `-c` never
         # seen. [90]
@@ -1989,6 +1994,15 @@ class ConfigScan:
                         and (tok, base) not in self.tokens_seen):
                     self.tokens_seen.add((tok, base))
                     self.add(*_expand2(tok, base))
+
+    @property
+    def submodule_content_diff(self) -> bool:
+        """`diff.submodule = diff` in effect: `show`, `log -p` and `diff` of a
+        commit that brings a gitlink run `git diff` inside that repository,
+        with its config — a repository planted in the tree included. The
+        accepted limitation [89]; `trust` warns."""
+        value = self.diff_submodule.get(False, self.diff_submodule.get(True))
+        return value == "diff"           # parse_submodule_params: strcmp, exact
 
     def run(self) -> "ConfigScan":
         """Read every source in git's order and fill `refs`, `remote_names`
@@ -4136,6 +4150,15 @@ def main(argv: list[str]) -> int:
                  f"if git tracks them, a checkout/merge/reset/pull of a commit someone else "
                  f"created replaces them after the check, and git runs the new version in the "
                  f"same command. Review incoming changes to these files.")
+        if insp.scan.submodule_content_diff:
+            # A read command is enough here: show/log -p/diff of a commit
+            # someone else created. Accepted limitation [89].
+            warn("diff.submodule = diff is set: `git show`, `log -p` and `diff` of a commit "
+                 "that brings a submodule run `git diff` inside it, with that repository's "
+                 "config — a repository planted in the work tree included, on a read "
+                 "command. gitguard cannot see this before the command. Safer: "
+                 "`git config --global diff.submodule log` (the commits, no execution), and "
+                 "`--submodule=diff` only on a commit you know.")
         check_safe_bare()
         return 0
     if mode == "diff":

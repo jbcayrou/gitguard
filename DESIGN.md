@@ -828,7 +828,7 @@ gitguard never walks the work tree looking for nested `.git`. git opens a
 nested repository through a gitlink: those of the index, which gitguard
 always reads (`index_gitlinks`; a sparse directory of a sparse index is
 looked at on disk, [87]), and those a command brings from a tree (below:
-[66], [77]–[79], [86]; [89] still open). This section first said "only
+[66], [77]–[79], [86]; [89] accepted, Known limitations). This section first said "only
 once a gitlink references it in the index": that premise was wrong seven
 times, so read every "never" here as a claim to test. The `git add -A`
 that creates an index gitlink executes nothing by itself — verified for `add -A`, `add .`,
@@ -976,7 +976,7 @@ into the tree was not watched.
 ## Tests
 
 **`python3 -m pytest`** (~1060 tests, expected failures [44], [71], [74] — accepted limitations — and
-the open [89], [95]; ~180 s, ~40 s with `-n 8` on the command line),
+[89], and the open [95]; ~180 s, ~40 s with `-n 8` on the command line),
 to run before any change:
 
 - `tests/attacks/` — **the attack corpus**, one module per family (`gitdir`,
@@ -1096,7 +1096,7 @@ false positives, two of them RCEs found after the tool was believed solid,
 [66]–[70], [72], [73], [75], [76] from the twelfth, fixed on 2026-10-23;
 [77]–[83] from the thirteenth, fixed on 2026-10-24; [84], [85] from a
 design review; [86]–[99] from the fourteenth (six agents, 2026-10-24),
-fixed on 2026-10-25 but [89] and [95], open;
+fixed on 2026-10-25 but [89], accepted on 2026-10-26, and [95], open;
 [44], [71] and [74] are accepted limitations, see "Known limitations"; the ninth pass was the
 promotion of the git-parity `xfail`s [46]–[50]).
 The method that worked, for the next pass — by a human or by agents that know
@@ -1295,13 +1295,29 @@ the order.
   the sh readings are not extended for further variants of this shape
   unless a review shows a realistic one.** [67]–[70], [72], [73], [75],
   [76] from the same review are fixed.
-- **Open [89]** (review of 2026-10-24): the submodule content diff. With
-  `diff.submodule = diff` (global) or `--submodule=diff`, `git show`, `log
-  -p` and `diff <rev> <rev>` of a commit bringing a gitlink to a repository
-  planted in the tree run `git diff` inside it, honouring its config
-  (`diff.external`). The switch only drops the dirty-tree probe; the
-  command-line option outranks any `-c`. Needs that setting or option from
-  the user. xfail record: `test_submodule_content_diff_enters_a_planted_repository`.
+- **Accepted limitation [89]** (decided 2026-10-26, xfail test kept as the
+  record: `test_submodule_content_diff_enters_a_planted_repository`): the
+  submodule content diff. With `diff.submodule = diff` (global) or
+  `--submodule=diff`, `git show`, `log -p` and `diff <rev> <rev>` of a
+  commit bringing a gitlink to a repository planted in the tree run `git
+  diff` inside it, honouring its config (`diff.external`). The switch only
+  drops the dirty-tree probe; `diff` is exempt from it; the command-line
+  option outranks any `-c`. The planting is [66]'s (no precondition); the
+  setting is the user's, not the default, rare — and the sandbox cannot
+  see `~/.gitconfig`, so it plants blind. Ruled out: `-c
+  diff.submodule=log` whenever the effective value is `diff` (fifteen
+  lines) — it takes from those users, on every wrapped command, the
+  display they chose, needs an exception in `SWITCH_EXEMPT` for `diff`,
+  and leaves `--submodule=diff` open anyway. Why accepted: the same rule
+  as [44], a configuration the user chose with a prevention layer (a
+  global `core.hooksPath` does not help here: the payload is the nested
+  repository's own config; the mount is the layer). Mitigation: `gitguard
+  trust` warns when the setting is in effect (the repository's value
+  outranks the global one, `ConfigScan.submodule_content_diff`), says that
+  a **read** command is enough — the first accepted limitation reached by
+  `git show` rather than a checkout — and names the way out:
+  `diff.submodule = log` shows the commits without running anything
+  (`EXEMPT_FORMS` proves it), `--submodule=diff` on a commit one knows.
 - **Open [95]**, the [44] boundary for config: a tracked `.gitconfig` the
   trusted `.git/config` includes (`include.path = ../.gitconfig`). The
   sandbox commits a new version and moves a branch; `git merge` checks it
