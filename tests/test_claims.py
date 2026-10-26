@@ -297,6 +297,8 @@ GITDIR_HASHED = {
     "shallow_XXXXXX": "temporary, renamed over `shallow` (volatile) or unlinked",
     "sharedindex_XXXXXX": "temporary of the split index",
     "sharedindex.%s": "split index: refused (check_split_index) [31]",
+    "fsmonitor--daemon.ipc": "the builtin fsmonitor's socket: not a regular file, _hash_file "
+                             "skips it; a regular file put there is watched, git runs nothing from it",
 }
 
 

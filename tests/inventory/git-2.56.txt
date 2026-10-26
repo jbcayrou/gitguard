@@ -25,6 +25,7 @@ TAG_EDITMSG
 config
 config.worktree
 fast_import_crash_%
+fsmonitor--daemon.ipc
 gc.log
 gc.pid
 index

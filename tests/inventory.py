@@ -35,8 +35,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-def c_files(src: Path) -> list[Path]:
-    return sorted(p for p in src.rglob("*.c") if "t/" not in p.as_posix()[len(src.as_posix()):])
+def c_files(src: Path, suffix: str = "*.c") -> list[Path]:
+    """git's sources without its test suite (`t/`): a filter on the first
+    path component only — `"t/" in path` also dropped `compat/`, and with it
+    the fsmonitor socket."""
+    return sorted(p for p in src.rglob(suffix) if p.relative_to(src).parts[0] != "t")
 
 
 def gitdir_names(src: Path) -> set[str]:
@@ -46,9 +49,7 @@ def gitdir_names(src: Path) -> set[str]:
     out: set[str] = set()
     pat_func = re.compile(r'GIT_PATH_FUNC\(\w+,\s*"([^"]+)"')
     pat_call = re.compile(r'(?:repo_)?git_path(?:dup)?\(\s*(?:[\w>.-]+,\s*)?"([^"]+)"')
-    for p in list(c_files(src)) + sorted(src.rglob("*.h")):
-        if "/t/" in p.as_posix():
-            continue
+    for p in c_files(src) + c_files(src, "*.h"):
         text = p.read_text(errors="replace")
         out.update(pat_func.findall(text))
         out.update(pat_call.findall(text))
