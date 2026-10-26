@@ -3255,9 +3255,9 @@ def cmd_pending(args: list[str]) -> None:
 # `--config-env`'s argument for the subcommand, ignore the `-C` that followed
 # and check another directory than git's. git refuses unknown options too. [40]
 GLOBAL_WITH_ARG = {"-c", "--config-env", "--namespace", "-C", "--git-dir", "--work-tree",
-                   "--attr-source", "--shallow-file", "--super-prefix"}
+                   "--attr-source", "--shallow-file"}
 GLOBAL_WITH_EQ = ("--config-env=", "--namespace=", "--git-dir=", "--work-tree=",
-                  "--attr-source=", "--shallow-file=", "--super-prefix=", "--exec-path=",
+                  "--attr-source=", "--shallow-file=", "--exec-path=",
                   "--list-cmds=")
 GLOBAL_FLAGS = {"-p", "--paginate", "-P", "--no-pager", "--no-replace-objects",
                 "--literal-pathspecs", "--no-literal-pathspecs", "--glob-pathspecs",
@@ -3687,11 +3687,6 @@ def _alias_parts(value: str) -> tuple[str | None, list[tuple[str, str | None]]]:
         else:
             i += 1
     return (words[i] or None) if i < len(words) else None, pairs
-
-
-def _alias_command(value: str) -> str | None:
-    """The git command a (non-`!`) alias runs, see _alias_parts. [66] [79]"""
-    return _alias_parts(value)[0]
 
 
 def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None, git: str,

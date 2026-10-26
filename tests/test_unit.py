@@ -633,7 +633,9 @@ def test_state_dir_order(monkeypatch, tmp_path: Path) -> None:
     ("checkout\vmain", "checkout\vmain"),   # git's isspace: \v and \f are not blanks
 ])
 def test_alias_command(value: str, word: str | None) -> None:
-    assert gg_mod._alias_command(value) == word
+    """The command word of _alias_parts: the oracle of its split and of the
+    options it skips, so that the `-c` pairs land where git reads them. [80]"""
+    assert gg_mod._alias_parts(value)[0] == word
 
 
 @pytest.mark.parametrize("value, words", [

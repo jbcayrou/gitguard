@@ -1232,7 +1232,7 @@ ALIAS_FORMS = {
 
 @pytest.mark.parametrize("form", list(ALIAS_FORMS))
 def test_alias_command_word_as_git(gg: GG, tmp_path: Path, form: str) -> None:
-    """`_alias_command` says which git command an alias runs, `_split_cmdline`
+    """`_alias_parts` says which git command an alias runs, `_split_cmdline`
     how its value splits; git is the oracle. With `alias.co = <form>`,
     GIT_TRACE says which builtin git ran (`built-in: git checkout`): the port
     must name it. Where git runs nothing because the alias's options kill it
@@ -1258,7 +1258,7 @@ def test_alias_command_word_as_git(gg: GG, tmp_path: Path, form: str) -> None:
                          capture_output=True, text=True, errors="replace")
     exp = re.search(r"alias expansion: co => (.*)", res.stderr)
     ran = re.search(r"trace: built-in: git (\S+)", res.stderr)
-    word = gg_mod._alias_command(value)
+    word = gg_mod._alias_parts(value)[0]
     if exp is not None and not value.lstrip(" \t\n\r").startswith("-"):
         assert gg_mod._split_cmdline(value) == shlex.split(exp.group(1)), exp.group(0)
     if value.startswith("!"):
