@@ -824,14 +824,16 @@ def test_checkout_brings_a_gitlink_to_a_planted_repository(gg: GG, tmp_path: Pat
     volatile). The user, on another branch, runs `git checkout main`: the
     index gitguard reads has no gitlink, the check passes; git writes the
     gitlink, then shows the local changes, enters `vendor/x` and runs its
-    fsmonitor in the same command. Fix: these commands run with
-    `-c diff.ignoreSubmodules=dirty`, which drops the `git status` in the
-    submodule; the gitlink is written, the next command is refused. Also
-    through an alias, global or `-c`, quoted, chained. [77] merge, rebase,
-    pull with an autostash, cherry-pick with the editor. [78] a word git
-    autocorrects. [79] an alias whose head is `-p`/`-c`/`--config-env`, a
-    shell alias. The positive control below runs every form with the real
-    git."""
+    fsmonitor in the same command. Since DESIGN-exec-path.md: that `git
+    status` is a child, gitguard at the exec path, which refuses `vendor/x`
+    as never trusted; the command fails there (the gitlink is written,
+    the next command is refused), the payload never runs. Formerly a `-c
+    diff.ignoreSubmodules=dirty` switch, guessed command by command ([77]
+    merge, rebase, pull with an autostash, cherry-pick with the editor;
+    [78] a word git autocorrects; [79] an alias whose head is
+    `-p`/`-c`/`--config-env`, a shell alias): every form stays as a
+    scenario, none needs a rule now. The positive control below runs every
+    form with the real git and raw children."""
     mark = tmp_path / "RAN"
     r = _two_branches(gg, tmp_path)
     cmd, config, dirty = GITLINK_BRINGERS[form]
@@ -841,9 +843,9 @@ def test_checkout_brings_a_gitlink_to_a_planted_repository(gg: GG, tmp_path: Pat
     assert not mark.exists() and not gg.check(r).blocked
     if dirty:
         (r / "a").write_text("local change\n")   # the autostash needs one
-    # the user
+    # the user: the child's refusal reaches the parent's stderr for checkout
+    # and switch; merge/rebase/pull silence their autostash's `git status`.
     res = gg.run("git", *cmd, cwd=r)
-    assert res.rc == 0, res.text
     assert not mark.exists(), "the planted repository's fsmonitor ran during the command"
     # the command did bring the gitlink, and the next command is refused
     assert gg.git("ls-files", "-s", "vendor/x", cwd=r).out.startswith("160000"), form
@@ -874,21 +876,19 @@ def test_alias_given_on_the_command_line_is_followed(gg: GG, tmp_path: Path) -> 
     gg.trust(r)
     _plant_gitlink(gg, r, mark)
     res = gg.run("git", "-c", "alias.co=checkout", "co", "main", cwd=r)
-    assert res.rc == 0 and not mark.exists(), res.text
+    assert not mark.exists(), res.text
 
 
 def test_stash_pop_brings_a_gitlink_to_a_planted_repository(gg: GG, tmp_path: Path) -> None:
     """[66] the stash form: a forged `refs/stash` (two parents, a reflog
     entry) whose tree has the gitlink. `git stash pop` applies it, then runs
-    `git status`, which enters `vendor/x`. `-c diff.ignoreSubmodules=dirty`
-    reaches the child through GIT_CONFIG_PARAMETERS."""
+    `git status`, a child, whose child in `vendor/x` is gitguard: refused."""
     mark = tmp_path / "RAN"
     r = _two_branches(gg, tmp_path)
     gg.trust(r)
     _plant_gitlink(gg, r, mark, ref="refs/stash")
     assert not mark.exists() and not gg.check(r).blocked
     res = gg.run("git", "stash", "pop", cwd=r)
-    assert res.rc == 0 and "vendor/x" in res.out, res.text
     assert not mark.exists(), "the planted repository's fsmonitor ran during the stash pop"
     assert gg.check(r).blocked
 
@@ -903,15 +903,16 @@ def test_stash_gitlink_control_real_git_runs_it(gg: GG, tmp_path: Path) -> None:
     assert mark.exists(), "git no longer enters the nested repository: [66] may be moot"
 
 
-def test_user_ignore_submodules_none_does_not_reopen_it(gg: GG, tmp_path: Path) -> None:
-    """[66] the injected `-c` comes after the user's: `-c
-    diff.ignoreSubmodules=none` on the command line does not win back."""
+def test_user_ignore_submodules_none_changes_nothing(gg: GG, tmp_path: Path) -> None:
+    """[66] no option of the command line reopens the planted repository:
+    the child that would enter it is gitguard, whatever `-c` the user
+    gives."""
     mark = tmp_path / "RAN"
     r = _two_branches(gg, tmp_path)
     gg.trust(r)
     _plant_gitlink(gg, r, mark)
     res = gg.run("git", "-c", "diff.ignoreSubmodules=none", "checkout", "main", cwd=r)
-    assert res.rc == 0 and not mark.exists(), res.text
+    assert not mark.exists(), res.text
 
 
 def test_trust_warns_hooks_in_tree(gg: GG, repo: Path) -> None:
@@ -1429,8 +1430,9 @@ def test_work_tree_alone_to_a_missing_directory_is_refused(gg: GG, repo: Path, t
 # the real git and must pass (if git stops doing it, the test may be moot).
 # The attacks refused at the check live in tests/attacks/ ([87] [88]
 # [90]–[94] [96]); their controls are here, calling the attack function
-# itself (its payload touches tmp_path/RAN). Accepted limitation, xfail(strict)
-# kept as the record: [89]; still open: [95].
+# itself (its payload touches tmp_path/RAN). [89] closed by the exec-path
+# design (the `git diff` in the planted repository is a child, gitguard);
+# [95] open, same repository, same command (DESIGN-exec-path.md).
 from tests.attacks import config_scope as _cs, nested as _nested, symlinks as _links  # noqa: E402
 from tests.attacks._helpers import git_has  # noqa: E402
 from tests.conftest import GITGUARD  # noqa: E402
@@ -1475,12 +1477,12 @@ COMMIT_TYPECHANGE = {
 @pytest.mark.parametrize("form", list(COMMIT_TYPECHANGE))
 def test_commit_stages_a_typechange_to_a_planted_repository(gg: GG, repo: Path, tmp_path: Path,
                                                             form: str) -> None:
-    """[86] `commit` was in SWITCH_EXEMPT on the ground that it never
-    writes a gitlink from a tree; `commit -a` (or a pathspec) does, when the
-    sandbox replaced a tracked file by a repository: the typechange 100644 →
-    160000 is staged, then the message template's status entered it and ran
-    its fsmonitor, in the command whose check passed. Commit now gets the
-    switch."""
+    """[86] `commit` was exempt from the former switch on the ground that it
+    never writes a gitlink from a tree; `commit -a` (or a pathspec) does,
+    when the sandbox replaced a tracked file by a repository: the typechange
+    100644 → 160000 is staged, then the message template's status entered
+    it and ran its fsmonitor, in the command whose check passed. That
+    status is a child git: gitguard, which refuses `vendor/x`."""
     mark = tmp_path / "RAN"
     _typechange_to_repo(gg, repo, mark)
     assert not mark.exists() and not gg.check(repo).blocked
@@ -1498,19 +1500,6 @@ def test_commit_typechange_control_real_git_runs_it(gg: GG, repo: Path, tmp_path
     gg.env["GIT_EDITOR"] = EDITOR
     gg.git(*COMMIT_TYPECHANGE[form], cwd=repo)
     assert mark.exists(), f"git no longer enters the typechanged repository with {form}: may be moot"
-
-
-@pytest.mark.parametrize("form", list(COMMIT_TYPECHANGE))
-def test_commit_typechange_switch_keeps_git_out(gg: GG, repo: Path, tmp_path: Path,
-                                                form: str) -> None:
-    """[86] the switch the other commands get is enough here: with `-c
-    diff.ignoreSubmodules=dirty` the real git does not enter the new
-    gitlink."""
-    mark = tmp_path / "RAN"
-    _typechange_to_repo(gg, repo, mark)
-    gg.env["GIT_EDITOR"] = EDITOR
-    gg.git("-c", "diff.ignoreSubmodules=dirty", *COMMIT_TYPECHANGE[form], cwd=repo)
-    assert not mark.exists()
 
 
 # partial commits build a temporary index from HEAD: a gitlink the sandbox
@@ -1579,17 +1568,14 @@ def _gitlink_with_diff_driver(gg: GG, tmp_path: Path, mark: Path, config: list) 
     return r
 
 
-@pytest.mark.xfail(strict=True, reason="[89] accepted limitation (DESIGN.md, Known limitations)")
 @pytest.mark.parametrize("form", list(SUBMODULE_DIFF))
 def test_submodule_content_diff_enters_a_planted_repository(gg: GG, tmp_path: Path, form: str) -> None:
-    """[89] accepted limitation, the record — the planting of [66], the
-    nested repository's diff.external as payload. With `diff.submodule =
-    diff` (global) or `--submodule=diff`, show/log -p/diff of the sandbox's
-    commit run `git diff` inside `vendor/x`, honouring its config: the
-    switch only drops the dirty-tree probe (match_stat_with_submodule), and
-    `diff` is exempt from it. Decided 2026-10-26: a setting the user chose,
-    rare, the `log` form is the way out; `trust` warns
-    (test_trust_warns_submodule_content_diff)."""
+    """[89] the planting of [66], the nested repository's diff.external as
+    payload. With `diff.submodule = diff` (global) or `--submodule=diff`,
+    show/log -p/diff of the sandbox's commit run `git diff` inside
+    `vendor/x`, honouring its config. An accepted limitation under the
+    former switch (which only dropped the dirty-tree probe); closed by the
+    exec-path design: that `git diff` is a child, gitguard, refused."""
     mark = tmp_path / "RAN"
     cmd, config = SUBMODULE_DIFF[form]
     r = _gitlink_with_diff_driver(gg, tmp_path, mark, config)
@@ -1598,26 +1584,14 @@ def test_submodule_content_diff_enters_a_planted_repository(gg: GG, tmp_path: Pa
     assert not mark.exists(), "the planted repository's diff driver ran"
 
 
-def test_trust_warns_submodule_content_diff(gg: GG, repo: Path) -> None:
-    """[89] accepted limitation made visible: `diff.submodule = diff` in the
-    global config warns at trust; the repository's own `log` outranks it
-    and silences the warning; a plain repository never warns."""
-    assert "diff.submodule = diff" not in gg.run("trust", cwd=repo).err
-    gg.git("config", "--global", "diff.submodule", "diff")
-    r = gg.run("trust", cwd=repo)
-    assert r.rc == 0 and "diff.submodule = diff is set" in r.err, r.text
-    gg.git("config", "diff.submodule", "log", cwd=repo)
-    assert "diff.submodule = diff" not in gg.run("trust", cwd=repo).err
-
-
 @pytest.mark.parametrize("form", list(SUBMODULE_DIFF))
 def test_submodule_content_diff_control_real_git_runs_it(gg: GG, tmp_path: Path, form: str) -> None:
-    """[89] positive control: the real git, with the switch gitguard adds
-    today, still runs the planted diff driver."""
+    """[89] positive control: the real git with raw children runs the
+    planted diff driver."""
     mark = tmp_path / "RAN"
     cmd, config = SUBMODULE_DIFF[form]
     r = _gitlink_with_diff_driver(gg, tmp_path, mark, config)
-    gg.git("-c", "diff.ignoreSubmodules=dirty", *cmd, cwd=r)
+    gg.git(*cmd, cwd=r)
     assert mark.exists(), f"git no longer diffs inside the submodule with {form}: may be moot"
 
 
@@ -1672,13 +1646,16 @@ def _tracked_include_branch(gg: GG, tmp_path: Path, mark: Path) -> Path:
     return r
 
 
-@pytest.mark.xfail(strict=True, reason="[95] OPEN — variant of [44], decision pending")
+@pytest.mark.xfail(strict=True, reason="[95] OPEN — variant of [44]; the maintenance child inherits "
+                                        "the parent's judgment (DESIGN-exec-path.md, section 2)")
 def test_merge_checks_out_a_tracked_include_then_reads_it(gg: GG, tmp_path: Path) -> None:
     """[95] OPEN — variant of [44] for config: a tracked file the trusted
     config includes. Nothing in the fingerprint changes (objects, refs);
     `git merge --ff-only agent` checks the new `.gitconfig` out, then spawns
     `git maintenance run --auto`, which reads it and starts its "pager" on
-    the user's terminal."""
+    the user's terminal. With gitguard at the exec path that child is
+    gitguard, but it is the same repository and the same command: it
+    inherits the parent's judgment, by design."""
     mark = tmp_path / "RAN"
     r = _tracked_include_branch(gg, tmp_path, mark)
     assert not gg.check(r).blocked
@@ -1690,7 +1667,7 @@ def test_tracked_include_control_real_git_runs_it(gg: GG, tmp_path: Path) -> Non
     """[95] positive control: the real git, on a terminal, runs it."""
     mark = tmp_path / "RAN"
     r = _tracked_include_branch(gg, tmp_path, mark)
-    _on_tty(["git", "merge", "-q", "--ff-only", "agent"], gg.env, r)
+    _on_tty(["git", "merge", "-q", "--ff-only", "agent"], gg.raw_env, r)
     assert mark.exists(), "the merge no longer reads the checked-out include: [95] may be moot"
 
 

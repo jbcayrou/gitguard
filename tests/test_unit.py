@@ -206,6 +206,54 @@ def test_refuse_sanitizes_message() -> None:
     assert str(gg_mod.Refuse("a\x1bb")) == "a?b"
 
 
+# ------------------------------------------------------------ the judged marker
+def test_judged_marker_round_trip(monkeypatch) -> None:
+    monkeypatch.delenv("GITGUARD_JUDGED", raising=False)
+    assert gg_mod.read_judged() is None
+    gg_mod.set_judged("key", "abc")
+    j = gg_mod.read_judged()
+    assert j.kind == "key" and j.value == "abc" and j.fresh
+    gg_mod.set_judged("new", "/p=a:th")
+    j = gg_mod.read_judged()
+    assert j.kind == "new" and j.value == "/p=a:th"
+    gg_mod.set_judged("serving")
+    assert gg_mod.read_judged().kind == "serving"
+
+
+@pytest.mark.parametrize("bad", ["", "x", "123", "123:other=1", "123:serving=1", "123:key=", "abc:key=1"])
+def test_judged_marker_malformed_is_refused(monkeypatch, bad: str) -> None:
+    monkeypatch.setenv("GITGUARD_JUDGED", bad)
+    with pytest.raises(gg_mod.Refuse):
+        gg_mod.read_judged()
+
+
+def test_judged_marker_expires(monkeypatch) -> None:
+    import time
+    monkeypatch.setenv("GITGUARD_JUDGED", f"{int(time.time()) - 61}:key=abc")
+    assert not gg_mod.read_judged().fresh
+    monkeypatch.setenv("GITGUARD_JUDGED", f"{int(time.time()) + 1}:key=abc")   # a second of skew
+    assert gg_mod.read_judged().fresh
+    monkeypatch.setenv("GITGUARD_JUDGED_TTL", "0")
+    monkeypatch.setenv("GITGUARD_JUDGED", f"{int(time.time()) - 2}:key=abc")
+    assert not gg_mod.read_judged().fresh
+
+
+def test_owner_keys_anchored_to_modules_and_worktrees(tmp_path: Path) -> None:
+    """A gitdir under `<root>/.git/modules/` or `worktrees/` is covered by
+    `<root>`'s key; `<root>/.git` itself too; `hooks/x`, a `.git` deeper
+    down or a separate gitdir are not."""
+    root = tmp_path / "r"
+    k = gg_mod.key_for(root).name
+    assert gg_mod._owner_keys(root / ".git/modules/sub") == {k}
+    assert gg_mod._owner_keys(root / ".git/modules/a/modules/b") == {k}
+    assert gg_mod._owner_keys(root / ".git/worktrees/wt") == {k}
+    assert gg_mod._owner_keys(root / ".git") == {k}
+    assert gg_mod._owner_keys(root / ".git/hooks/x") == set()
+    assert gg_mod._owner_keys(tmp_path / "elsewhere/gitdir") == set()
+    nested = root / "vendor/x"
+    assert gg_mod._owner_keys(nested / ".git") == {gg_mod.key_for(nested).name}
+
+
 # ------------------------------------------------------------ walk_gitdir filter
 def test_walk_gitdir_excludes_volatile(tmp_path: Path) -> None:
     g = tmp_path / ".git"
@@ -588,43 +636,6 @@ def test_alias_command(value: str, word: str | None) -> None:
     assert gg_mod._alias_command(value) == word
 
 
-def _cmd(aliases: dict | None = None):
-    c = gg_mod.CmdConfig()
-    c.aliases = aliases or {}
-    return c
-
-
-def test_exempt_from_switch() -> None:
-    """[66] [78] [79] the switch is the default; exempt: status, diff, config,
-    var, and an alias every definition of which resolves to one of them;
-    commit is not since [86]."""
-    f = gg_mod.exempt_from_switch
-    for w in ("status", "diff", "config", "var", "Status", "DIFF"):
-        assert f([w], _cmd()), w
-    for w in ("commit", "checkout", "switch", "stash", "merge", "rebase", "pull", "cherry-pick", "revert",
-              "reset", "show", "log", "add", "push", "submodule", "worktree", "nonsense", "", "-p"):
-        assert not f([w], _cmd()), w
-    assert not f([], _cmd())
-    assert f(["st"], _cmd({"st": {"status"}}))
-    assert f(["s"], _cmd({"s": {"st"}, "st": {"status"}}))
-    assert not f(["co"], _cmd({"co": {"checkout"}}))
-    assert not f(["st"], _cmd({"st": {"status", "checkout"}}))    # every definition must be exempt
-    assert not f(["st"], _cmd({"st": {"git", "status"}}))         # a shell alias, `!git status`
-    assert not f(["a"], _cmd({"a": {"b"}, "b": {"a"}}))             # an alias loop resolves to nothing
-    assert f(["d"], _cmd({"d": {"st", "s"}, "s": {"st"}, "st": {"status"}}))   # a diamond
-    assert f(["status"], _cmd({"status": {"checkout"}}))           # a builtin is never shadowed
-    assert f(["ST"], _cmd({"st": {"Status"}}))                      # case-insensitive
-
-
-@pytest.mark.parametrize("typo", ["chekout", "checkuot", "swich", "swtich", "stsh", "merg", "rebas",
-                                  "pul", "cherry-pik", "revrt", "sw", "chec", "stauts", "comit"])
-def test_typos_get_the_switch(typo: str) -> None:
-    """[78] a word that is no command and no alias gets the switch, whatever
-    help.autocorrect makes of it — an entering command, or status, where
-    the switch only hides a submodule's dirty tree from the report."""
-    assert not gg_mod.exempt_from_switch([typo], _cmd())
-
-
 @pytest.mark.parametrize("value, words", [
     ("a b", ["a", "b"]), (" a", ["", "a"]), ("a ", ["a", ""]), ("", [""]),
     ("a  \t b", ["a", "b"]), ("'a b' c", ["a b", "c"]), ('"a\\"b" c', ['a"b', "c"]),
@@ -652,21 +663,6 @@ def test_alias_parts(monkeypatch, value: str, command: str | None, pairs: list) 
     monkeypatch.setenv("HOME", "/home/user")
     monkeypatch.delenv("NO_SUCH_VAR_X", raising=False)
     assert gg_mod._alias_parts(value) == (command, pairs)
-
-
-def test_shell_alias_words() -> None:
-    w = gg_mod._shell_alias_words
-    assert {"git", "checkout", "q"} <= w("!git checkout -q")
-    assert {"f", "git", "co"} <= w('!f() { git co "$@"; }; f')
-    assert "switch" in w("!git-switch main") and "checkout" in w("!GIT checkout")
-
-
-def test_with_ignored_submodule_dirt() -> None:
-    args = ["-C", "x", "--no-pager", "-c", "a=b", "checkout", "main"]
-    assert gg_mod.with_ignored_submodule_dirt(args, args[5:]) == [
-        "-C", "x", "--no-pager", "-c", "a=b", "-c", "diff.ignoreSubmodules=dirty", "checkout", "main"]
-    assert gg_mod.with_ignored_submodule_dirt(["stash"], ["stash"]) == [
-        "-c", "diff.ignoreSubmodules=dirty", "stash"]
 
 
 @pytest.mark.parametrize("tok, want", [

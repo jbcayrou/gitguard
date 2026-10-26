@@ -251,3 +251,16 @@ def test_prune_removes_orphan_records_and_legacy_locks(gg: GG, repo: Path, tmp_p
     assert pending(gg, gone) is None and pending(gg, kept) is not None
     assert not any(p.exists() for p in legacy), "lock files of earlier versions are removed"
     assert gg.key_for(repo).is_file() and not gg.check(repo).blocked
+
+
+def test_child_git_never_waits(gg: GG, repo: Path) -> None:
+    """DESIGN-exec-path.md: a child git (a marker in its environment, here
+    for another repository) refuses a changed repository at once — no wait
+    for `gitguard pending`, however long GITGUARD_WAIT — and records."""
+    gg.git("config", "core.hooksPath", "/nowhere", cwd=repo)
+    env = dict(gg.env, GITGUARD_WAIT="30", GITGUARD_JUDGED=f"{int(time.time())}:key=0000000000000000")
+    t0 = time.monotonic()
+    r = subprocess.run([sys.executable, str(GITGUARD), "git", "status"], cwd=repo, env=env,
+                       capture_output=True, text=True, start_new_session=True)
+    assert r.returncode != 0 and time.monotonic() - t0 < 5, r.stderr
+    assert "has changed" in r.stderr and gg.key_for(repo).with_suffix(".pending").exists()

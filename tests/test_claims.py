@@ -1,12 +1,14 @@
 """gitguard's lists of claims about git, held to git itself.
 
 Each closed list in gitguard.py says "git never does X here": a global flag
-that does not move the gitdir (GLOBAL_FLAGS), a command that never enters a
-gitlink the index does not hold (SWITCH_EXEMPT), the options of clone and
+that does not move the gitdir (GLOBAL_FLAGS), the options of clone and
 init (NEW_REPO_OPTIONS), the index extensions git requires
-(KNOWN_REQUIRED_EXTENSIONS). Every one of them fell in a review because
-nothing checked the claim itself, only the attacks known at the time: [97]
-(`--bare` taken for inert), [86] (`commit` exempt), [98] (`--templ=`). Here
+(KNOWN_REQUIRED_EXTENSIONS), the invocations run without a check
+(passthrough), and the barrier of DESIGN-exec-path.md: git enters another
+repository through a child process. Every one of them fell in a review
+because nothing checked the claim itself, only the attacks known at the
+time: [97] (`--bare` taken for inert), [86] (`commit` exempt from the
+former switch), [98] (`--templ=`). Here
 each entry is checked against the git under test, so that a wrong entry or
 a git upgrade that changes the answer fails here first (run after a git
 upgrade, with `pytest -m discovery`).
@@ -93,52 +95,105 @@ def test_git_usage_global_options_are_known() -> None:
     assert opts and opts <= known, sorted(opts - known)
 
 
-# =================================== SWITCH_EXEMPT vs a gitlink from a tree
-# Every form of each exempt command, run by the real git *without* the
-# switch, after each planting of [86]: none may enter the planted
-# repository. A form that does is a wrong exemption, i.e. a bypass.
-EXEMPT_FORMS = {
-    "status": [["status"], ["status", "--short"], ["status", "--porcelain=v2"],
-               ["status", "-uall"]],
-    "diff": [["diff"], ["diff", "HEAD"], ["diff", "--cached"], ["diff", "--stat"],
-             ["diff", "HEAD~1", "HEAD"], ["diff", "--submodule=log", "HEAD~1"]],
-    "config": [["config", "--list"], ["config", "--get", "core.bare"]],
-    "var": [["var", "-l"]],
+# ====================================== passthroughs that read no repository
+@pytest.mark.parametrize("opt", [o[0] for o in gg_mod.PATH_QUERIES])
+def test_path_query_passes_through_and_matches_git(gg: GG, repo: Path, opt: str) -> None:
+    """PATH_QUERIES: `git --exec-path` (and `--html-path`, `--man-path`,
+    `--info-path`) print and exit in handle_options, before any setup —
+    the exec path's shell scripts start with `. "$(git --exec-path)/git-sh-setup"`.
+    Through gitguard, in a never-trusted repository, the answer is git's."""
+    (repo / "x").write_text("x\n")
+    gg.git("config", "core.hooksPath", "/nowhere", cwd=repo)     # the repository is no longer trusted
+    assert gg.check(repo).blocked
+    r = gg.run("git", opt, cwd=repo)
+    want = subprocess.run(["git", opt], cwd=repo, env=gg.env, capture_output=True, text=True)
+    assert r.rc == 0 and r.out == want.stdout and want.stdout.strip(), (opt, r.text)
+    assert gg.run("git", opt + "=/x", "status", cwd=repo).blocked     # the setting form is checked
+
+
+# ================================ git enters a repository through a child
+# DESIGN-exec-path.md: no route is guessed any more; the claim is that git
+# enters another repository — a submodule, a planted `vendor/x` — through a
+# child process, `<exec-path>/git`, which is gitguard. The same command, the
+# same planting, with the wrapped exec path (the child refuses, the payload
+# never runs) and the raw one (the positive control: the real git's child
+# runs it). A planting and a command for each way the sandbox brings a
+# gitlink: a tracked file replaced by a repository ([86]), a HEAD moved to a
+# commit with a gitlink ([86]), `--submodule=diff` ([89]).
+ENTRIES = {
+    "typechange_commit_a": ("typechange", ["commit", "-a"]),
+    "gitlink_in_head_partial_commit": ("gitlink_in_head", ["commit", "a"]),
 }
 
 
-def test_exempt_forms_cover_switch_exempt() -> None:
-    assert set(EXEMPT_FORMS) == set(gg_mod.SWITCH_EXEMPT)
-
-
-@pytest.mark.parametrize("planting", ["typechange", "gitlink_in_head"])
-@pytest.mark.parametrize("cmd", sorted(gg_mod.SWITCH_EXEMPT))
-def test_exempt_command_never_enters_a_gitlink_from_a_tree(gg: GG, repo: Path, tmp_path: Path,
-                                                           cmd: str, planting: str) -> None:
-    """[86] SWITCH_EXEMPT says these commands never put a gitlink in an
-    index then report on it: checked with the real git, no switch, every
-    form, both ways the sandbox brings a gitlink (a tracked file replaced
-    by a repository, a HEAD moved to a commit with a gitlink)."""
+def _planted(gg: GG, repo: Path, tmp_path: Path, planting: str) -> Path:
     mark = tmp_path / "RAN"
     if planting == "typechange":
         _typechange_to_repo(gg, repo, mark)
-        r = repo
-    else:
-        r = _gitlink_in_head(gg, tmp_path, mark)
+        return repo
+    return _gitlink_in_head(gg, tmp_path, mark)
+
+
+@pytest.mark.parametrize("form", sorted(ENTRIES))
+def test_git_enters_a_planted_repository_through_a_child(gg: GG, repo: Path, tmp_path: Path,
+                                                         form: str) -> None:
+    """With gitguard at the exec path, the real git's own command does not
+    run the planted repository's config: its child there is gitguard, which
+    refuses a repository never trusted."""
+    planting, cmd = ENTRIES[form]
+    r = _planted(gg, repo, tmp_path, planting)
     gg.env["GIT_EDITOR"] = EDITOR
-    for form in EXEMPT_FORMS[cmd]:
-        gg.git(*form, cwd=r)
-        assert not mark.exists(), f"`git {' '.join(form)}` entered the planted repository"
+    subprocess.run(["git", *cmd], cwd=r, env=gg.env, capture_output=True)   # wrapped children
+    assert not (tmp_path / "RAN").exists(), f"`git {' '.join(cmd)}` ran the planted config"
 
 
-def test_exempt_control_a_non_exempt_command_enters(gg: GG, repo: Path, tmp_path: Path) -> None:
-    """Positive control of the plantings above: `commit -a` (no longer
-    exempt, [86]) does enter the typechanged repository without the switch."""
+@pytest.mark.parametrize("form", sorted(ENTRIES))
+def test_git_enters_control_raw_child_runs_it(gg: GG, repo: Path, tmp_path: Path, form: str) -> None:
+    """Positive control: the same command with raw children runs it. If this
+    fails, git enters this way in-process now, and the barrier is gone for
+    that command: DESIGN-exec-path.md, section 6."""
+    planting, cmd = ENTRIES[form]
+    r = _planted(gg, repo, tmp_path, planting)
+    gg.env["GIT_EDITOR"] = EDITOR
+    subprocess.run(["git", *cmd], cwd=r, env=gg.raw_env, capture_output=True)
+    assert (tmp_path / "RAN").exists(), f"git no longer enters with `git {' '.join(cmd)}`"
+
+
+# Commands that read another repository in-process (repo_submodule_init),
+# where no child process stands between git and that repository
+# (DESIGN-exec-path.md, section 6). Two of them DO run the nested
+# repository's config (its core.fsmonitor, on the index refresh): the
+# barrier there is not the child but the fingerprint — a submodule is
+# entered in-process only when it is *active*, which takes
+# `submodule.<name>.url` or `.active` in `.git/config` (is_submodule_active
+# reads the config, not .gitmodules), and `.git/config` is hashed; a
+# planted repository under a tracked path that the sandbox cannot activate.
+# Recorded here per command: whether the real git (raw children) runs the
+# nested config, and that gitguard refuses the activation before.
+IN_PROCESS = {
+    "ls_files": (["ls-files", "--recurse-submodules"], True),
+    "grep": (["grep", "--recurse-submodules", "s"], True),
+    "diff_submodule_log": (["diff", "--cached", "--submodule=log"], False),
+    "rev_list_objects": (["rev-list", "--objects", "HEAD"], False),
+}
+
+
+@pytest.mark.parametrize("form", sorted(IN_PROCESS))
+def test_in_process_entry_needs_an_activation_gitguard_refuses(gg: GG, repo: Path, tmp_path: Path,
+                                                               form: str) -> None:
     mark = tmp_path / "RAN"
     _typechange_to_repo(gg, repo, mark)
-    gg.env["GIT_EDITOR"] = EDITOR
-    gg.git("commit", "-a", cwd=repo)
-    assert mark.exists()
+    (repo / ".gitmodules").write_text('[submodule "f"]\n\tpath = f\n\turl = ./f\n')
+    gg.git("config", "submodule.f.url", str(repo / "f"), cwd=repo)
+    gg.git("config", "submodule.f.active", "true", cwd=repo)
+    assert gg.git("add", "-A", cwd=repo).rc == 0
+    assert not mark.exists(), "`git add -A` ran the planted config: test_first_add_does_not_execute"
+    r = gg.check(repo)
+    assert r.blocked and "config" in r.err, r.text          # the activation is a watched change
+    cmd, runs = IN_PROCESS[form]
+    gg.git(*cmd, cwd=repo)                                  # the real git, raw children
+    assert mark.exists() == runs, (f"`git {' '.join(cmd)}` {'no longer runs' if runs else 'now runs'} "
+                                   f"the nested config in-process: update IN_PROCESS and section 6")
 
 
 # ============================================ NEW_REPO_OPTIONS vs `git -h`

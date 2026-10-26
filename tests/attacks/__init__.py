@@ -512,14 +512,14 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      of a commit bringing a gitlink to a planted repository run `git diff`
      inside it, honouring its diff.external. `diff.ignoreSubmodules=dirty`
      only drops the dirty-tree probe; `diff` is exempt from it anyway.
-     Accepted limitation (2026-10-26, DESIGN.md, Known limitations): a
-     setting the user chose, not the default, rare; the partial fix (`-c
-     diff.submodule=log` when the effective value is `diff`) would take
-     from those users what they chose on every command and leave the
-     command-line form open. `trust` warns when the setting is in effect
-     (the repository's value over the global one), names the `log` form as
-     the way out. The first accepted limitation reached by a read command.
-     xfail record: test_submodule_content_diff_enters_a_planted_repository.
+     Accepted as a limitation on 2026-10-26 (a setting the user chose,
+     rare; `-c diff.submodule=log` would take their display away), then
+     closed the same day by the exec-path design (DESIGN-exec-path.md):
+     that `git diff` is a child git, `<exec-path>/git`, i.e. gitguard,
+     which refuses the planted repository as never trusted. The switch
+     (`-c diff.ignoreSubmodules=dirty`), its exemption and the alias
+     reading made for it are gone with it; [66] [77] [78] [86] are
+     covered by the same child refusal, their scenarios kept.
 [90] the subsection form of an alias, `[alias "ci"] command = -c
      core.hooksPath=.githooks commit` (git 2.54): parsed as section
      `alias.ci`, key `command`, never read as an alias, so the `-c` of
@@ -576,7 +576,8 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      [86]–[99] found by an
      adversarial review (six agents, 2026-10-24), replayed against git 2.50
      and 2.54; replayed against 2.47.3 (Debian VM) on 2026-10-26. All fixed
-     on 2026-10-25 but [89] (accepted, 2026-10-26) and [95], still open.
+     on 2026-10-25 but [89] (closed on 2026-10-26, exec-path design) and
+     [95], still open.
 [100] False positives from the inventory of git's source (tests/inventory.py,
      2026-10-26): every name git opens under a gitdir, held to gitguard's
      tables by test_claims.py. Four edit buffers at the gitdir root were

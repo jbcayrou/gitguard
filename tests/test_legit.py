@@ -576,10 +576,10 @@ def test_global_relative_hookspath_with_remote_and_submodule_is_quiet(gg: GG, re
 
 
 def test_checkout_summary_still_reports_a_submodule(gg: GG, repo: Path, subsrc: Path) -> None:
-    """[66] `checkout`/`switch`/`stash` run with `-c diff.ignoreSubmodules=dirty`:
-    the summary of local changes still names a submodule with new commits
-    (`M sub`), only its own tree's modifications go unreported there; and
-    `git status`, which does not get the option, still reports them."""
+    """[66] a real submodule: the `git status --porcelain=2` git runs in it
+    is gitguard, covered by the superproject's judgment (its gitdir is
+    under `modules/`): the summary of local changes names the submodule
+    with new commits and modified content, as the real git does."""
     assert gg.git("submodule", "add", "-q", str(subsrc), "sub", cwd=repo).rc == 0
     gg.git("commit", "-qm", "sub", cwd=repo)
     gg.trust(repo)
@@ -611,13 +611,11 @@ def test_stash_pop_in_a_repository_with_a_submodule(gg: GG, repo: Path, subsrc: 
     assert not gg.check(repo).blocked
 
 
-def test_exempt_commands_still_report_a_dirty_submodule(gg: GG, repo: Path, subsrc: Path) -> None:
-    """[66] the switch is the default; status, diff and config — also
-    through an alias of theirs — run without it, so a submodule whose own
-    tree is dirty is still reported and `git config --list` shows nothing
-    gitguard added. Through a shell alias (`!git status`, not resolved) and
-    in commit's dry run and template ([86]) the switch is on: the dirt goes
-    unreported there, the documented price."""
+def test_every_command_reports_a_dirty_submodule(gg: GG, repo: Path, subsrc: Path) -> None:
+    """[66] no switch any more: status, diff, commit's dry run, a shell
+    alias (`!git status`, an inner git that inherits the judgment) all
+    report a submodule whose own tree is dirty, and `git config --list`
+    shows nothing gitguard added."""
     assert gg.git("submodule", "add", "-q", str(subsrc), "sub", cwd=repo).rc == 0
     gg.git("commit", "-qm", "sub", cwd=repo)
     gg.git("config", "--global", "alias.st", "status", cwd=repo)
@@ -629,7 +627,7 @@ def test_exempt_commands_still_report_a_dirty_submodule(gg: GG, repo: Path, subs
         r = gg.run("git", *args, cwd=repo)
         assert r.rc in (0, 1) and "modified content" in r.out, (args, r.text)
     r = gg.run("git", "commit", "--dry-run", cwd=repo)
-    assert r.rc in (0, 1) and "Changes not staged" not in r.out, r.text
+    assert r.rc in (0, 1) and "modified content" in r.out, r.text
     r = gg.run("git", "status", "--short", cwd=repo)
     assert " m sub" in r.out, r.text
     r = gg.run("git", "diff", "--submodule=log", cwd=repo)
@@ -637,15 +635,15 @@ def test_exempt_commands_still_report_a_dirty_submodule(gg: GG, repo: Path, subs
     r = gg.run("git", "config", "--list", cwd=repo)
     assert "ignoresubmodules" not in r.out.lower(), r.text
     r = gg.run("git", "sst", cwd=repo)
-    assert r.rc == 0 and "On branch" in r.out and "modified content" not in r.out, r.text
-    r = gg.run("git", "log", "-1", "--format=%s", cwd=repo)      # the switch, silently
+    assert r.rc == 0 and "On branch" in r.out and "modified content" in r.out, r.text
+    r = gg.run("git", "log", "-1", "--format=%s", cwd=repo)
     assert r.rc == 0 and r.out.strip() == "sub", r.text
     assert not gg.check(repo).blocked
 
 
-def test_autocorrected_word_runs_with_the_switch(gg: GG, repo: Path) -> None:
-    """[78] `git stauts` with help.autocorrect on: git corrects it, gitguard
-    adds the switch without resolving the word — no refusal, no prompt."""
+def test_autocorrected_word_runs(gg: GG, repo: Path) -> None:
+    """[78] `git stauts` with help.autocorrect on: git corrects it; gitguard
+    has nothing to resolve — no refusal, no prompt."""
     gg.git("config", "--global", "help.autocorrect", "immediate", cwd=repo)
     r = gg.run("git", "stauts", cwd=repo)
     assert r.rc == 0 and "On branch" in r.out, r.text

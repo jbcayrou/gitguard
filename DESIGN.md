@@ -83,9 +83,13 @@ which fire a planted `core.fsmonitor` at `cd` time. `alias git='gitguard
 git'` only wraps what the user types.
 
 System-wide (Debian): `dpkg-divert` the real git to `/usr/bin/git.real` and
-symlink `/usr/bin/git → gitguard`. macOS keeps the PATH symlink
+symlink `/usr/bin/git → gitguard`; the same for `/usr/lib/git-core/git`
+(`git.real` next to it), so that every child git is gitguard
+(DESIGN-exec-path.md, section 4: the dashed builtins there are symlinks to
+`git`, one diversion wraps them all). macOS keeps the PATH symlink
 (`/usr/bin/git` is under SIP, renaming Homebrew's git is undone by `brew
-upgrade`) plus VS Code's `git.path`.
+upgrade`) plus VS Code's `git.path`, and a `GIT_EXEC_PATH` directory for
+the children; `trust` warns when the exec path is not wrapped.
 
 Pre-existing repositories get one explicit `trust` each, by hand, after a
 look at their `config` and `hooks/`. **No automatic migration, no
@@ -107,9 +111,10 @@ of Homebrew's, with another system config.
 
 That git's system config (`<prefix>/etc/gitconfig`, derived from the
 binary's path) is read along with `/etc/gitconfig`: changing the real git
-changes the fingerprint (one `trust`). Hooks and `rebase --exec` run by the
-real git call `<exec-path>/git`, unwrapped by design (no recursion; their
-todo files are read instead, [36]). `/usr/bin/git-receive-pack`,
+changes the fingerprint (one `trust`). Hooks, `rebase --exec` and every
+child of the real git call `<exec-path>/git`: gitguard too, once diverted
+there (DESIGN-exec-path.md; `real_git()` finds `git.real` next to that
+path as well, no recursion). `/usr/bin/git-receive-pack`,
 `git-upload-pack` and `git-upload-archive` are symlinks to `/usr/bin/git`
 (Debian): diverted, they land on gitguard, which recognises them by
 `argv[0]` (`passthrough`, the one closed list of invocations run without a
@@ -865,88 +870,82 @@ hatch `GITGUARD_PRUNE` was also misleading: the gitlink detection never
 depended on it, so a vendored repository stayed refused after adding it —
 the real way out is a submodule (`absorbgitdirs`), now named by the message.
 
-**The gitlink that arrives with the command** ([66], fixed on 2026-10-23;
-[77]–[79] on 2026-10-24). The barrier above holds for a gitlink already in
-the index. The sandbox can also plant an untracked repository `vendor/x`
-(its config running a script) and a commit whose tree has a gitlink there,
-and move a branch — or forge `refs/stash` — to it: objects and refs are
-volatile, nothing is in the fingerprint, and the index gitguard reads has
-no gitlink. Some commands write the gitlink, then report the state of the
-tree in the same process: `checkout` / `switch` print the local changes,
-`stash pop` runs `git status`; `merge`, `rebase`, `pull` with an autostash
-re-apply it and print the status; `cherry-pick` and `revert` with the
-editor list the status in the message template ([77]). That report asks
-each gitlink whose directory holds a repository whether it is modified by
-running `git status` inside it (is_submodule_modified), which honours the
-planted config — all in the one command whose check passed. Probed command
-by command on git 2.47.3 and 2.50: `reset` (every mode), `restore`,
-`read-tree -u`, `bisect`, `am`, `apply --index`, `merge --squash`,
-`checkout -f`/`-q`, a merge or rebase without autostash write the gitlink
-without entering it. Fix: in exec mode, **every** command runs with `-c
-diff.ignoreSubmodules=dirty` inserted after the user's global options
-(`with_ignored_submodule_dirt`; the last `-c` wins, so a user's `=none`
-does not reopen it), except the commands of SWITCH_EXEMPT (below). git
-then compares each gitlink's recorded commit and skips the `git status`
-in the submodule (match_stat_with_submodule; `submodule.<name>.ignore`
-does not override it, override_submodule_config). The gitlink is written;
-the **next** command sees it and is refused, as after an `add`. The
-option travels to children through GIT_CONFIG_PARAMETERS, so a hook these
-commands run, and the git a shell alias runs, see it too.
+**The gitlink that arrives with the command** ([66], [77]–[79], [86],
+[89]). The barrier above holds for a gitlink already in the index. The
+sandbox can also plant an untracked repository `vendor/x` (its config
+running a script) and a commit whose tree has a gitlink there, and move a
+branch — or forge `refs/stash` — to it: objects and refs are volatile,
+nothing is in the fingerprint, and the index gitguard reads has no gitlink.
+Some commands write the gitlink, then report the state of the tree in the
+same command: `checkout` / `switch` print the local changes, `stash pop`
+runs `git status`; `merge`, `rebase`, `pull` with an autostash re-apply it
+and print the status; `cherry-pick` and `revert` with the editor list the
+status in the message template ([77]); `commit -a` stages a typechange to
+a repository and its template reports on it ([86]); `show`, `log -p` and
+`diff` with `diff.submodule = diff` show its content ([89]). Every one of
+these reports asks the gitlink's repository by **running a git inside it**
+(`git status --porcelain=2`, is_submodule_modified; `git diff
+--submodule=diff`), which honours the planted config — in the command
+whose check passed.
 
-The switch was first applied to a list of the entering commands
-(`checkout`, `switch`, `stash`, then [77]'s merge, rebase, pull,
-cherry-pick, revert), which needed `help.autocorrect` modelled — git's
-parse_autocorrect and a port of help_unknown_cmd's weighted Levenshtein
-([78]) — to catch a typo git turns into one of them. That list failed
-open: every command it missed was a bypass ([77] came right after [66]),
-and a future git can add an autostash or a status summary to another
-command. Since 2026-10-24 the default is inverted: the switch is on
-unless the command is known to be harmless *and* to show the option's
-effect. `SWITCH_EXEMPT` = `status`, `diff`, `config`, `var`:
-probed on git 2.50 with a dirty submodule, every form of each command,
-with and without the option — status (long, `--short`, `--porcelain`) and
-diff (`--submodule=short/log` too) report the submodule's dirty tree,
-`config --list`, `config <key>` and `var -l` list the command-line config;
-`submodule summary` and `status`, `describe --dirty`, `show`, `stash`,
-`add`, `ls-files` and the diff plumbing are unchanged. None of the four
-writes a gitlink into an index. `commit` was exempt too, "it writes the
-index from the work tree" — which is how a gitlink gets in ([86], review
-of 2026-10-24): `commit -a`, a pathspec or `-i` stage a tracked file the
-sandbox replaced by a repository (typechange 100644 → 160000), a partial
-commit (`commit <path>`, `-o`, `--amend <path>`) resets a temporary index
-from a HEAD the sandbox moved to a commit with a gitlink, and the message
-template (or `--dry-run`, `-v`) then ran `git status` in it. Each
-exemption is now a claim with a test: every [86] form against each exempt
-command (`tests/test_commands.py`). A command missing from the exemption
-costs a line of output, never a bypass; a wrong exemption is a bypass.
-What changes for the user: `status`, `diff` and `config` behave as
-before, directly or through an alias every
-definition of which resolves to one of them; every other command, a
-shell alias (`!git status`) and a word gitguard does not know (a typo
-help.autocorrect fixes, an alias it cannot resolve) get the switch — the
-summary of a checkout or a `!git status` no longer flags a submodule
-whose own tree is merely dirty (new commits are still shown); the
-Levenshtein port and `_autocorrect_on` are gone.
+Since 2026-10-26 (`DESIGN-exec-path.md`, the design record until it is
+merged here) that inner git is gitguard: git runs its children through
+`<exec-path>/git` (setup_path puts the exec path first in their PATH), and
+gitguard is diverted there (Debian: `dpkg-divert`, both `/usr/bin/git` and
+`/usr/lib/git-core/git`, whose 160 dashed builtins are symlinks to it;
+elsewhere a `GIT_EXEC_PATH` directory). A child in a repository the
+command has not judged — `vendor/x` — judges it as a first process would
+and refuses it as never trusted; the payload never runs, the parent's
+report fails, the gitlink is written, the next command is refused
+structurally. A child in the judged repository, or in a gitdir under its
+`modules/` or `worktrees/`, inherits the judgment through a marker in the
+environment (`GITGUARD_JUDGED`, the state key and the time, a minute's
+validity): the command's own writes (`submodule add`, `remote add`, `push
+-u`) are for the next command, as always. No route is guessed any more:
+whatever enters, enters through gitguard. `trust`, `retrust` and `list`
+warn when the exec path does not lead to gitguard (`check_wrap`).
 
-Which command runs is read as git reads it, from the repository's own
-config, the global files and `-c` (`CmdConfig`, filled by config_refs;
-`exempt_from_switch`): an alias is split as split_cmdline splits it
-(`_split_cmdline`) and its leading global options skipped as
-handle_options does (`-p`, `-c`, `--config-env`; git dies on the others)
-([79]); a builtin is never shadowed; an alias may name an alias; every
-definition counts rather than modelling precedence, and all of them must
-resolve to an exempt command for the alias to be exempt (an alias loop
-resolves to nothing: switch). A shell alias (`!…`) runs git from git's
-exec-path, which git puts first on the alias's PATH — never the wrapper,
-even installed as documented — so its words are candidate commands
-(`_shell_alias_words`, `git-` dropped): candidates, not an interpretation
-of sh, the boundary of [71] and [74]; `git` is no exempt command, so a
-shell alias is never exempt. Ruled out: reading the target tree before
-the command (an object reader — zlib, packs, deltas — for one case),
-restoring the tree walk (above), `=all` (hides submodules from the report
-altogether), asking git for its command list (`git --list-cmds`: running
-git on the repository being judged), the switch on every command without
-exemption (it would change `status` and `diff`).
+History, kept because its lessons are the reason for the design above.
+From 2026-10-23 to 2026-10-26 the parent tried to keep git out of the
+nested repository from outside: `-c diff.ignoreSubmodules=dirty` on the
+entering commands (git then compares the gitlink's recorded commit without
+running `git status` in it), first a list of those commands — `checkout`,
+`switch`, `stash`, then [77]'s merge, rebase, pull, cherry-pick, revert,
+which needed `help.autocorrect` modelled, a port of git's weighted
+Levenshtein ([78]), to catch a typo git turns into one of them — then,
+because every command the list missed was a bypass, the switch on every
+command but a closed exemption (`status`, `diff`, `config`, `var`, each
+form held to git), which still cost [86] (`commit` wrongly exempt) and left
+[89] open: `--submodule=diff` runs `git diff` in the submodule, a route the
+switch does not touch, and `diff` was exempt anyway. Four review cycles for
+one family, each fix a new claim about which commands enter and how. The
+exec-path design replaced the whole mechanism (`with_ignored_submodule_dirt`,
+`SWITCH_EXEMPT`, `exempt_from_switch`, `CmdConfig`, `_shell_alias_words`
+and their tests), and gave back what the switch took: a checkout summary
+or a `!git status` alias reports a submodule whose own tree is dirty again.
+Ruled out along the way: reading the target tree before the command (an
+object reader — zlib, packs, deltas — for one case), restoring the tree
+walk (above), `diff.ignoreSubmodules=all` (hides submodules from the report
+altogether), asking git for its command list (running git on the
+repository being judged).
+
+What a child never does: ask on the terminal (the parent git may be
+reading it), wait for a `gitguard pending` decision, auto-accept, notify,
+auto-trust a clone (`submodule add`'s clone into `modules/<x>`: the parent's
+next command sees it), or write to stdout (the parent parses it). It
+refuses at once and records. The children of a served repository
+(`git-receive-pack` and `git-upload-pack` through `TRANSPORT`, whose
+`index-pack` runs in a bare repository gitguard does not handle) inherit
+the passthrough (`serving`); the submodule clones of the user's `clone
+--recurse-submodules` inherit the clone in progress (`new`). What stays
+with the child-process barrier as a claim to re-test at each git release
+(`tests/test_claims.py`): git enters a submodule through a child for
+`status`, `commit -a`, a partial commit, `--submodule=diff`; and the
+commands that read a submodule **in-process** (`ls-files` and `grep` with
+`--recurse-submodules` do run its config, `diff --submodule=log` and
+`rev-list --objects` do not) only do so for an *active* submodule, which
+takes `submodule.<name>.url` or `.active` in `.git/config` — hashed, so a
+planted repository cannot be activated without a refusal.
 
 Performance (M4 Pro, see PERF.md for the full tables): ~33 ms overhead per
 command, constant whatever the tree: interpreter 16 ms, stdlib imports 6 ms,
@@ -976,7 +975,7 @@ into the tree was not watched.
 ## Tests
 
 **`python3 -m pytest`** (~1060 tests, expected failures [44], [71], [74] — accepted limitations — and
-[89], and the open [95]; ~180 s, ~40 s with `-n 8` on the command line),
+and the open [95]; ~180 s, ~40 s with `-n 8` on the command line),
 to run before any change:
 
 - `tests/attacks/` — **the attack corpus**, one module per family (`gitdir`,
@@ -1029,8 +1028,10 @@ to run before any change:
   `tests/attacks/`. See "Known limitations" for the list.
 - `tests/test_claims.py` — **gitguard's closed lists of claims about git,
   held to git**: each global flag of `GLOBAL_FLAGS` leaves the gitdir where
-  git puts it ([97]), every form of each `SWITCH_EXEMPT` command leaves a
-  gitlink brought from a tree alone ([86]), `NEW_REPO_OPTIONS` is `git
+  git puts it ([97]), the `PATH_QUERIES` print and exit before any setup,
+  git enters a planted repository through a child process (the barrier of
+  DESIGN-exec-path.md, with its positive control; the in-process entries
+  and the activation they need), `NEW_REPO_OPTIONS` is `git
   clone -h` / `git init -h` ([98]), the indexes git writes carry no
   required extension the parser refuses ([87]). Each of these lists fell
   in a review because the tests checked the known attacks, not the claim;
@@ -1096,7 +1097,7 @@ false positives, two of them RCEs found after the tool was believed solid,
 [66]–[70], [72], [73], [75], [76] from the twelfth, fixed on 2026-10-23;
 [77]–[83] from the thirteenth, fixed on 2026-10-24; [84], [85] from a
 design review; [86]–[99] from the fourteenth (six agents, 2026-10-24),
-fixed on 2026-10-25 but [89], accepted on 2026-10-26, and [95], open;
+fixed on 2026-10-25 but [89], closed on 2026-10-26 by the exec-path design (DESIGN-exec-path.md), and [95], open;
 [44], [71] and [74] are accepted limitations, see "Known limitations"; the ninth pass was the
 promotion of the git-parity `xfail`s [46]–[50]).
 The method that worked, for the next pass — by a human or by agents that know
@@ -1192,18 +1193,20 @@ fingerprint by construction — refs and objects are volatile, the tree is
 not walked, and the state at the check is the trusted one. Not a flaw of
 one check, the boundary of a check-then-exec design.
 
-The rule for a new member of the class: if git has a switch that keeps it
-from reading what it wrote (`-c diff.ignoreSubmodules=dirty` for the
-gitlink, [66]), the switch goes on every command with a closed exemption
-(`SWITCH_EXEMPT`, each entry held to git in `test_claims.py`); if the file
-is a link, the structure check refuses it ([88]); otherwise it is an
-accepted limitation with a `trust`-time warning ([44], [95]), and the
-prevention layer is the answer (a global `core.hooksPath` outside every
-tree, `safe.bareRepository=explicit`, a mount the sandbox cannot write
-`.git/` on). Finding the next member is a reading of a command's flow in
-git's source (`builtin/<cmd>.c`: what it writes under the gitdir or the
-tree, what it reads after), not a grep: the inventory lists the files, not
-the order.
+The rule for a new member of the class: if the reading is done by a
+**child git in another repository**, nothing to do — the child is gitguard
+and refuses it (Nested repositories, DESIGN-exec-path.md; [66] [77] [86]
+[89] closed this way); if the file is a link, the structure check refuses
+it ([88]); if the reading is done in the **same repository, in the same
+command** — a hook checked out and run ([44]), an include checked out and
+read by the `maintenance` child, which inherits the judgment ([95]) — it is
+an accepted limitation with a `trust`-time warning, and the prevention
+layer is the answer (a global `core.hooksPath` outside every tree,
+`safe.bareRepository=explicit`, a mount the sandbox cannot write `.git/`
+on). Finding the next member is a reading of a command's flow in git's
+source (`builtin/<cmd>.c`: what it writes under the gitdir or the tree,
+what it reads after, in which process), not a grep: the inventory lists
+the files, not the order.
 
 ## Known limitations (do not "fix" without thinking)
 
@@ -1257,9 +1260,9 @@ the order.
   files on disk and the config are still the trusted ones when gitguard
   checks; `git checkout`/`merge`/`pull`/`reset --hard` of that commit
   writes the new hook, then runs it, in the same command. Its general form,
-  the gitlink brought by the command ([66]), had a switch (`-c
-  diff.ignoreSubmodules=dirty`); a tracked hook has none: git runs the file
-  as checked out. Ruled out: forcing git onto the trusted copy (`-c
+  the gitlink brought by the command ([66]), is entered through a child
+  git, which is gitguard and refuses; a tracked hook is run by the parent
+  itself: git runs the file as checked out. Ruled out: forcing git onto the trusted copy (`-c
   core.hooksPath=<backup>`) — husky v9's `.husky/_/h` runs `.husky/<hook>`
   from the tree anyway, and hooks that load neighbouring files would break;
   reading the target tree before the command — an object reader (zlib,
@@ -1295,29 +1298,15 @@ the order.
   the sh readings are not extended for further variants of this shape
   unless a review shows a realistic one.** [67]–[70], [72], [73], [75],
   [76] from the same review are fixed.
-- **Accepted limitation [89]** (decided 2026-10-26, xfail test kept as the
-  record: `test_submodule_content_diff_enters_a_planted_repository`): the
-  submodule content diff. With `diff.submodule = diff` (global) or
-  `--submodule=diff`, `git show`, `log -p` and `diff <rev> <rev>` of a
-  commit bringing a gitlink to a repository planted in the tree run `git
-  diff` inside it, honouring its config (`diff.external`). The switch only
-  drops the dirty-tree probe; `diff` is exempt from it; the command-line
-  option outranks any `-c`. The planting is [66]'s (no precondition); the
-  setting is the user's, not the default, rare — and the sandbox cannot
-  see `~/.gitconfig`, so it plants blind. Ruled out: `-c
-  diff.submodule=log` whenever the effective value is `diff` (fifteen
-  lines) — it takes from those users, on every wrapped command, the
-  display they chose, needs an exception in `SWITCH_EXEMPT` for `diff`,
-  and leaves `--submodule=diff` open anyway. Why accepted: the same rule
-  as [44], a configuration the user chose with a prevention layer (a
-  global `core.hooksPath` does not help here: the payload is the nested
-  repository's own config; the mount is the layer). Mitigation: `gitguard
-  trust` warns when the setting is in effect (the repository's value
-  outranks the global one, `ConfigScan.submodule_content_diff`), says that
-  a **read** command is enough — the first accepted limitation reached by
-  `git show` rather than a checkout — and names the way out:
-  `diff.submodule = log` shows the commits without running anything
-  (`EXEMPT_FORMS` proves it), `--submodule=diff` on a commit one knows.
+- **Unwrapped exec path**: the child-process barrier (Nested
+  repositories) holds only where `<exec-path>/git` is gitguard. Where it
+  is not (an install without the second diversion, a macOS session without
+  the `GIT_EXEC_PATH` directory), a git that enters a repository planted
+  in the tree runs its config — [66], [86], [89] open again — and `trust`,
+  `retrust` and `list` say so (`check_wrap`). A marker older than
+  `GITGUARD_JUDGED_TTL` (60 s) makes a child judge its repository again:
+  the cost of a check, the same answer, by design (a shell opened from
+  `git commit`'s editor inherits the environment).
 - **Open [95]**, the [44] boundary for config: a tracked `.gitconfig` the
   trusted `.git/config` includes (`include.path = ../.gitconfig`). The
   sandbox commits a new version and moves a branch; `git merge` checks it

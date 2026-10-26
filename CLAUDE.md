@@ -35,8 +35,11 @@ paid for by a bypass.
   manifest already computed and displayed; never recompute at the `y`.
 - **Everything displayed goes through `san()`**; no raw mode, no flag the
   caller must remember.
-- **No walk of the work tree**; the index gitlink is the barrier
-  (`DESIGN.md`, "Nested repositories").
+- **No walk of the work tree**; the index gitlink is the barrier, and a
+  repository git enters during a command is judged by the child git that
+  enters it: gitguard at the exec path, the install this assumes
+  (`DESIGN.md`, "Nested repositories"; `DESIGN-exec-path.md`). Never guess
+  from the parent which commands enter.
 - **The state directory stays outside the repository.**
 - **Exclusions are anchored** to a position under a gitdir root, never to a
   bare name (`_child_root`, paths relative to a root in `VOLATILE_*`).
@@ -63,6 +66,8 @@ gitguard pending [<repo>… | -a | -c <repo>…]   decisions of terminal-less gi
 
 Environment: `GITGUARD_STATE`, `GITGUARD_REAL_GIT`, `GITGUARD_ALLOW_REBASE_EXEC`,
 `GITGUARD_NO_PROMPT`, `GITGUARD_WAIT`, `GITGUARD_NO_NOTIFY`, `GITGUARD_DEBUG`,
+`GITGUARD_JUDGED` (set by gitguard for the git it runs, read by child gits),
+`GITGUARD_JUDGED_TTL`,
 `NO_COLOR`; git's own `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`,
 `GIT_INDEX_FILE`, `GIT_CEILING_DIRECTORIES`, `GIT_CONFIG_*`, `GIT_TEMPLATE_DIR`
 are honoured as git honours them.
@@ -81,14 +86,14 @@ are honoured as git honours them.
 | state files, keys, locking | `save_trust`, `load_manifest`, `update_pending` | Storage |
 | exec mode: options, clone/init, prompt, pending | `split_global_options`, `parse_new_repo`, `check_or_die`, `ask_on_tty`, `wait_for_decision` | Auto-trust; Exec-mode shortcuts |
 | passthroughs that read no repository | `TRANSPORT`, `main` | Which git runs |
-| the gitlink brought by the command (the switch on every command, the exemption, aliases) | `SWITCH_EXEMPT`, `CmdConfig`, `exempt_from_switch`, `_alias_parts`, `with_ignored_submodule_dirt` | Nested repositories |
+| child gits: the marker, inheritance, `new`/`serving`, the exec-path wrap and its check | `Judged`, `read_judged`, `set_judged`, `_owner_keys`, `check_wrap`, `PATH_QUERIES`, `run_git` | Nested repositories; DESIGN-exec-path.md |
 | performance | PERF.md | Nested repositories (end) |
-| what git writes then reads in one command ([44] [66] [77] [86] [88] [95]) | `SWITCH_EXEMPT`, `_hard_link` | The command that writes what it then reads |
-| accepted limitations [44], [71], [74], [89], out-of-scope cases | — | Known limitations |
+| what git writes then reads in one command ([44] [66] [77] [86] [88] [95]) | `Judged.covers`, `_hard_link` | The command that writes what it then reads |
+| accepted limitations [44], [71], [74], out-of-scope cases | — | Known limitations |
 
 ## Tests
 
-`python3 -m pytest` (~1260 tests, expected failures: [44], [71], [74], [89], the accepted limitations, and the open [95]; ~180 s), before
+`python3 -m pytest` (~1200 tests, expected failures: [44], [71], [74], the accepted limitations, and the open [95]; ~180 s), before
 any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
 && venv/bin/pip install pytest`.
 
@@ -100,8 +105,10 @@ any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
 - `tests/test_git_parity.py` — git as the oracle for every reader; a known
   gap is `xfail(strict=True)`, promoted to `tests/attacks/` once fixed.
 - `tests/test_claims.py` — every closed list of claims about git in
-  gitguard.py (`GLOBAL_FLAGS`, `SWITCH_EXEMPT`, `NEW_REPO_OPTIONS`, index
-  extensions) held to git as the oracle; a new list gets its test there.
+  gitguard.py (`GLOBAL_FLAGS`, `NEW_REPO_OPTIONS`, `PATH_QUERIES`, index
+  extensions) held to git as the oracle, and the child-process barrier
+  (git enters a submodule through a child; the in-process entries and the
+  activation they need); a new list gets its test there.
   Its second half holds the lists to `tests/inventory/git-<ver>.txt`,
   git's universe taken from its source by `tests/inventory.py` (gitdir
   names, pathname keys, hooks, global options): every item must be
@@ -109,8 +116,11 @@ any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
   release's source, diff, classify the new lines (DESIGN.md, "Tests").
 - `tests/test_commands.py`, `test_nested.py`, `test_prompt.py` (pty),
   `test_pending.py`, `test_unit.py`.
-- The scenarios use `REAL_GIT` (conftest): on a machine where `git` *is*
-  gitguard, the suite still works.
+- The scenarios use `REAL_GIT` (conftest) with a **raw** exec path
+  (`gg.git`, `gg.raw_env`); the checks run with a **wrapped** one
+  (`gg.env`: `GIT_EXEC_PATH` whose `git` is gitguard), as on a machine
+  where the exec path is diverted. On a machine where `git` *is* gitguard,
+  the suite still works.
 
 Any new vector or false positive becomes a test first. Replay every
 reported bypass and every fix by hand, with byte variants, against the real

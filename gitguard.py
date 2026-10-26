@@ -118,7 +118,8 @@ INCLUDE_DEPTH = 10      # git: MAX_INCLUDE_DEPTH = 10
 # No walk of the work tree looking for nested `.git`: git opens a nested
 # repository through a gitlink — of the index, read at every command
 # (`index_gitlinks`, sparse directories included [87]), or brought by the
-# command from a tree, which the switch covers ([66], [86]; [89] accepted) —
+# command from a tree, which the child git that enters it — gitguard, at
+# the exec path — refuses as never trusted ([66], [86], [89]; DESIGN-exec-path.md) —
 # and the `git add -A` that creates an index gitlink executes nothing by itself (tests/nested_git_is_a_threat.sh,
 # test_first_add_does_not_execute). The command that FOLLOWS the `add` is
 # refused. A walk (`GITGUARD_SCAN_TREE`, removed 2026-10-18) only closed the
@@ -1786,9 +1787,6 @@ class ConfigScan:
       through config. A `[remote "x"]` section without one (a global
       `remote.origin.prune`) is not a remote for git: `push x` takes `x` as
       a path. [62] [82]
-    - `cmd`: what the config says of the command to run, every alias's
-      candidate commands (CmdConfig). [66]
-
     The `-c` an alias carries is config like any other: what it names is
     watched. [80] Two steps: `consider` reads one (section, key, value) and
     `add` records one path. The sources and the order are in `run`.
@@ -1801,16 +1799,12 @@ class ConfigScan:
         self.out: dict[Path, str] = {}
         self.refs: list[tuple[str, Path]] = []
         self.remote_names: set[str] = set()
-        self.cmd = CmdConfig()
         # Values of global origin and of the environment / `-c` (an alias's
         # `-c` included): resolved again against each local remote and
         # submodule. [68] [92]
         self.global_vals: list[tuple[str, str, str]] = []
         self.env_vals: list[tuple[str, str, str]] = []
         self.remote_bases: set[Path] = set()
-        # `diff.submodule` by origin (global or not): the repository's value
-        # outranks the global one, last wins within an origin. [89]
-        self.diff_submodule: dict[bool, str] = {}
         self.nxt: list[tuple[Path, Path, bool, bool]] = []    # config files found while reading
         self.tokens_seen: set[tuple[str, Path]] = set()
 
@@ -1888,19 +1882,13 @@ class ConfigScan:
         # submodule's: there, `<name>` is a path.
         if base == repo.root and section.startswith("remote.") and key in ("url", "pushurl"):
             self.remote_names.add(section[len("remote."):])
-        if base == repo.root and not relocated and (section, key) == ("diff", "submodule"):
-            self.diff_submodule[glob] = value
         # `[alias] ci = …`, or since git 2.54 `[alias "ci"] command = …`: the
         # subsection form was read as an unknown section, its `-c` never
         # seen. [90]
         alias = key if section == "alias" else (
             section[len("alias."):] if section.startswith("alias.") and key == "command" else None)
         if alias is not None:
-            command, pairs = _alias_parts(value)
-            if base == repo.root:
-                words = _shell_alias_words(value) if value.startswith("!") else {command} - {None}
-                if words:
-                    self.cmd.aliases.setdefault(alias.lower(), set()).update(w for w in words if w)
+            _, pairs = _alias_parts(value)
             # `alias.ci = -c core.hooksPath=.githooks commit`: git applies the
             # alias's `-c` when it runs, so `.githooks` is a hooks directory
             # like one named on the command line — and travels like it:
@@ -1994,15 +1982,6 @@ class ConfigScan:
                         and (tok, base) not in self.tokens_seen):
                     self.tokens_seen.add((tok, base))
                     self.add(*_expand2(tok, base))
-
-    @property
-    def submodule_content_diff(self) -> bool:
-        """`diff.submodule = diff` in effect: `show`, `log -p` and `diff` of a
-        commit that brings a gitlink run `git diff` inside that repository,
-        with its config — a repository planted in the tree included. The
-        accepted limitation [89]; `trust` warns."""
-        value = self.diff_submodule.get(False, self.diff_submodule.get(True))
-        return value == "diff"           # parse_submodule_params: strcmp, exact
 
     def run(self) -> "ConfigScan":
         """Read every source in git's order and fill `refs`, `remote_names`
@@ -2812,10 +2791,12 @@ def notify_pending(label, text: str) -> None:
 
 def record_pending(key: Path, kind: str, label, message: str,
                    new: dict | None = None, refs: list[tuple[str, Path]] | None = None,
-                   waiter: dict | None = None) -> None:
+                   waiter: dict | None = None, notify_user: bool = True) -> None:
     """Create or refresh `<key>.pending` (kind: changed | never | structural)
     and notify once per NOTIFY_COOLDOWN. `new`/`refs` (changed only) describe
-    the latest state seen; `waiter` registers the blocked process."""
+    the latest state seen; `waiter` registers the blocked process. A child
+    git (`notify_user` False) records without notifying: its parent's
+    stderr carries the message."""
     now = time.time()
     notify = []
 
@@ -2838,7 +2819,7 @@ def record_pending(key: Path, kind: str, label, message: str,
         return d
 
     update_pending(key, fn)
-    if notify:
+    if notify and notify_user:
         notify_pending(label, "git is waiting for your decision. In a terminal: gitguard pending"
                        if kind == "changed" else f"{message} — in a terminal: gitguard pending")
 
@@ -3079,6 +3060,7 @@ def cmd_list() -> None:
     if n == 0:
         info(f"no repository registered in {STATE}")
     check_safe_bare()
+    check_wrap()
 
 
 def forget_key(key: Path) -> None:
@@ -3143,6 +3125,7 @@ def cmd_retrust() -> None:
             warn(f"skipped ({st}): {root or key.name}")
     info(f"{n} repository(ies) re-trusted, {skipped} skipped")
     check_safe_bare()
+    check_wrap()
 
 
 def review(repo: Repo, key: Path, old: dict, new: dict, refs: list[tuple[str, Path]],
@@ -3711,115 +3694,19 @@ def _alias_command(value: str) -> str | None:
     return _alias_parts(value)[0]
 
 
-_SHELL_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
-
-
-def _shell_alias_words(value: str) -> set[str]:
-    """Every word of a `!` alias, lower-cased, a leading `git-` dropped
-    (`git-checkout` in the exec-path): the commands the shell may run. A shell
-    alias runs git from git's own exec-path, put first on its PATH, so the
-    inner git is never the wrapper; the outer git's `-c` does reach it
-    (GIT_CONFIG_PARAMETERS). Candidates, not an interpretation of sh: a word
-    the shell builds (`$c`, `$(…)`) is not seen ([71], [74]). [79]"""
-    return {w.lower().removeprefix("git-") for w in _SHELL_WORD.findall(value[1:])}
-
-
-# The gitlink that arrives with the command [66]. A commit the sandbox built
-# carries a gitlink to a repository it planted in the tree (objects and refs
-# are volatile). Some commands write that gitlink into the index and, in
-# the same process, report the state of the tree, entering every gitlink
-# whose directory holds a repository to run `git status` there
-# (is_submodule_modified), which honours the planted config — unknown to
-# the index gitguard read. Seen on git 2.47.3 and 2.50: checkout and switch
-# (the local changes), stash pop/apply (`git status`) [66]; merge, rebase
-# and pull with an autostash, cherry-pick and revert with the editor [77];
-# a word help.autocorrect turns into one of them [78]; through an alias,
-# shell or not [79]. A list of those commands was the rule and each one
-# missed was a bypass ([77] after [66]), so the switch is now the default:
-# every command runs with `-c diff.ignoreSubmodules=dirty` (git then
-# compares each gitlink's recorded commit without running `git status` in
-# it, match_stat_with_submodule) except the few whose output the option
-# changes and which never write a gitlink from a tree (SWITCH_EXEMPT). A
-# command gitguard does not recognise — a typo, an alias it cannot resolve,
-# a command of a future git — gets the switch, where it changes nothing
-# visible. Fail closed. The gitlink is written; the next command is refused.
-IGNORE_SUBMODULE_DIRT = "diff.ignoreSubmodules=dirty"
-# Probed on git 2.50 with a dirty submodule, every form of each command,
-# with and without the option: status (long, --short, --porcelain) and diff
-# (--submodule=short/log too) report the submodule's dirty tree; `config
-# --list`, `config <key>` and `var -l` list the command-line config.
-# Unchanged: submodule summary and status, describe --dirty, show, stash,
-# add, ls-files, the diff plumbing. None of the four writes a gitlink into
-# an index. `commit` was exempt on the ground that it writes the index from
-# the work tree: that is how a gitlink gets in — `commit -a` (or a pathspec)
-# stages a tracked file the sandbox replaced by a repository, a partial
-# commit resets a temporary index from a HEAD the sandbox moved — and its
-# message template then entered it. Its dry run and template no longer
-# report a submodule's dirty tree. [86] A command missing here costs a line
-# of output, never a bypass; a command added here is a claim to prove
-# (tests/test_commands.py, the [86] forms against each exempt command).
-SWITCH_EXEMPT = frozenset({"status", "diff", "config", "var"})
-
-
-class CmdConfig:
-    """What the repository's config (local, global, environment, `-c`) says
-    about the command git will run, read by config_refs in exec mode: each
-    alias's candidate commands (every definition counts, a superset of
-    git's last-one-wins). [66] [79]"""
-
-    def __init__(self) -> None:
-        self.aliases: dict[str, set[str]] = {}
-
-
-def exempt_from_switch(rest: list[str], cmd: CmdConfig) -> bool:
-    """Does `git <rest>` run a command of SWITCH_EXEMPT and nothing else?
-    Then the switch is left out, so that its output stays what the user
-    knows. A builtin is never shadowed by an alias of its name (git.c
-    run_argv). An alias is exempt only when every definition of it, through
-    alias chains, resolves to an exempt builtin (see _alias_parts); a shell
-    alias (`!git status`) never is: its words are candidates, not an
-    interpretation of sh (_shell_alias_words), and `git` is no exempt
-    command. Anything else — a word that is no command, a typo git may
-    autocorrect, an alias loop — gets the switch. Case-insensitive: config
-    keys are, and `git-Status` finds `git-status` in the exec path of a
-    case-insensitive file system. [66] [78] [79]"""
-    if not rest:
-        return False
-    todo, seen, reached = [rest[0].lower()], set(), False
-    while todo:
-        w = todo.pop()
-        if w in SWITCH_EXEMPT:
-            reached = True
-            continue
-        if w in seen:
-            continue
-        seen.add(w)
-        defs = cmd.aliases.get(w)
-        if not defs:
-            return False
-        todo.extend(x.lower() for x in defs)
-    return reached
-
-
-def with_ignored_submodule_dirt(args: list[str], rest: list[str]) -> list[str]:
-    """`args` with `-c diff.ignoreSubmodules=dirty` inserted after the global
-    options (after the user's own `-c`: the last one wins). git then compares
-    the recorded commit of each gitlink without running `git status` in the
-    submodule (match_stat_with_submodule), and still reports new commits;
-    only "modified content" of a submodule's own tree goes unreported by
-    these commands' summaries. `submodule.<name>.ignore` does not override
-    it (override_submodule_config). Checked on git 2.47 and 2.50. [66]"""
-    cut = len(args) - len(rest)
-    return [*args[:cut], "-c", IGNORE_SUBMODULE_DIRT, *args[cut:]]
-
-
-def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None, git: str) -> int:
+def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None, git: str,
+            child: bool = False) -> int:
+    """Run the real git. A clone/init of the user's is waited for and the new
+    repository trusted (Auto-trust); one run by a child git (`submodule add`
+    cloning into `modules/<x>`) is not: the parent's next command sees the
+    new gitdir in its own fingerprint and asks."""
     os.chdir(orig)
-    if newrepo is None:
+    if newrepo is None or child:
         os.execv(git, [git, *args])
     import subprocess
     sub, d = newrepo
     preexisting = (d / ".git").exists() or (d / ".git").is_symlink()
+    set_judged("new", str(d.resolve()))   # its submodule clones are children under it
     rc = subprocess.call([git, *args])
     if rc == 0:
         d = d.resolve()
@@ -4024,19 +3911,168 @@ def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
 #   (a bare one, which gitguard does not handle) and run nothing of the
 #   cwd's; a local push already reaches them unwrapped through the real
 #   git's exec path. Every ssh push to the VM failed before this entry.
+# - `--exec-path`, `--html-path`, `--man-path`, `--info-path` as the first
+#   argument: handle_options (git.c) prints the path and exit(0)s before
+#   any setup. The exec path's shell scripts (`git-submodule`,
+#   `git-mergetool`, `git-request-pull`…) start with `.
+#   "$(git --exec-path)/git-sh-setup"`: with a check in the way, in a
+#   never-trusted repository, the output was empty and `git-submodule` died
+#   on "cannot open /git-sh-i18n". `--exec-path=<dir>` (sets it) is not on
+#   the list.
 TRANSPORT = {"git-receive-pack": "receive-pack", "git-upload-pack": "upload-pack",
              "git-upload-archive": "upload-archive"}
 VERSION_ARGS = (["--version"], ["version"])
+PATH_QUERIES = (["--exec-path"], ["--html-path"], ["--man-path"], ["--info-path"])
 
 
 def passthrough(name: str, args: list[str]) -> list[str] | None:
     """The real git's arguments when the invocation (`name` = argv[0]'s
     basename, `args` = the git arguments) is on the list above; else None."""
     if name in TRANSPORT:
+        # Its children (`index-pack`, `pack-objects`, `update-server-info`,
+        # `maintenance`) run in the served repository, a bare one gitguard
+        # does not handle: they inherit the passthrough. Without this, every
+        # ssh push to the host died in `index-pack` once gitguard sat at the
+        # exec path — the incident that created TRANSPORT, one level down.
+        set_judged("serving")
         return [TRANSPORT[name], *args]
-    if args[:1] in VERSION_ARGS:
+    if args[:1] in VERSION_ARGS or args[:1] in PATH_QUERIES:
         return args
     return None
+
+
+# ------------------------------------------------------------- child gits
+# Every git enters another repository through a child process, and the
+# child is `<exec-path>/git` (setup_path puts the exec path first in its
+# PATH): with gitguard diverted there, every child is gitguard
+# (DESIGN-exec-path.md). A marker in the environment of the git gitguard
+# runs says which repository this command has already judged: a child in
+# that repository does not judge it again — what the command itself writes
+# (`submodule add`, `remote add`, `push -u`) is judged at the next command,
+# as before — while a child in any other repository, a submodule or a
+# planted `vendor/x`, judges it as a first process would, and refuses a
+# repository never trusted. No route to guess: whatever enters, enters
+# through gitguard. The environment is trusted here as everywhere else
+# (`GITGUARD_REAL_GIT`, `GIT_DIR`): whoever sets the user's environment is
+# outside the model (DESIGN.md, Known limitations).
+JUDGED_ENV = "GITGUARD_JUDGED"
+JUDGED_TTL_DEFAULT = 60.0
+
+
+class Judged:
+    """The marker, parsed: `<epoch>:key=<K>` (a repository judged, by its
+    state key), `<epoch>:new=<path>` (a clone/init of the user's in
+    progress: the new repository and its submodule clones are under
+    `path`), `<epoch>:serving` (a receive-pack/upload-pack serving a
+    repository named by argument). `fresh`: within GITGUARD_JUDGED_TTL
+    seconds of the judgment — an environment variable reaches every
+    descendant, the shell opened from `git commit`'s editor included; a
+    late child judges again, today's cost and today's semantics."""
+
+    def __init__(self, kind: str, value: str, at: float) -> None:
+        self.kind, self.value, self.at = kind, value, at
+
+    @property
+    def fresh(self) -> bool:
+        # The epoch is floored at write time; a second of skew is tolerated
+        # (a rounded value sat half a second in the future and every child
+        # judged again, silently: the suite caught it, the user would not).
+        return -1 <= time.time() - self.at <= judged_ttl()
+
+    def covers(self, repo: Repo) -> bool:
+        """Is `repo` what this marker judged? The same key; or a gitdir under
+        `<judged>/.git/modules/` or `worktrees/` — its content is in the
+        judged manifest (the walk descends there), resolved gitdir and
+        common dir both; or anything under a clone/init in progress; or
+        anything, when serving."""
+        if not self.fresh:
+            return False
+        if self.kind == "serving":
+            return True
+        if self.kind == "new":
+            new = Path(self.value)
+            return repo.root == new or new in repo.root.parents
+        return (repo.key.name == self.value
+                or self.value in _owner_keys(repo.gitdir) & _owner_keys(repo.common))
+
+
+def _owner_keys(p: Path) -> set[str]:
+    """State keys of the repositories whose gitdir is `p` or contains it as a
+    `modules/` or `worktrees/` entry, in the standard layout `<root>/.git`.
+    Another layout (`--separate-git-dir`) yields nothing: the child judges
+    for itself, fail closed."""
+    out = set()
+    for a in (p, *p.parents):
+        if a.name == ".git":
+            rel = p.relative_to(a).parts
+            if not rel or rel[0] in ("modules", "worktrees"):
+                out.add(key_for(a.parent).name)
+    return out
+
+
+def judged_ttl() -> float:
+    v = os.environ.get("GITGUARD_JUDGED_TTL")
+    if v is None or v == "":
+        return JUDGED_TTL_DEFAULT
+    try:
+        f = float(v)
+        if f < 0:
+            raise ValueError
+    except ValueError:
+        raise Refuse(f"GITGUARD_JUDGED_TTL must be a number of seconds: {v!r}") from None
+    return f
+
+
+def read_judged() -> Judged | None:
+    """The marker of the environment, None without one. A malformed one is
+    refused: a child never guesses."""
+    v = os.environ.get(JUDGED_ENV)
+    if v is None:
+        return None
+    try:
+        at, _, rest = v.partition(":")
+        kind, _, value = rest.partition("=")
+        if kind not in ("key", "new", "serving") or (kind == "serving") != (value == ""):
+            raise ValueError
+        return Judged(kind, value, float(at))
+    except ValueError:
+        raise Refuse(f"malformed {JUDGED_ENV}: {v!r}") from None
+
+
+def set_judged(kind: str, value: str = "") -> None:
+    os.environ[JUDGED_ENV] = f"{int(time.time())}:{kind}" + (f"={value}" if value else "")
+
+
+def check_wrap() -> None:
+    """Warn (without refusing) when git's exec path does not lead to
+    gitguard: the children of every git then run unwrapped, and a
+    repository git enters through one — a submodule, a repository planted
+    in the tree — is not judged at entry. The exec path is GIT_EXEC_PATH
+    when set, else what the real git answers to `--exec-path`: a run of git
+    without a repository (handle_options exits before any setup), the one
+    git gitguard runs. Called where the user reads the output: trust,
+    retrust, list."""
+    p = os.environ.get("GIT_EXEC_PATH")
+    if not p:
+        import subprocess
+        try:
+            r = subprocess.run([real_git(), "--exec-path"], capture_output=True, text=True,
+                               timeout=10)
+            p = r.stdout.strip()
+        except (OSError, subprocess.SubprocessError, Refuse):
+            p = ""
+    me = Path(__file__).resolve()
+    try:
+        wrapped = bool(p) and (Path(p) / "git").resolve() == me
+    except OSError:
+        wrapped = False
+    if not wrapped:
+        warn(f"git's exec path ({san(p) or 'unknown'}) does not lead to gitguard: the children "
+             f"of every git command run unwrapped, so a repository git enters through one (a "
+             f"submodule, a repository planted in the work tree) is not judged at entry. "
+             f"Debian: `dpkg-divert --package gitguard --add --rename --divert "
+             f"{san(p)}/git.real {san(p)}/git && ln -s {me} {san(p)}/git`; elsewhere a "
+             f"GIT_EXEC_PATH directory (DESIGN-exec-path.md).")
 
 
 def main(argv: list[str]) -> int:
@@ -4044,6 +4080,11 @@ def main(argv: list[str]) -> int:
     name = Path(argv[0]).name
     if name == "git" or name in TRANSPORT:
         mode, argv = "exec", argv[1:]    # invoked through a symlink named git
+    elif name.startswith("git-"):
+        # `<exec-path>/git-<cmd>` is a symlink to `<exec-path>/git` (Debian:
+        # 160 builtins); with gitguard diverted there, a child git or a
+        # dashed invocation lands here under that name.
+        mode, argv = "exec", [name[4:], *argv[1:]]
     else:
         argv = argv[1:]
         cmd = argv[0] if argv else ""
@@ -4094,6 +4135,7 @@ def main(argv: list[str]) -> int:
     key: Path | None = None
     old: Manifest | None = None
     fingerprinted = False
+    judged = read_judged() if mode == "exec" else None       # a child git
     try:
         if mode == "exec":
             git = real_git()             # resolved first: no git at all is its own error
@@ -4101,25 +4143,36 @@ def main(argv: list[str]) -> int:
         if root is None:
             if mode == "exec":
                 check_archive_outside_repo(split_global_options(argv, orig).rest)
-                return run_git(argv, orig, newrepo, git)
+                return run_git(argv, orig, newrepo, git, child=judged is not None)
             if mode != "check":
                 raise Refuse(f"no git repository here: {Path.cwd()}")      # [30]
             return 0
         repo = open_repo(root)
         label, key = repo.label, repo.key
+        if judged is not None:
+            rest = split_global_options(argv, orig).rest
+            if os.environ.get("GITGUARD_DEBUG"):
+                err(f"child git: marker {judged.kind}={judged.value} fresh={judged.fresh}, repository "
+                    f"key={repo.key.name} owners={sorted(_owner_keys(repo.gitdir) & _owner_keys(repo.common))} "
+                    f"gitdir={repo.gitdir} → {'inherits' if judged.covers(repo) else 'judges'}")
+            # The judged repository: inherited, the command's own writes
+            # are for the next command. Not the checks on this child's
+            # arguments: a push or an archive --remote is judged on where
+            # it goes ([62] [70]), by the full path below.
+            if judged.covers(repo) and rest[:1] not in (["push"], ["archive"]):
+                return run_git(argv, orig, newrepo, git, child=True)
         insp = inspect(repo)
         refs, new = insp.refs, insp.new
         if mode == "exec":
             rest = split_global_options(argv, orig).rest
             check_remote_destination(repo, rest, insp.scan.remote_names, refs)
-            if not exempt_from_switch(rest, insp.scan.cmd):
-                argv = with_ignored_submodule_dirt(argv, rest)
         old = load_manifest(key)
         fingerprinted = True
     except Refuse as e:
-        if mode == "exec" and not e.recorded and not has_tty():
+        if mode == "exec" and not e.recorded and (judged is not None or not has_tty()):
             kind = "never" if fingerprinted and (old is None or not old.current) else "structural"
-            record_pending(key or key_for(Path.cwd().resolve()), kind, label, str(e))
+            record_pending(key or key_for(Path.cwd().resolve()), kind, label, str(e),
+                           notify_user=judged is None)
             e.recorded = True
         raise
 
@@ -4132,6 +4185,7 @@ def main(argv: list[str]) -> int:
                               "Record this state as the reference? [y/N] "):
                     raise Refuse("not trusted.")
                 check_safe_bare()
+                check_wrap()
                 return 0
             rule()
             warn(STYLE.bold(f"{repo.label}/.git has changed since the last trust"))
@@ -4150,16 +4204,9 @@ def main(argv: list[str]) -> int:
                  f"if git tracks them, a checkout/merge/reset/pull of a commit someone else "
                  f"created replaces them after the check, and git runs the new version in the "
                  f"same command. Review incoming changes to these files.")
-        if insp.scan.submodule_content_diff:
-            # A read command is enough here: show/log -p/diff of a commit
-            # someone else created. Accepted limitation [89].
-            warn("diff.submodule = diff is set: `git show`, `log -p` and `diff` of a commit "
-                 "that brings a submodule run `git diff` inside it, with that repository's "
-                 "config — a repository planted in the work tree included, on a read "
-                 "command. gitguard cannot see this before the command. Safer: "
-                 "`git config --global diff.submodule log` (the commits, no execution), and "
-                 "`--submodule=diff` only on a commit you know.")
         check_safe_bare()
+        check_wrap()
+        check_wrap()
         return 0
     if mode == "diff":
         if old is None:
@@ -4177,15 +4224,19 @@ def main(argv: list[str]) -> int:
         return 0
 
     try:
-        check_or_die(repo, key, old, new, refs, interactive=(mode == "exec"))
+        # A child never asks, waits, auto-accepts or notifies: it shares the
+        # parent's terminal, which the parent git may be reading, and nobody
+        # is left waiting on it. It refuses at once and records.
+        check_or_die(repo, key, old, new, refs, interactive=(mode == "exec" and judged is None))
     except Refuse as e:
-        if mode == "exec" and not e.recorded and not has_tty():
+        if mode == "exec" and not e.recorded and (judged is not None or not has_tty()):
             kind = "never" if old is None or not old.current else "structural"
-            record_pending(key, kind, label, str(e))
+            record_pending(key, kind, label, str(e), notify_user=judged is None)
             e.recorded = True
         raise
     if mode == "exec":
-        return run_git(argv, orig, newrepo, git)
+        set_judged("key", key.name)
+        return run_git(argv, orig, newrepo, git, child=judged is not None)
     return 0
 
 if __name__ == "__main__":

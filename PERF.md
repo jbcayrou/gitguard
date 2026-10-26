@@ -14,6 +14,23 @@ again in each submodule, hard-link and FIFO checks, sparse directories):
 machine state — 39.4 → 40.4 ms on a one-file repository, 62.5 → 64.9 ms on
 one with 10 submodules and a global config of 30 aliases and a config hook.
 
+## Child gits (DESIGN-exec-path.md)
+
+With gitguard at git's exec path, every child git is gitguard too. On the
+Debian VM (git 2.47.3, python 3.13), a trusted one-file repository, the
+same gitguard as parent and child, median of 15 (2026-10-26):
+
+| command                          | raw children | wrapped children |
+|----------------------------------|-------------:|-----------------:|
+| `log -1` (no child)              | 26 ms        | 26 ms            |
+| `commit` (one child: maintenance)| 26 ms        | 50 ms            |
+| alias `!git log` (one child)     | 26 ms        | 50 ms            |
+| alias with three children        | 27 ms        | 101 ms           |
+
+About 25 ms per child on the VM: the interpreter's start (the inheriting
+child skips the check itself). `pull` has two or three children, `status`
+one per submodule, `submodule foreach` one per submodule plus the command's.
+
 ## Environment
 
 - Apple M4 Pro, macOS (Darwin 27.0), APFS

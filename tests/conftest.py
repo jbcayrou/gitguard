@@ -44,6 +44,36 @@ def _real_git() -> str:
 REAL_GIT = _real_git()
 
 
+def _exec_paths(base: Path) -> tuple[Path, Path]:
+    """Two exec paths (DESIGN-exec-path.md). The scenarios are built with the
+    real git and **raw** children (`raw/git` is the real binary), the checks
+    run with the **wrapped** exec path (`wrapped/git` is gitguard, `git.real`
+    next to it): git puts the exec path first in its children's PATH, so a
+    child git of the checked command is gitguard, as it is on a machine
+    where the exec path is diverted. Every other entry of the real exec
+    path (helpers, scripts) is linked into both."""
+    r = subprocess.run([REAL_GIT, "--exec-path"], capture_output=True, text=True)
+    real_core = Path(r.stdout.strip())
+    real_bin = real_core / "git.real" if (real_core / "git.real").exists() else real_core / "git"
+    if _is_gitguard(real_bin):
+        raise RuntimeError(f"{real_bin} is gitguard and no git.real sits next to it")
+    raw, wrapped = base / "exec-raw", base / "exec-wrapped"
+    git_inode = (real_core / "git").resolve()
+    for d in (raw, wrapped):
+        d.mkdir()
+        for n in os.listdir(real_core):
+            if n in ("git", "git.real"):
+                continue
+            if (real_core / n).resolve() == git_inode:
+                os.symlink("git", d / n)       # a dashed builtin: `git` of this directory
+            else:
+                os.symlink(real_core / n, d / n)
+    os.symlink(real_bin, raw / "git")
+    os.symlink(GITGUARD, wrapped / "git")
+    os.symlink(real_bin, wrapped / "git.real")
+    return raw, wrapped
+
+
 def pytest_report_header(config) -> str:
     """Which git the parity tests took as the oracle: the discovery ports
     (`-m discovery`) and the byte-variant tables were checked against it."""
@@ -68,9 +98,17 @@ class Result:
 
 @dataclass
 class GG:
-    """Run gitguard.py (or raw git) in an isolated environment."""
+    """Run gitguard.py (or raw git) in an isolated environment. `env` has the
+    wrapped exec path (a child git of a checked command is gitguard);
+    `raw_env` the raw one, for building scenarios and for positive controls
+    that need the real git to enter a repository."""
     env: dict[str, str]
     state: Path
+    raw_exec: Path = Path("/nonexistent")
+
+    @property
+    def raw_env(self) -> dict[str, str]:
+        return {**self.env, "GIT_EXEC_PATH": str(self.raw_exec)}
 
     def run(self, *args: str, cwd: Path | None = None, stdin: str | None = None) -> Result:
         r = subprocess.run([sys.executable, str(GITGUARD), *args], cwd=cwd, env=self.env,
@@ -87,7 +125,7 @@ class GG:
 
     def git(self, *args: str, cwd: Path | None = None) -> Result:
         """Raw git, bypassing gitguard — to build the scenarios."""
-        r = subprocess.run(["git", *args], cwd=cwd, env=self.env, capture_output=True,
+        r = subprocess.run(["git", *args], cwd=cwd, env=self.raw_env, capture_output=True,
                            text=True, errors="replace")
         return Result(r.returncode, r.stdout, r.stderr)
 
@@ -96,8 +134,14 @@ class GG:
         return self.state / hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
 
 
+@pytest.fixture(scope="session")
+def exec_paths(tmp_path_factory) -> tuple[Path, Path]:
+    return _exec_paths(tmp_path_factory.mktemp("exec"))
+
+
 @pytest.fixture
-def gg(tmp_path: Path) -> GG:
+def gg(tmp_path: Path, exec_paths: tuple[Path, Path]) -> GG:
+    raw, wrapped = exec_paths
     home = tmp_path / "home"
     state = tmp_path / "state"
     home.mkdir()
@@ -113,8 +157,9 @@ def gg(tmp_path: Path) -> GG:
         "LC_ALL": "C.UTF-8",
         "GITGUARD_NO_NOTIFY": "1",   # the suite never notifies a developer's desktop
         "GITGUARD_WAIT": "0",        # nor blocks: the waiting tests set their own value
+        "GIT_EXEC_PATH": str(wrapped),
     }
-    g = GG(env, state)
+    g = GG(env, state, raw)
     for k, v in [("user.email", "t@t"), ("user.name", "t"), ("init.defaultBranch", "main"),
                  ("protocol.file.allow", "always")]:
         assert g.git("config", "--global", k, v).rc == 0
