@@ -1442,7 +1442,8 @@ def test_work_tree_alone_to_a_missing_directory_is_refused(gg: GG, repo: Path, t
 # [90]–[94] [96]); their controls are here, calling the attack function
 # itself (its payload touches tmp_path/RAN). [89] closed by the exec-path
 # design (the `git diff` in the planted repository is a child, gitguard);
-# [95] open, same repository, same command (DESIGN-exec-path.md).
+# [95] closed by the child in the same repository re-hashing the tree-side
+# references (`check_tree_refs`).
 from tests.attacks import config_scope as _cs, nested as _nested, symlinks as _links  # noqa: E402
 from tests.attacks._helpers import git_has  # noqa: E402
 from tests.conftest import GITGUARD  # noqa: E402
@@ -1669,16 +1670,14 @@ def _tracked_include_branch(gg: GG, tmp_path: Path, mark: Path) -> Path:
     return r
 
 
-@pytest.mark.xfail(strict=True, reason="[95] OPEN — variant of [44]; the maintenance child inherits "
-                                        "the parent's judgment (DESIGN-exec-path.md, section 2)")
 def test_merge_checks_out_a_tracked_include_then_reads_it(gg: GG, tmp_path: Path) -> None:
-    """[95] OPEN — variant of [44] for config: a tracked file the trusted
-    config includes. Nothing in the fingerprint changes (objects, refs);
-    `git merge --ff-only agent` checks the new `.gitconfig` out, then spawns
-    `git maintenance run --auto`, which reads it and starts its "pager" on
-    the user's terminal. With gitguard at the exec path that child is
-    gitguard, but it is the same repository and the same command: it
-    inherits the parent's judgment, by design."""
+    """[95] Variant of [44] for config: a tracked file the trusted config
+    includes. Nothing in the fingerprint changes (objects, refs); `git merge
+    --ff-only agent` checks the new `.gitconfig` out, then spawns `git
+    maintenance run --auto`, which reads it and starts its "pager" on the
+    user's terminal. That child is gitguard, covered by the parent's
+    marker: in the judged repository itself it re-hashes the tree-side
+    references (`check_tree_refs`) and refuses the changed include."""
     mark = tmp_path / "RAN"
     r = _tracked_include_branch(gg, tmp_path, mark)
     assert not gg.check(r).blocked

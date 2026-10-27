@@ -982,8 +982,8 @@ into the tree was not watched.
 
 ## Tests
 
-**`python3 -m pytest`** (~1060 tests, expected failures [44], [71], [74] — accepted limitations — and
-and the open [95]; ~180 s, ~40 s with `-n 8` on the command line),
+**`python3 -m pytest`** (~1260 tests, expected failures [44], [71], [74] — accepted limitations;
+~180 s, ~40 s with `-n 8` on the command line),
 to run before any change:
 
 - `tests/attacks/` — **the attack corpus**, one module per family (`gitdir`,
@@ -1105,7 +1105,7 @@ false positives, two of them RCEs found after the tool was believed solid,
 [66]–[70], [72], [73], [75], [76] from the twelfth, fixed on 2026-10-23;
 [77]–[83] from the thirteenth, fixed on 2026-10-24; [84], [85] from a
 design review; [86]–[99] from the fourteenth (six agents, 2026-10-24),
-fixed on 2026-10-25 but [89], closed on 2026-10-26 by the exec-path design (DESIGN-exec-path.md), and [95], open;
+fixed on 2026-10-25 but [89], closed on 2026-10-26 by the exec-path design (DESIGN-exec-path.md), and [95], closed on 2026-10-27 (the child re-hashes the tree-side references);
 [44], [71] and [74] are accepted limitations, see "Known limitations"; the ninth pass was the
 promotion of the git-parity `xfail`s [46]–[50]).
 The method that worked, for the next pass — by a human or by agents that know
@@ -1205,11 +1205,20 @@ The rule for a new member of the class: if the reading is done by a
 **child git in another repository**, nothing to do — the child is gitguard
 and refuses it (Nested repositories, DESIGN-exec-path.md; [66] [77] [86]
 [89] closed this way); if the file is a link, the structure check refuses
-it ([88]); if the reading is done in the **same repository, in the same
-command** — a hook checked out and run ([44]), an include checked out and
-read by the `maintenance` child, which inherits the judgment ([95]) — it is
-an accepted limitation with a `trust`-time warning, and the prevention
-layer is the answer (a global `core.hooksPath` outside every tree,
+it ([88]); if the reading is done by a **child git in the same
+repository** — an include checked out by `merge`, then read by its
+`maintenance run --auto` ([95]) — the child inherits the judgment but not
+blindly: before running, it re-hashes the tree-side references of the
+manifest (scope `wt`: the files and directories the trusted config names
+inside the work tree) and refuses if they changed (`check_tree_refs`,
+~0.5 ms; only the refs, never a walk of the tree). The cost is a refusal
+of that child when the change is legitimate (a pull bringing a colleague's
+hook): git ignores the exit of its maintenance child, the command
+succeeds, and the next command asks, as it would have anyway. If the
+reading is done by the **command's own process** — a hook checked out and
+run by the same `checkout` ([44]) — no gitguard runs between the write
+and the read: an accepted limitation with a `trust`-time warning, and the
+prevention layer is the answer (a global `core.hooksPath` outside every tree,
 `safe.bareRepository=explicit`, a mount the sandbox cannot write `.git/`
 on). Finding the next member is a reading of a command's flow in git's
 source (`builtin/<cmd>.c`: what it writes under the gitdir or the tree,
@@ -1317,12 +1326,13 @@ the files, not the order.
   in the judged repository skips its check, one typed in another refuses
   without asking (the record is in `gitguard pending`). One repository, a
   process the user started by hand: documented, not closed ([104]).
-- **Open [95]**, the [44] boundary for config: a tracked `.gitconfig` the
-  trusted `.git/config` includes (`include.path = ../.gitconfig`). The
-  sandbox commits a new version and moves a branch; `git merge` checks it
-  out, then its `git maintenance run --auto` reads it. Decision pending:
-  an accepted limitation with a `trust` warning, as [44]. xfail record:
-  `test_merge_checks_out_a_tracked_include_then_reads_it`.
+- [95], the [44] boundary for config, is closed only where a child git
+  reads the file (the `maintenance` of a `merge`): a tracked file the
+  trusted config names, checked out and then read by the command's own
+  process, is [44]. A legitimate change to such a file makes that child
+  refuse during the command (noise on stderr, the command succeeds); the
+  next command asks. Submodule children are not re-checked this way: their
+  own tree-side references are judged at the next command in them.
 - `git --work-tree=<other> …` changes the set of hooks git runs, so the
   fingerprint differs from the repository's own tree ([72]): the tree is
   blessed with `GIT_WORK_TREE=<other> gitguard trust` (same state key),

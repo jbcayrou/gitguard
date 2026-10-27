@@ -548,12 +548,16 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      link's), gitguard against the target's. The sandbox writes the file
      git reads, gitguard watches another. Fix: included files are queued as
      opened.
-[95] OPEN — variant of [44] for config: a tracked `.gitconfig` the trusted
+[95] variant of [44] for config: a tracked `.gitconfig` the trusted
      `.git/config` includes (`include.path = ../.gitconfig`). The sandbox
      writes objects and a ref only; `git merge` checks the new file out,
      then spawns `git maintenance run --auto`, which reads it and starts
-     its `pager.maintenance` on the user's terminal. Decision pending:
-     accepted limitation with a `trust` warning, like [44], or more.
+     its `pager.maintenance` on the user's terminal. Fix (2026-10-27): the
+     child is gitguard (exec-path design); covered, in the judged
+     repository itself, it re-hashes the tree-side references (scope `wt`)
+     against the manifest and refuses (`check_tree_refs`). Closes the
+     reading by a child git only; a reading by the command's own process
+     stays [44].
 [96] a path glued to a short option (`core.sshCommand = ssh
      -F./deploy/ssh_config`) is one token starting with `-`, dropped;
      ssh reads the file, a ProxyCommand planted there runs on `git fetch`.
@@ -577,7 +581,7 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      adversarial review (six agents, 2026-10-24), replayed against git 2.50
      and 2.54; replayed against 2.47.3 (Debian VM) on 2026-10-26. All fixed
      on 2026-10-25 but [89] (closed on 2026-10-26, exec-path design) and
-     [95], still open.
+     [95] (closed on 2026-10-27, the child re-hashes the tree-side refs).
 [100] False positives from the inventory of git's source (tests/inventory.py,
      2026-10-26): every name git opens under a gitdir, held to gitguard's
      tables by test_claims.py. Four edit buffers at the gitdir root were

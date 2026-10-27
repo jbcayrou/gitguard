@@ -141,6 +141,33 @@ def test_hookspath_ordinary_commits(gg: GG, repo: Path) -> None:
     assert not gg.check(repo).blocked
 
 
+def test_merge_bringing_a_tracked_hook_change_succeeds(gg: GG, repo: Path) -> None:
+    """[95] The cost of closing it: a merge that brings a legitimate change
+    to a tracked hook the trusted config names (`core.hooksPath =
+    .githooks`). The merge's `maintenance run --auto` child sees the hook
+    changed since the check and refuses; git ignores that child's exit, the
+    merge succeeds, and the next command asks about the hook, as it did
+    before the child checked anything."""
+    hooks = repo / ".githooks"
+    hooks.mkdir()
+    (hooks / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
+    gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
+    gg.git("add", ".githooks", cwd=repo)
+    gg.git("commit", "-qm", "hooks", cwd=repo)
+    gg.git("checkout", "-qb", "up", cwd=repo)
+    (hooks / "pre-commit").write_text("#!/bin/sh\n# a colleague's lint\nexit 0\n")
+    gg.git("commit", "-qam", "lint", cwd=repo)
+    gg.git("checkout", "-q", "-", cwd=repo)
+    gg.trust(repo)
+    r = gg.run("git", "merge", "-q", "--ff-only", "up", cwd=repo)
+    assert r.rc == 0, r.text
+    assert "colleague" in (hooks / "pre-commit").read_text()
+    c = gg.check(repo)
+    assert c.blocked and "pre-commit" in c.err, c.text
+    gg.trust(repo)
+    assert not gg.check(repo).blocked
+
+
 def test_hookspath_system_readonly_ignored(gg: GG, repo: Path) -> None:
     gg.git("config", "core.hooksPath", "/usr/share/git-core/templates/hooks", cwd=repo)
     gg.trust(repo)

@@ -57,8 +57,10 @@ there is no longer a question "will this command enter a submodule?" —
 whatever enters, enters through gitguard. The third sentence is the
 boundary kept on purpose: [44] (a tracked hook checked out, then run) and
 [95] (a tracked include checked out, then read by the `maintenance` child)
-are the same repository, the same command; they stay accepted limitations
-(section 5).
+are the same repository, the same command. [44] stays an accepted
+limitation (section 5); [95] was closed on 2026-10-27 because its reader is
+a child: a covered child in the judged repository itself re-hashes the
+tree-side references before it runs (`check_tree_refs`).
 
 What it replaces, to be removed once the install is verified (section
 3.8): `with_ignored_submodule_dirt`, `SWITCH_EXEMPT`, `exempt_from_switch`,
@@ -146,6 +148,13 @@ child is judged on where it goes and on that alone (`check_remote_destination`,
 [62] [70] [108]: a hook or alias of the trusted config may legitimately
 run `git push`, and a submodule's push must not be judged under the
 submodule's own key); `parse_new_repo` sets the `new` marker (3.4).
+A covered child in the **judged repository itself** (its gitdir is the
+marker's) also re-hashes the manifest's tree-side references (scope `wt`:
+a relative `core.hooksPath`, an `include.path` into the tree) and refuses
+if they changed: the command may have checked out a commit that rewrote
+them, and this child is their first reader ([95]: `merge`, then its
+`maintenance run --auto` reading a tracked include; `check_tree_refs`,
+~0.5 ms, the refs only, never the tree).
 
 ### 3.3 Covered by the judged repository
 
@@ -340,7 +349,7 @@ system-wide replay; keep the `git.real` layout.
 |---|---|---|
 | git enters another repository through a child | [6] [7] [14] [24] [36] [60] [66] [77] [78] [86] [87] | covered twice: the parent's structural refusals, the child's refusal at entry |
 | the submodule content diff | [89] | **closed** (XPASS on the VM); the accepted-limitation text and the `trust` warning go |
-| a tracked include read by the `maintenance` child | [95] | **stays**: same repository, same command (section 2). Joins [44] as an accepted limitation; `trust` warns when an `include.path` resolves inside the work tree, as it warns for hooks in the tree |
+| a tracked include read by the `maintenance` child | [95] | **closed** (2026-10-27): the covered child in the same repository re-hashes the tree-side references and refuses a change (section 2) |
 | tracked hooks, sh readings | [44] [71] [74] | unchanged |
 | everything else (fingerprint scope, parsers, discovery, options, remotes, FPs) | ~75 | unchanged, untouched |
 
@@ -435,7 +444,7 @@ documented the loss).
 | 2 | conftest two exec paths; claims tests of section 7 | 1 day |
 | 3 | positive controls inverted, legit scenarios, pty test for children, PERF.md | 1 day |
 | 4 | verification at trust (3.7); Debian install script and `.deb` skeleton; VM update and replay | ½–1 day |
-| 5 | removal of the switch, `SWITCH_EXEMPT`, `exempt_from_switch`, `EXEMPT_FORMS`; DESIGN.md "Nested repositories" rewritten; [89] moved from accepted to fixed, [95] warning on includes in the tree; catalogue entry for this design | ½ day |
+| 5 | removal of the switch, `SWITCH_EXEMPT`, `exempt_from_switch`, `EXEMPT_FORMS`; DESIGN.md "Nested repositories" rewritten; [89] moved from accepted to fixed ([95] closed later, 2026-10-27, by `check_tree_refs`); catalogue entry for this design | ½ day |
 
 Step 1 alone leaves gitguard working on an unwrapped machine exactly as
 today; the removal in step 5 is the only step that requires the install.

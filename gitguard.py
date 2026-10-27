@@ -2564,6 +2564,30 @@ class Inspection:
         return self.scan.refs
 
 
+def check_tree_refs(repo: Repo, key: Path) -> None:
+    """A covered child in the judged repository itself re-hashes the
+    tree-side references (scope `wt`: hooks and includes the trusted config
+    names inside the work tree) against the manifest, and refuses if they
+    differ. The command may have checked out a commit that rewrote them (a
+    merge of the sandbox's branch), and this child (the merge's
+    `maintenance run --auto`) is the first git to read them. [95]
+    A reading by the command's own process is not seen here: [44]."""
+    old = load_manifest(key)
+    if old is None or not old.current:
+        return
+    zones = tuple({repo.gitdir, repo.common, repo.root})
+    now = {}
+    for scope, p in old.refs:
+        if scope == "wt":
+            now.update({(e.scope, e.path): e for e in walk_tree(scope, repo.root, p, repo, zones)})
+    was = {k: e for k, e in old.entries.items() if k[0] == "wt"}
+    if now != was:
+        rule()
+        warn(STYLE.bold(f"{repo.label}: files in the work tree the trusted config names changed during the command"))
+        show_changes(repo, old.entries, {**{k: e for k, e in old.entries.items() if k[0] != "wt"}, **now}, key)
+        raise Refuse("refusing to run git; the next git command asks about these changes.")
+
+
 def inspect(repo: Repo) -> Inspection:
     """config_refs → check_structure → manifest. Raises Refuse on a
     structural problem; the fingerprint is not computed then."""
@@ -4310,6 +4334,10 @@ def main(argv: list[str]) -> int:
                 if rest[:1] in (["push"], ["archive"]):
                     insp = inspect(repo)
                     check_remote_destination(repo, rest, insp.scan.remote_names, insp.refs)
+                # The judged repository itself: what the command checked
+                # out into the tree since the check is read by this child. [95]
+                if judged.kind == "repo" and repo.gitdir == Path(judged.paths[0]):
+                    check_tree_refs(repo, key)
                 return run_git(argv, orig, newrepo, git, judged)
         insp = inspect(repo)
         refs, new = insp.refs, insp.new
