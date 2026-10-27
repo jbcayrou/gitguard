@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import os
 import pytest
 
 import gitguard as gg_mod
@@ -88,26 +89,44 @@ def test_parse_new_repo_targets(args, expected, monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
     res = parse_new_repo(args)
     assert res is not None
-    assert res[0] == expected[0]
-    assert res[1] == (tmp_path / expected[1])
+    assert (res.sub, res.dir, res.gitdir, res.auto_trust) == (expected[0], tmp_path / expected[1], None, True)
 
 
-@pytest.mark.parametrize("args", [
-    ["status"],
-    ["clone", "--bare", "u", "d"],
-    ["clone", "--mirror", "u"],
-    ["init", "--bare", "d"],
-    ["init", "--separate-git-dir=/x", "d"],
-    ["clone"],
-])
+@pytest.mark.parametrize("args", [["status"], ["clone"], ["clone", "/"]])
 def test_parse_new_repo_none(args, monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
     assert parse_new_repo(args) is None
 
 
+@pytest.mark.parametrize("args,dir,gitdir", [
+    (["clone", "--bare", "u", "d"], "d", None),
+    (["clone", "--mirror", "u"], "u.git", None),
+    (["init", "--bare", "d"], "d", None),
+    (["init", "--bare"], ".", None),
+])
+def test_parse_new_repo_bare_sets_the_marker_without_auto_trust(args, dir, gitdir, monkeypatch, tmp_path) -> None:
+    """A bare repository is not auto-trusted (gitguard does not handle
+    those), but its clone's index-pack still needs the `new` marker. [101]"""
+    monkeypatch.chdir(tmp_path)
+    res = parse_new_repo(args)
+    assert (res.dir, res.gitdir, res.auto_trust) == (tmp_path / dir, None, False)
+
+
+@pytest.mark.parametrize("args", [["init", "--separate-git-dir=g", "d"], ["init", "--separate-git-dir", "g", "d"],
+                                  ["clone", "--separate-git-dir=g", "u", "d"], ["clone", "--sep=g", "u", "d"]])
+def test_parse_new_repo_separate_git_dir(args, monkeypatch, tmp_path) -> None:
+    """`--separate-git-dir`: the gitdir is elsewhere; the marker names it
+    too (the clone's index-pack runs with GIT_DIR there). [101]"""
+    monkeypatch.chdir(tmp_path)
+    res = parse_new_repo(args)
+    assert (res.dir, res.gitdir, res.auto_trust) == (tmp_path / "d", tmp_path / "g", True)
+    assert res.paths == [str((tmp_path / "d").resolve()), str((tmp_path / "g").resolve())]
+
+
 def test_parse_new_repo_template_warns(monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.chdir(tmp_path)
-    assert parse_new_repo(["clone", "--template=/t", "u", "d"]) is None
+    res = parse_new_repo(["clone", "--template=/t", "u", "d"])
+    assert res.dir == tmp_path / "d" and not res.auto_trust
     assert "template" in capsys.readouterr().err
 
 
@@ -115,7 +134,30 @@ def test_parse_new_repo_dash_C(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / "sub").mkdir()
     res = parse_new_repo(["-C", "sub", "init", "d"])
-    assert res == ("init", tmp_path / "sub" / "d")
+    assert (res.sub, res.dir) == ("init", tmp_path / "sub" / "d")
+
+
+@pytest.mark.parametrize("url,bundle,bare,expected", [
+    ("x/.git", False, False, "x"),                 # [110]: was "" (the `.git` cut, nothing after the `/`)
+    ("x/.git/", False, False, "x"),
+    ("/p/x.git", False, False, "x"),
+    ("/p/x.git/", False, False, "x"),
+    ("https://h/o/x.git", False, False, "x"),
+    ("ssh://user@h:22/o/x", False, False, "x"),
+    ("user@h:x.git", False, False, "x"),
+    ("h:x", False, False, "x"),
+    ("h:2222", False, False, "h"),                 # a bare host:port: the port is stripped
+    ("/foo/bar:2222.git", False, False, "2222"),   # git's documented oddity
+    ("/p/x.bundle", True, False, "x"),
+    ("/p/x.bundle", False, False, "x.bundle"),
+    ("/p/x", False, True, "x.git"),
+    ("/p/x.git", False, True, "x.git"),
+    ("/p/a  b\tc ", False, False, "a b c"),
+    ("/", False, False, None),
+    ("", False, False, None),
+])
+def test_guess_dir_name_is_git_url_basename(url, bundle, bare, expected) -> None:
+    assert gg_mod._guess_dir_name(url, bundle, bare) == expected
 
 
 # ------------------------------------------------------- split_global_options
@@ -207,51 +249,118 @@ def test_refuse_sanitizes_message() -> None:
 
 
 # ------------------------------------------------------------ the judged marker
+def _hex(p: str) -> str:
+    return os.fsencode(p).hex()
+
+
 def test_judged_marker_round_trip(monkeypatch) -> None:
     monkeypatch.delenv("GITGUARD_JUDGED", raising=False)
     assert gg_mod.read_judged() is None
-    gg_mod.set_judged("key", "abc")
+    gg_mod.set_judged("repo", "/g/.git", "/g/.git", "/g")
     j = gg_mod.read_judged()
-    assert j.kind == "key" and j.value == "abc" and j.fresh
-    gg_mod.set_judged("new", "/p=a:th")
+    assert j.kind == "repo" and j.paths == ["/g/.git", "/g/.git", "/g"] and j.pid == os.getpid() and j.alive
+    gg_mod.set_judged("repo", "/srv/x.git", "/srv/x.git", "")          # served: no tree
+    assert gg_mod.read_judged().paths == ["/srv/x.git", "/srv/x.git", ""]
+    gg_mod.set_judged("new", "/p=a:th,\N{EURO SIGN}", "/else/where")   # anything but NUL
     j = gg_mod.read_judged()
-    assert j.kind == "new" and j.value == "/p=a:th"
-    gg_mod.set_judged("serving")
-    assert gg_mod.read_judged().kind == "serving"
+    assert j.kind == "new" and j.paths == ["/p=a:th,\N{EURO SIGN}", "/else/where"]
 
 
-@pytest.mark.parametrize("bad", ["", "x", "123", "123:other=1", "123:serving=1", "123:key=", "abc:key=1"])
+@pytest.mark.parametrize("bad", ["", "x", "123", "123:other=1", "123:repo", "123:repo=", "abc:repo=2f",
+                                 f"123:repo={_hex('/a')}", f"123:repo=,{_hex('/a')},{_hex('/a')}",
+                                 f"123:new=", f"123:new={_hex('/a')},{_hex('/b')},{_hex('/c')}",
+                                 "123:repo=zz,zz,zz", "123:serving"])
 def test_judged_marker_malformed_is_refused(monkeypatch, bad: str) -> None:
     monkeypatch.setenv("GITGUARD_JUDGED", bad)
     with pytest.raises(gg_mod.Refuse):
         gg_mod.read_judged()
 
 
-def test_judged_marker_expires(monkeypatch) -> None:
-    import time
-    monkeypatch.setenv("GITGUARD_JUDGED", f"{int(time.time()) - 61}:key=abc")
-    assert not gg_mod.read_judged().fresh
-    monkeypatch.setenv("GITGUARD_JUDGED", f"{int(time.time()) + 1}:key=abc")   # a second of skew
-    assert gg_mod.read_judged().fresh
-    monkeypatch.setenv("GITGUARD_JUDGED_TTL", "0")
-    monkeypatch.setenv("GITGUARD_JUDGED", f"{int(time.time()) - 2}:key=abc")
-    assert not gg_mod.read_judged().fresh
+def test_judged_marker_dies_with_its_process(monkeypatch) -> None:
+    """[104] the marker is valid while the process that set it is an
+    ancestor: a dead pid, or a live one outside the chain, is no marker —
+    and no TTL: a clock changed the answer mid-command."""
+    import subprocess
+    anc = gg_mod._ancestors()
+    assert os.getpid() in anc and os.getppid() in anc
+    body = f"123:repo={_hex('/a')},{_hex('/a')},{_hex('/a')}"
+    monkeypatch.setenv("GITGUARD_JUDGED", f"{os.getpid()}:" + body.partition(":")[2])
+    assert gg_mod.read_judged() is not None
+    dead = subprocess.Popen(["true"]); dead.wait()
+    monkeypatch.setenv("GITGUARD_JUDGED", f"{dead.pid}:" + body.partition(":")[2])
+    assert gg_mod.read_judged() is None
+    alive = subprocess.Popen(["sleep", "5"])
+    try:
+        monkeypatch.setenv("GITGUARD_JUDGED", f"{alive.pid}:" + body.partition(":")[2])
+        assert gg_mod.read_judged() is None, "alive but not an ancestor"
+    finally:
+        alive.kill(); alive.wait()
+    assert not hasattr(gg_mod, "judged_ttl") and "GITGUARD_JUDGED_TTL" not in open(gg_mod.__file__).read()
 
 
-def test_owner_keys_anchored_to_modules_and_worktrees(tmp_path: Path) -> None:
-    """A gitdir under `<root>/.git/modules/` or `worktrees/` is covered by
-    `<root>`'s key; `<root>/.git` itself too; `hooks/x`, a `.git` deeper
-    down or a separate gitdir are not."""
+def _layout(tmp_path: Path) -> tuple[Path, Path]:
+    """A main repository with a submodule `sub` (which has its own
+    submodule `inner`), a linked worktree `wt` with a submodule `a`, and a
+    gitdir planted in `sub`'s volatile `refs/`: only the directories the
+    recognition needs (HEAD / commondir)."""
     root = tmp_path / "r"
-    k = gg_mod.key_for(root).name
-    assert gg_mod._owner_keys(root / ".git/modules/sub") == {k}
-    assert gg_mod._owner_keys(root / ".git/modules/a/modules/b") == {k}
-    assert gg_mod._owner_keys(root / ".git/worktrees/wt") == {k}
-    assert gg_mod._owner_keys(root / ".git") == {k}
-    assert gg_mod._owner_keys(root / ".git/hooks/x") == set()
-    assert gg_mod._owner_keys(tmp_path / "elsewhere/gitdir") == set()
-    nested = root / "vendor/x"
-    assert gg_mod._owner_keys(nested / ".git") == {gg_mod.key_for(nested).name}
+    g = root / ".git"
+    for d in ["modules/sub", "modules/sub/modules/inner", "worktrees/wt", "worktrees/wt/modules/a",
+              "modules/sub/refs/p", "hooks/x"]:
+        (g / d).mkdir(parents=True)
+    for d in ["", "modules/sub", "modules/sub/modules/inner", "worktrees/wt/modules/a", "modules/sub/refs/p"]:
+        (g / d / "HEAD").write_text("ref: refs/heads/main\n")
+    (g / "worktrees/wt/commondir").write_text("../..\n")
+    return root, g
+
+
+def _repo(root: Path, gitdir: Path, common: Path | None = None) -> "gg_mod.Repo":
+    return gg_mod.Repo(root, gitdir, common or gitdir, root)
+
+
+def test_judged_covers_what_the_walk_hashed(tmp_path: Path, monkeypatch) -> None:
+    """[102] [103] coverage = the judged gitdir and common dir and the gitdir
+    roots nested under their modules/ and worktrees/ (gitdir_roots): a
+    submodule, a submodule's submodule, a worktree's submodule, whatever
+    the gitdir's name; never a gitdir planted in a volatile zone, nor
+    `hooks/x`, nor another repository; the same gitdir with another tree
+    is judged."""
+    root, g = _layout(tmp_path)
+    gg_mod.set_judged("repo", str(g), str(g), str(root))
+    j = gg_mod.read_judged()
+    assert j.covers(_repo(root, g))
+    assert j.covers(_repo(root / "sub", g / "modules/sub"))
+    assert j.covers(_repo(root / "sub/inner", g / "modules/sub/modules/inner"))
+    assert j.covers(_repo(tmp_path / "wt", g / "worktrees/wt", g))
+    assert j.covers(_repo(tmp_path / "wt/a", g / "worktrees/wt/modules/a"))
+    assert not j.covers(_repo(root / "vendor/x", g / "modules/sub/refs/p")), "[103] volatile zone"
+    assert not j.covers(_repo(root / "h", g / "hooks/x"))
+    assert not j.covers(_repo(tmp_path / "other", tmp_path / "other/.git"))
+    assert not j.covers(_repo(tmp_path / "elsewhere", g)), "same gitdir, another tree [72]"
+    assert not j.covers(_repo(tmp_path / "wt", g / "worktrees/wt", tmp_path / "planted")), "planted commondir"
+    # judged from the worktree (its own key): its submodule is covered, the main's too (common)
+    gg_mod.set_judged("repo", str(g / "worktrees/wt"), str(g), str(tmp_path / "wt"))
+    j = gg_mod.read_judged()
+    assert j.covers(_repo(tmp_path / "wt/a", g / "worktrees/wt/modules/a"))
+    assert j.covers(_repo(root / "sub", g / "modules/sub"))
+    assert not j.covers(_repo(root / "vendor/x", g / "modules/sub/refs/p"))
+    # judged from inside the submodule: its own submodule is covered, the superproject is not
+    gg_mod.set_judged("repo", str(g / "modules/sub"), str(g / "modules/sub"), str(root / "sub"))
+    j = gg_mod.read_judged()
+    assert j.covers(_repo(root / "sub/inner", g / "modules/sub/modules/inner"))
+    assert not j.covers(_repo(root, g))
+    # served: any tree of the same gitdir, nothing else
+    gg_mod.set_judged("repo", str(g), str(g), "")
+    j = gg_mod.read_judged()
+    assert j.covers(_repo(tmp_path / "whatever", g)) and j.covers(_repo(root / "sub", g / "modules/sub"))
+    assert not j.covers(_repo(tmp_path / "other", tmp_path / "other/.git"))
+    # a clone in progress: gitdir, common or root under the new path
+    gg_mod.set_judged("new", str(tmp_path / "new"), str(tmp_path / "sep"))
+    j = gg_mod.read_judged()
+    assert j.covers(_repo(tmp_path, tmp_path / "new/.git")), "[101] index-pack: GIT_DIR under new, cwd elsewhere"
+    assert j.covers(_repo(tmp_path / "new/sub", tmp_path / "new/.git/modules/sub"))
+    assert j.covers(_repo(tmp_path / "new", tmp_path / "sep")), "--separate-git-dir"
+    assert not j.covers(_repo(tmp_path / "newer", tmp_path / "newer/.git"))
 
 
 # ------------------------------------------------------------ walk_gitdir filter

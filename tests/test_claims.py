@@ -24,7 +24,7 @@ import pytest
 
 import gitguard as gg_mod
 from tests.conftest import GG, REAL_GIT
-from tests.test_commands import EDITOR, _gitlink_in_head, _typechange_to_repo
+from tests.test_commands import EDITOR, _gitlink_in_head, _gitlink_in_head_volatile_zone, _typechange_to_repo
 
 
 def _help(*args: str) -> str:
@@ -119,10 +119,13 @@ def test_path_query_passes_through_and_matches_git(gg: GG, repo: Path, opt: str)
 # never runs) and the raw one (the positive control: the real git's child
 # runs it). A planting and a command for each way the sandbox brings a
 # gitlink: a tracked file replaced by a repository ([86]), a HEAD moved to a
-# commit with a gitlink ([86]), `--submodule=diff` ([89]).
+# commit with a gitlink ([86]), `--submodule=diff` ([89]); and the planted
+# gitdir hidden in a volatile zone of a real submodule's gitdir, where the
+# marker must not cover it ([103]).
 ENTRIES = {
     "typechange_commit_a": ("typechange", ["commit", "-a"]),
     "gitlink_in_head_partial_commit": ("gitlink_in_head", ["commit", "a"]),
+    "gitlink_in_head_volatile_zone": ("volatile_zone", ["commit", "a"]),
 }
 
 
@@ -131,6 +134,8 @@ def _planted(gg: GG, repo: Path, tmp_path: Path, planting: str) -> Path:
     if planting == "typechange":
         _typechange_to_repo(gg, repo, mark)
         return repo
+    if planting == "volatile_zone":
+        return _gitlink_in_head_volatile_zone(gg, tmp_path, mark)
     return _gitlink_in_head(gg, tmp_path, mark)
 
 

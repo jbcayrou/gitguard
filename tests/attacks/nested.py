@@ -218,3 +218,24 @@ def attack_sparse_index_hides_gitlink(gg: GG, repo: Path, tmp_path: Path) -> Non
     (positive control: test_commands)"""
     from tests.attacks._helpers import payload, plant_sparse_gitlink
     plant_sparse_gitlink(gg, repo, tmp_path, str(payload(tmp_path)))
+
+
+def attack_gitdir_in_submodule_volatile_zone(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[103] a gitdir planted in a volatile zone of a real submodule's gitdir
+    (`.git/modules/sub/refs/p`: nobody hashes refs/), named by a gitlink of
+    the submodule's index (volatile) through a gitfile: check_nested_git
+    accepted anything under modules/, and `git status` recursed into it"""
+    sub = add_submodule(gg, repo, tmp_path)
+    gg.trust(repo)
+    planted = tmp_path / "vol-planted"
+    gg.git("init", "-q", str(planted))
+    (planted / "p").write_text("p\n")
+    gg.git("add", "p", cwd=planted)
+    gg.git("commit", "-qm", "p", cwd=planted)
+    gg.git("config", "core.fsmonitor", "/tmp/evil", cwd=planted)
+    pg = repo / ".git/modules/sub/refs/p"
+    shutil.move(str(planted / ".git"), str(pg))
+    sha = gg.git("--git-dir", str(pg), "rev-parse", "HEAD").out.strip()
+    assert gg.git("update-index", "--add", "--cacheinfo", f"160000,{sha},inner", cwd=sub).rc == 0
+    (sub / "inner").mkdir()
+    (sub / "inner/.git").write_text("gitdir: ../../.git/modules/sub/refs/p\n")

@@ -258,9 +258,27 @@ def test_child_git_never_waits(gg: GG, repo: Path) -> None:
     for another repository) refuses a changed repository at once — no wait
     for `gitguard pending`, however long GITGUARD_WAIT — and records."""
     gg.git("config", "core.hooksPath", "/nowhere", cwd=repo)
-    env = dict(gg.env, GITGUARD_WAIT="30", GITGUARD_JUDGED=f"{int(time.time())}:key=0000000000000000")
+    h = os.fsencode("/elsewhere/.git").hex()
+    env = dict(gg.env, GITGUARD_WAIT="30", GITGUARD_JUDGED=f"{os.getpid()}:repo={h},{h},{os.fsencode('/elsewhere').hex()}")
     t0 = time.monotonic()
     r = subprocess.run([sys.executable, str(GITGUARD), "git", "status"], cwd=repo, env=env,
                        capture_output=True, text=True, start_new_session=True)
     assert r.returncode != 0 and time.monotonic() - t0 < 5, r.stderr
     assert "has changed" in r.stderr and gg.key_for(repo).with_suffix(".pending").exists()
+
+
+def test_dead_marker_is_no_marker(gg: GG, repo: Path) -> None:
+    """[104] a marker whose process is gone is no marker: the user's
+    semantics — a changed repository without a terminal records and waits
+    for `gitguard pending` (GITGUARD_WAIT) instead of a child's immediate
+    refusal."""
+    gg.git("config", "core.hooksPath", "/nowhere", cwd=repo)
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    h = os.fsencode("/elsewhere/.git").hex()
+    env = dict(gg.env, GITGUARD_WAIT="2",
+               GITGUARD_JUDGED=f"{dead.pid}:repo={h},{h},{os.fsencode('/elsewhere').hex()}")
+    t0 = time.monotonic()
+    r = subprocess.run([sys.executable, str(GITGUARD), "git", "status"], cwd=repo, env=env,
+                       capture_output=True, text=True, start_new_session=True)
+    assert r.returncode != 0 and time.monotonic() - t0 >= 2 and "no decision within" in r.stderr, r.stderr

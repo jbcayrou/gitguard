@@ -31,6 +31,11 @@ About 25 ms per child on the VM: the interpreter's start (the inheriting
 child skips the check itself). `pull` has two or three children, `status`
 one per submodule, `submodule foreach` one per submodule plus the command's.
 
+Re-measured on 2026-10-27 after the marker was redone ([101]–[112]: pid
+lifetime through `/proc`, coverage by `gitdir_roots`, an `iterdir` of
+`modules/` and `worktrees/` per child): 26 / 51 / 51 / 101 ms, the same
+table within noise.
+
 ## Environment
 
 - Apple M4 Pro, macOS (Darwin 27.0), APFS

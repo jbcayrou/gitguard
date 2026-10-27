@@ -744,19 +744,29 @@ def test_checkout_rewrites_tracked_hook_then_runs_it(gg: GG, repo: Path, tmp_pat
     assert not mark.exists(), "post-checkout from the container's commit was executed"
 
 
-def _plant_gitlink(gg: GG, r: Path, mark: Path, ref: str = "refs/heads/main") -> None:
+def _plant_gitlink(gg: GG, r: Path, mark: Path, ref: str = "refs/heads/main",
+                   zone: Path | None = None) -> None:
     """The sandbox of [66]: an untracked repository `vendor/x` whose config runs
     a script (core.fsmonitor touching `mark`), a commit whose tree has a
     gitlink at `vendor/x`, and `ref` moved to it — objects and refs are
     volatile, nothing of this is in the fingerprint. For `refs/stash` the
-    commit is shaped like a stash (two parents, a reflog entry)."""
+    commit is shaped like a stash (two parents, a reflog entry). With
+    `zone`, the planted gitdir is moved there (a volatile zone of a real
+    submodule's gitdir, [103]) and `vendor/x/.git` is a gitfile to it."""
     x = r / "vendor/x"
     gg.git("init", "-q", str(x))
     (x / "s").write_text("s\n")
     gg.git("add", "s", cwd=x)
     gg.git("commit", "-qm", "s", cwd=x)
-    write_exec(x / ".git/fsm.sh", f"#!/bin/sh\ntouch '{mark}'\n")
-    gg.git("config", "core.fsmonitor", str(x / ".git/fsm.sh"), cwd=x)
+    gitdir = x / ".git"
+    if zone is not None:
+        import shutil
+        zone.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(gitdir), str(zone))
+        gitdir = zone
+        (x / ".git").write_text(f"gitdir: {os.path.relpath(zone, x)}\n")
+    write_exec(gitdir / "fsm.sh", f"#!/bin/sh\ntouch '{mark}'\n")
+    gg.git("config", "core.fsmonitor", str(gitdir / "fsm.sh"), cwd=x)
     (x / "s").write_text("dirty\n")        # a dirty submodule tree: what `git status` reports
     sub = gg.git("rev-parse", "HEAD", cwd=x).out.strip()
     import subprocess
@@ -1521,6 +1531,19 @@ def _gitlink_in_head(gg: GG, tmp_path: Path, mark: Path) -> Path:
     return r
 
 
+def _gitlink_in_head_volatile_zone(gg: GG, tmp_path: Path, mark: Path) -> Path:
+    """[103] as _gitlink_in_head, the planted gitdir sitting in a volatile
+    zone of a real submodule's gitdir (`.git/modules/sub/refs/p`), hashed
+    by nobody; the marker covered it by prefix, the child inherited."""
+    from tests.attacks._helpers import add_submodule
+    r = _two_branches(gg, tmp_path)
+    add_submodule(gg, r, tmp_path)
+    gg.trust(r)
+    _plant_gitlink(gg, r, mark, ref="refs/heads/feature", zone=r / ".git/modules/sub/refs/p")
+    (r / "a").write_text("b\n")
+    return r
+
+
 @pytest.mark.parametrize("form", list(COMMIT_FROM_HEAD))
 def test_partial_commit_enters_a_gitlink_from_head(gg: GG, tmp_path: Path, form: str) -> None:
     """[86] the sandbox moves the current branch to a commit with a
@@ -1879,3 +1902,138 @@ def test_glued_ssh_option_control_real_git_runs_it(gg: GG, repo: Path, tmp_path:
     attack(gg, repo, tmp_path)
     gg.git("fetch", "-q", "origin", cwd=repo)
     assert (tmp_path / "RAN").exists()
+
+
+# ------------------------------------------------ the marker, 15th pass [104]–[112]
+def test_served_repository_marker_covers_it_alone(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[105] a trusted post-receive of a local hub runs `cd site && git pull`:
+    the hub's children inherit a marker for the hub, not for `site`, whose
+    planted post-merge must not run. The child judges `site`, refuses at
+    once (no terminal to ask) and records. Control: raw children run it."""
+    mark = tmp_path / "RAN"
+    hub, site = tmp_path / "hub.git", tmp_path / "site"
+    assert gg.git("init", "-q", "--bare", str(hub)).rc == 0
+    gg.git("remote", "add", "hub", str(hub), cwd=repo)
+    assert gg.git("push", "-q", "hub", "main", cwd=repo).rc == 0
+    assert gg.git("clone", "-q", str(hub), str(site)).rc == 0
+    write_exec(hub / "hooks/post-receive",
+               f"#!/bin/sh\ncd {site} && unset GIT_DIR && git pull -q origin main\n")
+    gg.trust(repo)
+    gg.trust(site)
+    write_exec(site / ".git/hooks/post-merge", f"#!/bin/sh\ntouch {mark}\n")     # the sandbox
+    (repo / "f").write_text("2\n")
+    gg.git("commit", "-qam", "2", cwd=repo)
+    r = gg.run("git", "push", "-q", "hub", "main", cwd=repo)
+    assert r.rc == 0 and not mark.exists(), r.text
+    assert Path(str(gg.key_for(site)) + ".pending").exists(), "the child's refusal is recorded"
+    (repo / "f").write_text("3\n")
+    gg.git("commit", "-qam", "3", cwd=repo)
+    assert gg.git("push", "-q", "hub", "main", cwd=repo).rc == 0
+    assert mark.exists(), "control: the real git's hook runs the pull, which runs post-merge"
+
+
+def test_server_as_first_word_passes_through(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[106] `git upload-pack <dir>` / `git receive-pack <dir>` as the first
+    word (git daemon, http-backend, git-shell) serve the named repository
+    and read nothing of the cwd: passed through like the dashed names."""
+    bare = tmp_path / "srv.git"
+    assert gg.git("init", "-q", "--bare", str(bare)).rc == 0
+    write_exec(repo / ".git/hooks/pre-commit")           # cwd modified: irrelevant
+    for cmd in (["upload-pack", "--advertise-refs", str(bare)],
+                ["receive-pack", "--advertise-refs", str(bare)],
+                ["upload-pack", "--timeout", "5", "--advertise-refs", str(bare)]):
+        r = gg.run("git", *cmd, cwd=repo)
+        assert r.rc == 0 and "gitguard" not in r.err and r.out, (cmd, r.text)
+    assert gg.check(repo).blocked
+    assert gg.run("git", "-C", str(repo), "upload-pack", str(bare), cwd=tmp_path).blocked, \
+        "a global option first: the full check"
+
+
+def test_child_clone_is_auto_trusted_unless_covered(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[107] a clone run by a child git (an alias, a hook, pre-commit's
+    cache) is the user's clone: marker, wait, auto-trust. One the marker
+    covers — `submodule add`'s clone into `modules/<x>` — leaves no state
+    of its own: the parent's next command sees the new gitdir and asks."""
+    src = make_source(gg, tmp_path)
+    cache = tmp_path / "cache"
+    gg.git("config", "alias.getit", f"!git clone -q file://{src} {cache}", cwd=repo)
+    gg.trust(repo)
+    r = gg.run("git", "getit", cwd=repo)
+    assert r.rc == 0 and "new repository trusted" in r.err, r.text
+    assert not gg.check(cache).blocked
+    r = gg.run("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(src), "sub", cwd=repo)
+    assert r.rc == 0 and "trusted" not in r.err, r.text
+    assert not gg.key_for(repo / "sub").exists(), "a covered clone registers nothing"
+    assert gg.check(repo).blocked, "the parent's next command sees modules/sub"
+
+
+def test_submodule_push_children_judged_on_their_destination(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[108] a covered child's push is judged on where it goes, not under
+    its own key: `push --recurse-submodules=on-demand` pushes the
+    submodule, an alias `push -u && push --tags` survives its own branch
+    tracking write; a push to a path no trusted config names is still
+    refused ([62]), with the planted pre-receive never run."""
+    from tests.attacks._helpers import add_submodule
+    sub = add_submodule(gg, repo, tmp_path)
+    hub, subhub, evil = tmp_path / "hub.git", tmp_path / "subhub.git", tmp_path / "evil.git"
+    for b in (hub, subhub, evil):
+        assert gg.git("init", "-q", "--bare", str(b)).rc == 0
+    mark = tmp_path / "RAN"
+    write_exec(evil / "hooks/pre-receive", f"#!/bin/sh\ntouch {mark}\n")
+    gg.git("remote", "add", "hub", str(hub), cwd=repo)
+    gg.git("remote", "add", "hub", str(subhub), cwd=sub)
+    (sub / "s").write_text("s2\n")
+    gg.git("commit", "-qam", "s2", cwd=sub)
+    gg.git("commit", "-qam", "sub2", cwd=repo)
+    gg.git("config", "alias.pp", "!git push -q -u hub main && git push -q --tags hub", cwd=repo)
+    gg.git("config", "alias.pe", f"!git push -q {evil} main", cwd=repo)
+    gg.git("tag", "v1", cwd=repo)
+    gg.trust(repo)
+    r = gg.run("git", "push", "-q", "--recurse-submodules=on-demand", "hub", "main", cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+    assert gg.git("--git-dir", str(subhub), "rev-parse", "main").rc == 0, "the submodule was pushed"
+    r = gg.run("git", "pp", cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+    assert gg.git("--git-dir", str(hub), "rev-parse", "v1").rc == 0
+    r = gg.run("git", "pe", cwd=repo)
+    assert r.rc != 0 and "[62]" in r.err and not mark.exists(), r.text
+
+
+def test_device_in_a_config_value_is_no_path(gg: GG, repo: Path) -> None:
+    """[109] `/dev/null` in an alias, global or local: nothing to watch.
+    It refused every repository as an unreadable directory, `trust` too."""
+    gg.git("config", "--global", "alias.q", "!git status >/dev/null")
+    gg.git("config", "alias.n", "!cat /dev/null", cwd=repo)
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0 and "/dev/null" not in r.err, r.text
+    assert not gg.check(repo).blocked
+    assert gg.run("git", "q", cwd=repo).rc == 0
+
+
+def test_child_with_another_work_tree_is_judged(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[111] a trusted alias `!git --work-tree=<site> checkout -f main` with a
+    relative core.hooksPath: the child runs the hooks of `<site>/.githooks`,
+    which nothing judged. The same gitdir with another tree is another
+    repository: judged, refused (never trusted / changed), the planted
+    post-checkout never runs. Control: the raw child runs it."""
+    mark = tmp_path / "RAN"
+    site = tmp_path / "site"
+    site.mkdir()
+    write_exec(repo / ".githooks/post-checkout", "#!/bin/sh\nexit 0\n")
+    gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
+    gg.git("config", "alias.deploy", f"!git --work-tree={site} checkout -q -f main", cwd=repo)
+    gg.trust(repo)
+    write_exec(site / ".githooks/post-checkout", f"#!/bin/sh\ntouch {mark}\n")      # the sandbox
+    r = gg.run("git", "deploy", cwd=repo)
+    assert r.rc != 0 and not mark.exists(), r.text
+    assert gg.git("deploy", cwd=repo).rc == 0 and mark.exists(), "control: git runs it"
+
+
+def test_real_git_naming_gitguard_is_refused(gg: GG, repo: Path) -> None:
+    """[112] GITGUARD_REAL_GIT = gitguard itself: refused, not exec'd for ever."""
+    import subprocess
+    from tests.conftest import GITGUARD
+    env = dict(gg.env, GITGUARD_REAL_GIT=str(GITGUARD))
+    r = subprocess.run([sys.executable, str(GITGUARD), "git", "status"], cwd=repo, env=env,
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode != 0 and "names gitguard itself" in r.stderr, r.stderr

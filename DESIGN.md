@@ -897,12 +897,17 @@ elsewhere a `GIT_EXEC_PATH` directory). A child in a repository the
 command has not judged — `vendor/x` — judges it as a first process would
 and refuses it as never trusted; the payload never runs, the parent's
 report fails, the gitlink is written, the next command is refused
-structurally. A child in the judged repository, or in a gitdir under its
-`modules/` or `worktrees/`, inherits the judgment through a marker in the
-environment (`GITGUARD_JUDGED`, the state key and the time, a minute's
-validity): the command's own writes (`submodule add`, `remote add`, `push
--u`) are for the next command, as always. No route is guessed any more:
-whatever enters, enters through gitguard. `trust`, `retrust` and `list`
+structurally. A child in the judged repository, or in a gitdir root the
+walk descended (`modules/<x>`, `worktrees/<x>`, `gitdir_roots`), inherits
+the judgment through a marker in the environment (`GITGUARD_JUDGED`: the
+judged gitdir, common dir and root, and the pid of the process that set
+it, valid while that pid is an ancestor — the command's lifetime, not a
+clock [104]): the command's own writes (`submodule add`, `remote add`,
+`push -u`) are for the next command, as always. Covered means hashed: a
+gitdir planted in a volatile zone of a submodule's gitdir is nobody's
+([103]), the same gitdir with another work tree is another repository
+([111]), a served repository covers itself alone ([105]). No route is
+guessed any more: whatever enters, enters through gitguard. `trust`, `retrust` and `list`
 warn when the exec path does not lead to gitguard (`check_wrap`).
 
 History, kept because its lessons are the reason for the design above.
@@ -931,13 +936,16 @@ repository being judged).
 
 What a child never does: ask on the terminal (the parent git may be
 reading it), wait for a `gitguard pending` decision, auto-accept, notify,
-auto-trust a clone (`submodule add`'s clone into `modules/<x>`: the parent's
-next command sees it), or write to stdout (the parent parses it). It
-refuses at once and records. The children of a served repository
-(`git-receive-pack` and `git-upload-pack` through `TRANSPORT`, whose
-`index-pack` runs in a bare repository gitguard does not handle) inherit
-the passthrough (`serving`); the submodule clones of the user's `clone
---recurse-submodules` inherit the clone in progress (`new`). What stays
+or write to stdout (the parent parses it). It refuses at once and records.
+A child's clone or init is auto-trusted like the user's ([107]) unless the
+marker already covers it (`submodule add`'s clone into `modules/<x>`: the
+parent's next command sees it). A covered child's `push` is judged on its
+destination alone ([108]). The children of a served repository
+(`git-receive-pack`, `git-upload-pack`, `git upload-pack <dir>` through
+`TRANSPORT` and `SERVERS`, whose `index-pack` runs in a bare repository
+gitguard does not handle) inherit a marker for that repository, opened as
+enter_repo opens it; the submodule clones and the `index-pack` of a clone
+in progress inherit `new` ([101]). What stays
 with the child-process barrier as a claim to re-test at each git release
 (`tests/test_claims.py`): git enters a submodule through a child for
 `status`, `commit -a`, a partial commit, `--submodule=diff`; and the
@@ -1303,10 +1311,12 @@ the files, not the order.
   is not (an install without the second diversion, a macOS session without
   the `GIT_EXEC_PATH` directory), a git that enters a repository planted
   in the tree runs its config — [66], [86], [89] open again — and `trust`,
-  `retrust` and `list` say so (`check_wrap`). A marker older than
-  `GITGUARD_JUDGED_TTL` (60 s) makes a child judge its repository again:
-  the cost of a check, the same answer, by design (a shell opened from
-  `git commit`'s editor inherits the environment).
+  `retrust` and `list` say so (`check_wrap`); the wrap is the install, no
+  switch stands in for it. A shell opened from `git commit`'s editor
+  inherits the marker for as long as that git lives: a `git` typed there
+  in the judged repository skips its check, one typed in another refuses
+  without asking (the record is in `gitguard pending`). One repository, a
+  process the user started by hand: documented, not closed ([104]).
 - **Open [95]**, the [44] boundary for config: a tracked `.gitconfig` the
   trusted `.git/config` includes (`include.path = ../.gitconfig`). The
   sandbox commits a new version and moves a branch; `git merge` checks it

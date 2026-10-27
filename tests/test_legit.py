@@ -698,3 +698,116 @@ def test_editor_aborted_leaves_edit_buffers(gg: GG, repo: Path) -> None:
     assert left, "git left no edit buffer behind: scenario void"
     r = gg.check(repo)
     assert not r.blocked, (left, r.text)
+
+
+# ------------------------------------------------- [101] clones through index-pack
+def _bundle(gg: GG, repo: Path, tmp_path: Path) -> Path:
+    b = tmp_path / "r.bundle"
+    assert gg.git("bundle", "create", "-q", str(b), "--all", cwd=repo).rc == 0
+    return b
+
+
+@pytest.mark.parametrize("form", ["file", "depth", "bare", "mirror", "bundle", "separate"])
+def test_clone_through_index_pack(gg: GG, repo: Path, tmp_path: Path, form: str) -> None:
+    """[101] every clone but one of a plain local path (which hard-links the
+    objects) runs fetch-pack → index-pack, a child with `GIT_DIR=<new>/.git`
+    and the user's cwd: it must inherit the `new` marker, whatever the
+    layout (`--bare`: the gitdir is the new path itself; `--separate-git-dir`:
+    the gitdir is elsewhere). Every form died "never trusted" in index-pack
+    and the suite never ran one."""
+    dst = tmp_path / "dst"
+    src = _bundle(gg, repo, tmp_path) if form == "bundle" else f"file://{repo}"
+    opts = {"file": [], "depth": ["--depth", "1"], "bare": ["--bare"], "mirror": ["--mirror"],
+            "bundle": [], "separate": [f"--separate-git-dir={tmp_path / 'g'}"]}[form]
+    r = gg.run("git", "clone", "-q", *opts, str(src), str(dst), cwd=tmp_path)
+    assert r.rc == 0 and "never trusted" not in r.err and "✗" not in r.err, r.text
+    if form in ("file", "depth", "bundle"):
+        assert not gg.check(dst).blocked, "auto-trust of the clone"
+    assert gg.git("log", "-1", "--oneline", cwd=dst).rc == 0
+
+
+def test_clone_from_inside_a_trusted_repository(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[101] the user's cwd is a trusted repository K: the clone's index-pack
+    child, with `GIT_DIR=<new>/.git` and K's root as cwd, computed the new
+    gitdir's manifest under K's key and reported a false diff of K."""
+    src = make_source(gg, tmp_path)
+    dst = repo / "vendor"
+    r = gg.run("git", "clone", "-q", f"file://{src}", str(dst), cwd=repo)
+    assert r.rc == 0 and "has changed" not in r.err and "✗" not in r.err, r.text
+    assert not gg.check(dst).blocked
+    assert not gg.check(repo).blocked, "no gitlink yet: nothing to see (the [14] barrier is the next add)"
+
+
+def test_recurse_submodules_clone_over_file_url(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[101] `clone --recurse-submodules file://…`: the superproject's
+    index-pack, then one clone per submodule, each with its index-pack,
+    all under the `new` marker; the auto-trust covers the result."""
+    add_submodule(gg, repo, tmp_path)
+    dst = tmp_path / "superclone"
+    r = gg.run("git", "clone", "-q", "--recurse-submodules", f"file://{repo}", str(dst), cwd=tmp_path)
+    assert r.rc == 0 and "✗" not in r.err and r.err.count("trusted:") == 1, r.text
+    assert not gg.check(dst).blocked
+    assert (dst / "sub/s").exists()
+
+
+# ------------------------------------- [102] coverage by the judged gitdir, not by name
+def test_submodule_in_linked_worktree(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[102] a linked worktree's submodule lives in
+    `<common>/worktrees/<wt>/modules/<name>`: part of the worktree's
+    fingerprint (the walk descends it), so the worktree's judgment covers
+    the child git that enters it. The marker covered by the name `.git`
+    and by key: `.git/worktrees/wt/modules/sub` mapped to the main
+    repository's key, never to the worktree's, and every `status` in the
+    worktree died "never trusted" in the submodule."""
+    add_submodule(gg, repo, tmp_path)
+    wt = tmp_path / "wt"
+    assert gg.git("worktree", "add", "-q", str(wt), "-b", "wt", cwd=repo).rc == 0
+    assert gg.git("submodule", "update", "--init", "-q", cwd=wt).rc == 0
+    gg.trust(wt)
+    for cmd in (["status", "--short"], ["diff"], ["commit", "-qam", "x", "--allow-empty"]):
+        r = gg.run("git", *cmd, cwd=wt)
+        assert r.rc == 0 and "gitguard:" not in r.err, (cmd, r.text)
+
+
+def test_submodule_with_separate_git_dir(gg: GG, tmp_path: Path) -> None:
+    """[102] `init --separate-git-dir`: the gitdir is not named `.git`; its
+    `modules/<name>` is in the fingerprint all the same. The child entering
+    the submodule must inherit."""
+    w, g = tmp_path / "w", tmp_path / "g"
+    assert gg.git("init", "-q", f"--separate-git-dir={g}", str(w)).rc == 0
+    commit(gg, w)
+    add_submodule(gg, w, tmp_path)
+    gg.trust(w)
+    r = gg.run("git", "status", "--short", cwd=w)
+    assert r.rc == 0 and "gitguard:" not in r.err, r.text
+
+
+def test_dotfiles_layout_commit(gg: GG, tmp_path: Path) -> None:
+    """[102] the dotfiles layout: `GIT_DIR=~/.cfg GIT_WORK_TREE=~`. Each
+    commit spawns `git maintenance run --auto` with the same gitdir and
+    tree: the same repository, covered."""
+    home, cfg = tmp_path / "home2", tmp_path / "home2/.cfg"
+    home.mkdir()
+    assert gg.git("init", "-q", "--bare", str(cfg)).rc == 0
+    assert gg.git(f"--git-dir={cfg}", f"--work-tree={home}", "config", "core.bare", "false").rc == 0
+    (home / ".profile").write_text("x\n")
+    assert gg.git(f"--git-dir={cfg}", f"--work-tree={home}", "add", ".profile").rc == 0
+    gg.env.update(GIT_DIR=str(cfg), GIT_WORK_TREE=str(home))
+    gg.trust(home)
+    r = gg.run("git", "commit", "-qm", "p", cwd=home)
+    assert r.rc == 0 and "gitguard:" not in r.err, r.text
+
+
+def test_submodule_of_submodule_worked_in_directly(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[102] the user works inside a submodule that has its own submodule:
+    the judged gitdir is `.git/modules/sub`, the child's
+    `.git/modules/sub/modules/inner`, under it. By name, the child's owner
+    was the superproject, not `sub`: refused."""
+    sub = add_submodule(gg, repo, tmp_path)
+    inner_src = make_source(gg, tmp_path, "innersrc")
+    r = gg.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner_src), "inner", cwd=sub)
+    assert r.rc == 0, r.text
+    assert gg.git("commit", "-qm", "inner", cwd=sub).rc == 0
+    gg.trust(sub)
+    r = gg.run("git", "status", "--short", cwd=sub)
+    assert r.rc == 0 and "gitguard:" not in r.err, r.text

@@ -9,7 +9,7 @@ the host runs it. gitguard is detection; `safe.bareRepository=explicit` and
 a global `core.hooksPath` are the prevention layers it assumes.
 
 **`DESIGN.md` is the design record** (threat model, every check and why,
-ruled-out alternatives, the catalogue of 99 bypasses). Read the section named below
+ruled-out alternatives, the catalogue of 112 bypasses). Read the section named below
 before touching the matching code; it is long because every paragraph was
 paid for by a bypass.
 
@@ -43,6 +43,11 @@ paid for by a bypass.
 - **The state directory stays outside the repository.**
 - **Exclusions are anchored** to a position under a gitdir root, never to a
   bare name (`_child_root`, paths relative to a root in `VOLATILE_*`).
+- **A child inherits only what the parent hashed**: the marker names the
+  judged gitdir, common dir and root, and covers the gitdir roots the walk
+  descends (`gitdir_roots`), never a name or a prefix ([102] [103]); it
+  lives as long as the process that set it (`_ancestors`), never a clock
+  ([104]).
 - **A directory is watched only for keys git reads it from** (`DIR_KEYS`);
   one that contains the repository, at depth 1 only;
   a file is not watched for keys git reads as data (`DATA_KEYS`).
@@ -67,7 +72,6 @@ gitguard pending [<repo>… | -a | -c <repo>…]   decisions of terminal-less gi
 Environment: `GITGUARD_STATE`, `GITGUARD_REAL_GIT`, `GITGUARD_ALLOW_REBASE_EXEC`,
 `GITGUARD_NO_PROMPT`, `GITGUARD_WAIT`, `GITGUARD_NO_NOTIFY`, `GITGUARD_DEBUG`,
 `GITGUARD_JUDGED` (set by gitguard for the git it runs, read by child gits),
-`GITGUARD_JUDGED_TTL`,
 `NO_COLOR`; git's own `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`,
 `GIT_INDEX_FILE`, `GIT_CEILING_DIRECTORIES`, `GIT_CONFIG_*`, `GIT_TEMPLATE_DIR`
 are honoured as git honours them.
@@ -86,7 +90,7 @@ are honoured as git honours them.
 | state files, keys, locking | `save_trust`, `load_manifest`, `update_pending` | Storage |
 | exec mode: options, clone/init, prompt, pending | `split_global_options`, `parse_new_repo`, `check_or_die`, `ask_on_tty`, `wait_for_decision` | Auto-trust; Exec-mode shortcuts |
 | passthroughs that read no repository | `TRANSPORT`, `main` | Which git runs |
-| child gits: the marker, inheritance, `new`/`serving`, the exec-path wrap and its check | `Judged`, `read_judged`, `set_judged`, `_owner_keys`, `check_wrap`, `PATH_QUERIES`, `run_git` | Nested repositories; DESIGN-exec-path.md |
+| child gits: the marker (pid + judged gitdir/common/root), coverage by `gitdir_roots`, `new`, the served repository, the exec-path wrap and its check | `Judged`, `_ancestors`, `read_judged`, `set_judged`, `NewRepo`, `_served_repository`, `check_wrap`, `PATH_QUERIES`, `run_git` | Nested repositories; DESIGN-exec-path.md |
 | performance | PERF.md | Nested repositories (end) |
 | what git writes then reads in one command ([44] [66] [77] [86] [88] [95]) | `Judged.covers`, `_hard_link` | The command that writes what it then reads |
 | accepted limitations [44], [71], [74], out-of-scope cases | — | Known limitations |

@@ -120,33 +120,49 @@ alias git='gitguard git'
 ### System-wide (Debian/Ubuntu)
 
 To wrap every git on the machine, cron and GUIs included, install gitguard
-*as* `/usr/bin/git` and divert the real one. `dpkg-divert` keeps the
-diversion across `apt upgrade git`:
+*as* `/usr/bin/git` and divert the real one — and do the same at git's
+**exec path**, `/usr/lib/git-core/git`: that is the `git` every git runs
+its children through (`git status` in a submodule, `git pull` in a hook,
+the `index-pack` of a clone), and the wrap is what lets a child judge the
+repository it enters (DESIGN-exec-path.md). `dpkg-divert` keeps both
+diversions across `apt upgrade git`:
 
 ```sh
 sudo install -m 755 gitguard.py /usr/bin/gitguard
 sudo dpkg-divert --package gitguard --add --rename --divert /usr/bin/git.real /usr/bin/git
 sudo ln -s gitguard /usr/bin/git
+sudo dpkg-divert --package gitguard --add --rename --divert /usr/lib/git-core/git.real /usr/lib/git-core/git
+sudo ln -s /usr/bin/gitguard /usr/lib/git-core/git
 ```
 
-gitguard runs a `git.real` found next to itself before looking at the
-`PATH`, so no environment variable is needed (cron, systemd and GUIs would
-not get one). Hooks and `rebase --exec` run by the real git use
-`/usr/lib/git-core/git`, unwrapped by design. `/usr/bin/git-receive-pack`,
-`git-upload-pack` and `git-upload-archive` are symlinks to `git`, so they
-land on gitguard too: invoked under those names (by sshd, for every push
-and fetch *to* the machine) it passes straight to the real git, since they
-serve a repository named by argument and run nothing of the caller's. To
-undo:
+gitguard runs a `git.real` found next to the name it was invoked by
+before looking at the `PATH`, so no environment variable is needed (cron,
+systemd and GUIs would not get one). The 160 dashed builtins of
+`/usr/lib/git-core` (`git-status`, `git-receive-pack`…) are symlinks to
+`git` and land on gitguard too: invoked under a dashed name it runs that
+command; under `git-receive-pack`, `git-upload-pack` and
+`git-upload-archive` (sshd, for every push and fetch *to* the machine) it
+passes straight to the real git, since they serve a repository named by
+argument and run nothing of the caller's. `gitguard trust`, `list` and
+`retrust` warn while the exec path is not wrapped: gitguard then checks
+the repositories you run git in, as before, but not the ones git enters
+on its own. To undo:
 
 ```sh
-sudo rm /usr/bin/git
+sudo rm /usr/bin/git /usr/lib/git-core/git
 sudo dpkg-divert --package gitguard --rename --remove /usr/bin/git
+sudo dpkg-divert --package gitguard --rename --remove /usr/lib/git-core/git
 ```
 
 On macOS `/usr/bin/git` is protected by SIP and renaming Homebrew's git is
 undone by `brew upgrade`: keep the `PATH` symlink (it covers everything
-started from a login shell, VS Code included) and set `git.path` in VS Code.
+started from a login shell, VS Code included), set `git.path` in VS Code,
+and for the exec path give git a directory of your own: copy or link the
+content of `$(git --exec-path)` into `~/.local/lib/git-core`, replace its
+`git` by a symlink to gitguard and relink the dashed builtins to it, then
+export `GIT_EXEC_PATH=~/.local/lib/git-core` in your shell profile (and
+`launchctl setenv GIT_EXEC_PATH …` for GUI apps). Redo it after `brew
+upgrade git`; `gitguard trust` tells you when it is stale.
 
 ### First trust
 

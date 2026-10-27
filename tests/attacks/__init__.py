@@ -591,6 +591,78 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      object ids. The method, not a review, found them: the bottom-up
      catalogue above took fourteen passes to cover a universe git's source
      enumerates under five signatures (DESIGN.md, "Tests").
+[101] Every clone but of a plain local path (`file://`, ssh, https, a
+     bundle, `--depth`, `--bare`, `--mirror`, `--separate-git-dir`) runs
+     fetch-pack → index-pack, a child with `GIT_DIR=<new>/.git` from the
+     user's cwd; the `new` marker compared the child's root alone, so every
+     such clone died "repository never trusted" — or, from a trusted cwd K,
+     reported a false diff of K. The suite had never run a clone through
+     index-pack. Fix: `new` covers a gitdir, common dir or root under the
+     new path; bare and separate-gitdir forms set the marker too (NewRepo).
+[102] The marker covered by the name `.git` and by state key
+     (`_owner_keys`): a worktree's submodule (`worktrees/<wt>/modules/<x>`),
+     a `--separate-git-dir` repository's, a submodule's own submodule
+     worked in directly were covered by nobody, every `status` there
+     refused. Fix: the marker carries the judged gitdir, common dir and
+     root; a child is covered when its gitdir and common dir are both among
+     `gitdir_roots` of those — exactly what the walk hashed.
+[103] A gitdir planted in a volatile zone of a real submodule's gitdir
+     (`.git/modules/sub/refs/p`: hashed by nobody) and named by a gitfile.
+     By the submodule's index (volatile): `check_nested_git` accepted any
+     target under `modules/`, and `git status` recursed into it — master
+     too. By a commit the sandbox writes (a gitlink `vendor/x`): the child
+     entering it inherited the judgment, `_owner_keys` being a prefix test.
+     Fix: a gitfile must point to a gitdir root (`gitdir_roots`), and
+     coverage is those roots ([102]).
+[104] The marker expired by the clock (`GITGUARD_JUDGED_TTL`, 60 s), which
+     changed the answer mid-command, not its cost: every submodule of a
+     `clone --recurse-submodules` longer than a minute, a slow `submodule
+     foreach`, `filter-branch`, `rebase --exec` were refused as never
+     trusted; a stale marker in an editor's shell kept child semantics for
+     ever. Fix: the marker carries the pid of the process that set it and
+     is valid while that pid is an ancestor (`/proc` on Linux,
+     proc_pidinfo on macOS); dead or outside the chain: no marker. No TTL.
+[105] `serving` covered every repository: a trusted `post-receive` of a
+     hub that runs `cd site && git pull` entered `site` unjudged, and its
+     planted hook ran; a linked worktree planted in a non-bare local
+     remote (`receive.denyCurrentBranch = updateInstead`) was read by
+     receive-pack's `update-index --refresh`. Fix: the served repository,
+     opened as enter_repo opens it (`_local_remote`), is an ordinary `repo`
+     marker without a tree.
+[106] `git daemon`, `git http-backend` and `git-shell` run `git
+     upload-pack <dir>` / `git receive-pack <dir>` — the first word, not
+     the dashed name: not passed through, the bare repository refused.
+     Fix: `SERVERS`, the same passthrough and marker as `TRANSPORT`.
+[107] A clone or init run by a child git (pre-commit's first-use `git init`
+     in its cache, git-lfs, a hook's clone) got no `new` marker and no
+     auto-trust: its index-pack died, its next use was "never trusted".
+     Fix: a child's clone is the user's clone — waited for, marker set,
+     auto-trusted — unless the marker already covers the result
+     (`submodule add`'s clone into `modules/<x>`, the submodules of `clone
+     --recurse-submodules`), which the parent's next command, or the clone's
+     own auto-trust, takes as a whole.
+[108] A covered child's `push` took the full path under its own key: `push
+     --recurse-submodules=on-demand`, `submodule foreach git push` refused
+     as never trusted; an alias `push -u && push --tags` refused at the
+     second push, the first having written the branch tracking. Fix: a
+     covered push or archive child is judged on its destination alone
+     (`check_remote_destination`, [62] [70]).
+[109] A `/dev/null` token in any config value (`alias.q = !git status
+     >/dev/null`, global or local) was taken for a path to watch and
+     refused as an unreadable directory — every repository at once,
+     `trust` included. Pre-existing. Fix: a device, a FIFO or a socket is
+     nothing git runs or reads as a file: ignored by `ConfigScan.add`.
+[110] `git clone <path>/.git` without a target: the directory name was
+     read as `<path>/` cut of `.git`, an empty name; the `new` marker
+     covered the whole cwd and nothing was trusted. Fix: a port of
+     git_url_basename (dir.c), parity-tested.
+[111] A child with another work tree (`!git --work-tree=<site> checkout -f
+     main` in a trusted alias) inherited the judgment by key: a relative
+     `core.hooksPath` then named `<site>/.githooks`, which nothing judged —
+     [72] for children. Fix: the same gitdir with another root is another
+     repository ([102]).
+[112] `GITGUARD_REAL_GIT` naming gitguard itself (`<exec-path>/git` after
+     the diversion) exec'd gitguard for ever. Fix: refused.
 """
 from __future__ import annotations
 

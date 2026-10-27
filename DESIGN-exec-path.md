@@ -91,13 +91,17 @@ real git finds its helpers, and its `git` children resolve to gitguard.
 
 ### 3.2 The judgment marker
 
-When gitguard has judged a repository of key `K` (section "Storage":
-`sha256(resolved root)[:16]`) and runs the real git, it puts in that
-process's environment:
+When gitguard has judged a repository and runs the real git, it puts in
+that process's environment:
 
 ```
-GITGUARD_JUDGED=<epoch seconds>:key=<K>
+GITGUARD_JUDGED=<pid>:repo=<gitdir>,<common dir>,<root>
 ```
+
+the three paths resolved and hex-encoded (a path holds anything but NUL,
+the one byte an environment value cannot), `pid` the process that set it:
+gitguard itself, which execs the real git under its own pid, or stays the
+parent of a clone it waits for.
 
 Not signed, on purpose. The marker could only be forged by whoever sets
 the environment of the user's git: the user's shell, a `direnv allow`, a
@@ -111,77 +115,98 @@ model already ("Known limitations"); every other variable gitguard reads
 and a signed marker would be the one exception, a secret to store, prune
 and permission for no threat in the model.
 
-The marker **expires**: a child accepts it only within
-`GITGUARD_JUDGED_TTL` seconds (default 60). Not against an attacker: an
-environment variable reaches every descendant, not only git's children —
-the editor of `git commit`, a shell opened from it (`:terminal`), the
-browser of `git instaweb`. Without expiry, every `git` typed in that shell
-would skip the check of `K` for the whole editing session. With expiry, a
-late child re-checks: today's cost, today's semantics.
+The marker **lives as long as the process that set it**: a child accepts
+it only while `pid` is one of its ancestors (`_ancestors`: `/proc/<pid>/stat`
+on Linux, `proc_pidinfo` on macOS; a chain that cannot be read stops
+there, fail closed). That is the lifetime of the command, however long —
+a `clone --recurse-submodules` of a large tree, a `filter-branch`, a
+`bisect run` — and not a moment more: an environment variable that
+outlived its git (a detached shell) names a pid that is no ancestor, and
+a pid reused by another process is never in a live ancestor chain. A
+marker whose process is gone is **no marker**: the user's semantics. The
+first design expired the marker by the clock instead (a TTL of 60 s,
+[104]); the 15th adversarial pass showed the clock changing the *answer*
+mid-command, not only its cost — every submodule of a clone longer than a
+minute refused as never trusted, a `rebase --exec` stopped half-way — and
+a stale marker in an editor's shell keeping child semantics for ever.
 
 A gitguard child reads the marker before anything else. It applies the
 global options (`-C`, `--git-dir`: they decide which repository), finds the
-root, computes the key, and:
+root, opens the repository and:
 
-- key equal to the marker's `K`, marker valid → **inherits**: no
-  fingerprint, no structural check, no prompt; straight to the real git,
-  marker passed on unchanged (a grandchild in the same repository inherits
-  too; the expiry bounds the chain).
+- **covered** (3.3) → **inherits**: no fingerprint, no structural check, no
+  prompt; straight to the real git, marker passed on unchanged (a
+  grandchild in the same repository inherits too).
 - otherwise → the **full check**, as if it were the user's command, then
   its own marker for its children.
 
 Inheritance skips the judgment of **the repository**, not the checks on
-**the child's own arguments**: `check_remote_destination` ([62], a `git
-push <path>` to a repository no trusted config names), `archive
---remote` ([70] [81]), `parse_new_repo` for the `new` marker (3.4). They
-are cheap, they are about this argv, and a hook or alias of the trusted
-config may legitimately run `git push`, which must be judged on where it
-pushes.
+**the child's own arguments**: a covered `push` or `archive --remote`
+child is judged on where it goes and on that alone (`check_remote_destination`,
+[62] [70] [108]: a hook or alias of the trusted config may legitimately
+run `git push`, and a submodule's push must not be judged under the
+submodule's own key); `parse_new_repo` sets the `new` marker (3.4).
 
 ### 3.3 Covered by the judged repository
 
-A child's repository counts as `K` when its **resolved gitdir and its
-common dir are both under `<K's gitdir>/modules/` or
-`<K's gitdir>/worktrees/`**. The content of those directories is in `K`'s
-manifest (the gitdir walk descends into them, anchored by `_child_root`),
-so `K`'s judgment covers them. This is what makes a real submodule's
-`git status --porcelain=2` pass without a `trust` of its own, and what
-lets `git worktree add` run its `git reset --hard` in the new worktree.
+A child's repository is covered when its **resolved gitdir and common dir
+are both gitdir roots the parent's walk descended**: the judged gitdir,
+the judged common dir, and every root nested under their `modules/` and
+`worktrees/` (`gitdir_roots`, the same recognition as the walk's
+`_child_root`: a `HEAD` or a `commondir` under those two directories, and
+nowhere else). Covered means hashed: the content of those roots is in the
+judged manifest, so the judgment extends to them. This is what makes a
+real submodule's `git status --porcelain=2` pass without a `trust` of its
+own, lets `git worktree add` run its `git reset --hard` in the new
+worktree, and covers a worktree's own submodules
+(`worktrees/<wt>/modules/<x>`), a `--separate-git-dir` repository's, a
+submodule's submodule worked in directly ([102]: the first rule, the
+name `.git` and a prefix under it, covered none of those and every
+`status` there was refused).
 
-Anchoring, as everywhere: the rule is on the resolved paths, not on the
-gitfile's text. A planted `vendor/x/.git` whose gitfile says `gitdir:
-../../.git/modules/x` with a planted gitdir there is caught one step
-earlier: `.git/modules/x` is inside `K`'s gitdir, hence in the fingerprint,
-hence seen by the parent's check. A gitfile pointing outside `modules/`
-([7] [24]) gets its own key and is never trusted.
+The rule is on what was hashed, not on where a path sits: a gitdir
+planted in a **volatile zone** of a real submodule's gitdir
+(`.git/modules/sub/refs/p`, where nobody hashes), named by a gitlink in a
+commit the sandbox writes, is under `modules/` and covered by nothing —
+the child judges it on its own and refuses it ([103]; by the submodule's
+index the same planting is caught one step earlier, `check_nested_git`
+requiring a gitdir root, which it did not before). A gitfile pointing
+outside the roots ([7] [24]) gets its own key and is never trusted.
 
-Linked worktrees keep their own trust key for the **user's** commands
-([72]: another tree, other tree-side references); a **child** running in a
-worktree of `K` inherits `K`'s judgment. Known gap, accepted because it is
-today's state (that child is unwrapped today): a relative
-`core.hooksPath` of the common config names `<wt>/.githooks`, which is not
-in `K`'s manifest; a child spawned in the worktree by a command of the main
-repository would run a hook the sandbox rewrote there. Such spawns are
-rare (`worktree add`, `worktree remove`); the user's next command in the
-worktree judges it under its own key.
+The **same gitdir with another work tree** is another repository: the
+tree-side references ([72], a relative `core.hooksPath`) resolve
+elsewhere. A child whose gitdir is the judged one must have the judged
+root; a trusted alias `!git --work-tree=<site> checkout -f main` is
+judged there and refused until `<site>` is trusted ([111]). Linked
+worktrees keep their own trust key for the **user's** commands, as before.
 
 ### 3.4 Two more marker values
 
-- `GITGUARD_JUDGED=<epoch>:new=<path>` — set by `run_git` for
+- `GITGUARD_JUDGED=<pid>:new=<path>[,<gitdir>]` — set by `run_git` for
   `clone` and `init` (the parent judges nothing: the repository does not
-  exist yet; auto-trust comes after git returns). A child whose root is
-  `<path>` or under it passes. Without it, `clone --recurse-submodules`
-  dies in its first submodule clone ("never trusted"), and the auto-trust
-  never happens.
-- `GITGUARD_JUDGED=<epoch>:serving` — set by the `TRANSPORT`
-  passthrough. `git-receive-pack` and `git-upload-pack` run in a bare
-  repository gitguard does not handle; their children (`index-pack`,
-  `unpack-objects`, `pack-objects`, `update-server-info`, `maintenance`)
-  run there too. Without this value, every ssh push *to* the machine fails
-  at `index-pack` — the incident that created `TRANSPORT` on the VM, one
-  level down. Not a new exposure: those children are unwrapped today, and
-  the served repository is named by sshd's or the pushing git's argument,
-  never the caller's cwd.
+  exist yet; auto-trust comes after git returns). Covered: anything whose
+  gitdir, common dir **or** root is `<path>` or under it, or at `<gitdir>`
+  (`--separate-git-dir`). The clone's own `index-pack` runs with
+  `GIT_DIR=<new>/.git` from the user's cwd ([101]: compared by root alone,
+  every clone but of a plain local path died "never trusted" — and from a
+  trusted cwd reported a false diff of it); the submodule clones of
+  `--recurse-submodules` run under `<path>`. Every form of clone and init
+  sets it, bare and template included (`NewRepo`); only the auto-trust
+  is withheld for those.
+- A **served repository**: `git-receive-pack`, `git-upload-pack`,
+  `git-upload-archive` (`TRANSPORT`, the dashed names sshd runs) and the
+  same as a first word (`SERVERS`: what `git daemon`, `http-backend` and
+  `git-shell` run, [106]) serve the repository named by their argument, a
+  bare one gitguard does not handle, and run nothing of the cwd's. The
+  passthrough sets an ordinary `repo` marker for that repository, opened
+  as enter_repo opens it (`_local_remote`), with an empty root (its tree,
+  for a non-bare remote, is the push's business). Its children
+  (`index-pack`, `pack-objects`, `update-server-info`, `maintenance`, the
+  hooks' gits in that repository) inherit; a hook that enters **another**
+  repository (`cd site && git pull`) does not: that git judges `site`
+  ([105]; the first value, `serving`, covered everything). Without a
+  marker every ssh push *to* the machine fails at `index-pack` — the
+  incident that created `TRANSPORT` on the VM, one level down.
 
 ### 3.5 What a child never does
 
@@ -189,8 +214,8 @@ A child shares the parent's session and terminal. The exec-mode behaviour
 of a refusal (a `[y/N]` on `/dev/tty`, or without a terminal a `pending`
 record and a wait of `GITGUARD_WAIT` seconds) is wrong there: the parent
 git may be reading stdin or holding the pager, and a `git status` meeting
-a planted repository would hang a minute. With a marker present, whatever
-its value:
+a planted repository would hang a minute. With a live marker present,
+whatever its value:
 
 - a refusal is **immediate**: no question, no wait; the `pending` record
   is written (the user sees it with `gitguard pending`), the desktop
@@ -198,9 +223,16 @@ its value:
 - nothing is written to **stdout** (git parses the child's stdout:
   `status --porcelain=2`, `rev-parse`); exec mode already keeps its
   messages on stderr, the rule becomes a test;
-- **no auto-trust**: a `clone` child of `submodule add` must not register
-  `.git/modules/x` as an independent repository in the state; the parent's
-  next command sees the new `modules/x` in its own fingerprint and asks.
+- **no auto-accept** of a branch-tracking change: a child writes no trust
+  state for a repository it judged.
+
+A child's **clone or init is the user's**: waited for, `new` marker set,
+auto-trusted ([107]: pre-commit's first-use `git init` in its cache, a
+hook's clone) — unless the marker already covers the result (`submodule
+add`'s clone into `modules/<x>`, the submodules of `clone
+--recurse-submodules`), which the parent's next command, or the clone's
+own auto-trust, takes as a whole; the new repository is opened at its
+path, not through the `GIT_DIR` git exports to that child.
 
 The parent git sees the refused child fail: `git checkout` prints "Could
 not run 'git status --porcelain=2' in submodule vendor/x" after gitguard's
@@ -234,7 +266,7 @@ refusal to `trust` is open (section 9).
 
 ### 3.8 Order of the changes
 
-1. The marker (3.2), the coverage rule (3.3), `new` and `serving` (3.4),
+1. The marker (3.2), the coverage rule (3.3), `new` and the served repository (3.4),
    the child behaviour (3.5), the passthroughs (3.6), the `git-<cmd>` name
    (3.1): gitguard works both wrapped and unwrapped.
 2. The verification (3.7) and the Debian install (section 4).
@@ -345,13 +377,15 @@ documented the loss).
   included (the Python floor dominates). `pull` ≈ +3 children, `status`
   with N submodules +N, `filter-branch` and `bisect run` hundreds. Accepted
   for the transition; a Rust port removes it (floor ~2 ms).
-- **Fail-closed failure modes** to keep in mind: an unwrapped `serving`
-  marker breaks every ssh push to the host; a stale macOS shim after `brew
-  upgrade` breaks every child ("no git"); a mixed install (old script in
+- **Fail-closed failure modes** to keep in mind: a transport passthrough
+  without its marker breaks every ssh push to the host; a stale macOS
+  shim after `brew upgrade` breaks every child ("no git"); a mixed install (old script in
   `/usr/bin`, new at the exec path) refuses everything as changed. The
   trust-time verification (3.7) reports the first two.
-- **The marker's residual window**: within its TTL, a shell opened from a
-  git-spawned editor skips the check of that one repository. A minute, one
+- **The marker's residual window**: a shell opened from a git-spawned
+  editor inherits the marker for as long as that git lives: a `git` typed
+  there in the judged repository skips its check, one typed in another
+  repository refuses without asking (recorded for `gitguard pending`). One
   repository, a process the user started by hand: documented, not closed.
 - **IDE polling**: an IDE running `git status` every few seconds in a
   repository with a planted nested repository produces one refused child
@@ -397,7 +431,7 @@ documented the loss).
 
 | step | content | size |
 |---|---|---|
-| 1 | marker (3.2) with TTL; coverage rule (3.3); `new`/`serving` (3.4); child behaviour (3.5); passthroughs (3.6); `git-<cmd>` (3.1) | 1 day |
+| 1 | marker (3.2); coverage rule (3.3); `new`/served (3.4); child behaviour (3.5); passthroughs (3.6); `git-<cmd>` (3.1) — redone after the 15th pass ([101]–[112]): pid lifetime, coverage by `gitdir_roots` | 2 days |
 | 2 | conftest two exec paths; claims tests of section 7 | 1 day |
 | 3 | positive controls inverted, legit scenarios, pty test for children, PERF.md | 1 day |
 | 4 | verification at trust (3.7); Debian install script and `.deb` skeleton; VM update and replay | ½–1 day |
@@ -408,24 +442,18 @@ today; the removal in step 5 is the only step that requires the install.
 
 ## 9. Open questions
 
-1. Unwrapped exec path at `trust`: a warning (today's protection level,
-   silently weaker once the switch is gone) or a refusal to `trust` until
-   the install is complete? Leaning: refusal with the install command in
-   the message, overridable by `GITGUARD_ALLOW_UNWRAPPED=1` for the macOS
-   shim case.
-2. `GITGUARD_JUDGED_TTL` default: 60 s covers `submodule update` on a
-   normal tree; a `filter-branch` or `bisect run` outlives it and pays a
-   re-check per child after the first minute (semantics unchanged). Keep
-   60, document, measure.
+1. *Decided 2026-10-27*: unwrapped exec path at `trust` is a warning
+   (`check_wrap`), no refusal, no switch standing in: the wrap is the
+   install, a fallback that is sometimes on would make the protection
+   depend on an install detail nobody sees, and refusing `trust` would
+   break macOS while the wrap there is fragile.
+2. *Decided 2026-10-27*: no TTL. The marker lives with the process that
+   set it (3.2, [104]).
 3. Worktree children (3.3): inherit the main repository's judgment
    (proposed) or carry their own key and make `worktree add` auto-trust
    the new worktree as `clone` does? The second is cleaner on paper and
    adds a third auto-trust path to maintain; the first is today's exposure.
-4. Keep the `-c diff.ignoreSubmodules=dirty` switch as defence in depth on
-   unwrapped machines, or remove it (step 5)? Keeping it keeps
-   `SWITCH_EXEMPT` and its claims tests alive; removing it is the
-   simplification this design is for. Proposed: remove, the verification
-   of 3.7 being the replacement.
+4. *Decided*: the `-c diff.ignoreSubmodules=dirty` switch is removed (see 1).
 5. The Rust port: not a condition of this design, but the per-child floor
    is its first concrete justification. Not before the design has settled
    on this branch.

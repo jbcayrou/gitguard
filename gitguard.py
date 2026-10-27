@@ -66,9 +66,16 @@ def real_git() -> str:
     `/usr/bin/git.real`, not another one elsewhere in the PATH. The former
     default `/usr/bin/git` silently ran another git than the user's (Apple's
     instead of Homebrew's on a Mac), with another system config."""
-    if os.environ.get("GITGUARD_REAL_GIT"):
-        return os.environ["GITGUARD_REAL_GIT"]
     me = Path(__file__).resolve()
+    if os.environ.get("GITGUARD_REAL_GIT"):
+        v = os.environ["GITGUARD_REAL_GIT"]
+        try:
+            looped = Path(v).resolve() == me
+        except OSError:
+            looped = False
+        if looped:          # `<exec-path>/git` after the diversion: gitguard would exec itself for ever
+            raise Refuse(f"GITGUARD_REAL_GIT names gitguard itself: {v}")
+        return v
 
     def usable(cand: Path) -> bool:
         try:
@@ -1469,7 +1476,8 @@ def check_indexes(repo: Repo) -> None:
     checked there."""
     cache = Path(str(repo.key) + ".idx")
     trees = dict(submodule_trees(repo))
-    for r in dict.fromkeys([*gitdir_roots(repo.gitdir), *gitdir_roots(repo.common)]):
+    roots = set(dict.fromkeys([*gitdir_roots(repo.gitdir), *gitdir_roots(repo.common)]))
+    for r in sorted(roots):
         if r == repo.gitdir:
             continue
         # The object format of the repository this index belongs to: a
@@ -1484,14 +1492,17 @@ def check_indexes(repo: Repo) -> None:
             continue
         nested = set(gitmodules_gits(tree)) | index_nested(tree, *links)
         for n in sorted(nested):
-            check_nested_git(n, r)
+            check_nested_git(n, r, roots)
 
 
-def check_nested_git(n: Path, common: Path) -> None:
+def check_nested_git(n: Path, common: Path, roots: set[Path]) -> None:
     """A nested `.git` — declared in .gitmodules or referenced by an index
     gitlink, wherever it is (node_modules/, build/…) — must be a file pointing
-    under `common`/modules (submodule) or `common`/worktrees (linked worktree
-    stored inside the tree, e.g. `.worktrees/x`)."""
+    to a gitdir root under `common` (`roots`: gitdir_roots of the whole
+    repository): a submodule's `modules/<x>`, a linked worktree's
+    `worktrees/<x>` stored inside the tree (`.worktrees/x`). "Anywhere under
+    modules/" accepted `modules/x/refs/p`, a volatile zone of a real
+    submodule's gitdir, where a planted gitdir is hashed by nobody. [103]"""
     if n.is_symlink():
         raise Refuse(f"nested .git is a symlink: {n}")
     if n.is_dir():
@@ -1501,15 +1512,16 @@ def check_nested_git(n: Path, common: Path) -> None:
         # references it in the index.
         raise Refuse(nested_repo_hint(n))
     target = read_gitfile(n)
-    if not any(common / d in target.parents for d in ("modules", "worktrees")):
-        raise Refuse(f"{n} points outside {common}/modules and {common}/worktrees: {target}")
+    if target not in roots or common not in target.parents:
+        raise Refuse(f"{n} points to no gitdir under {common}/modules or {common}/worktrees: {target}")
 
 
 def check_structure(repo: Repo, refs: list[tuple[str, Path]]) -> None:
     check_split_index(repo)
     check_indexes(repo)
+    roots = set(gitdir_roots(repo.common))
     for n in repo.gitfiles:
-        check_nested_git(n, repo.common)
+        check_nested_git(n, repo.common, roots)
     check_volatile_readers(repo)
     # Control characters in a name: fake line / spoofed display. Only names
     # that enter the fingerprint (hence get displayed) matter: the non-volatile
@@ -1813,6 +1825,17 @@ class ConfigScan:
         git may execute or read, or refuse it."""
         repo, out = self.repo, self.out
         if not (p.exists() or p.is_symlink()):
+            return
+        try:
+            mode = p.stat().st_mode
+        except OSError:
+            mode = 0
+        if p.exists() and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+            # A device, a FIFO, a socket: `/dev/null` in an alias
+            # (`!git status >/dev/null`) was taken for a path to watch and
+            # refused as an unreadable directory, every repository at once
+            # when the alias was global, `trust` included. Nothing git runs
+            # or reads as a file. [109]
             return
         # git executes files. A directory is only loaded by the keys that read
         # its content (DIR_KEYS); elsewhere it is a program argument
@@ -3424,13 +3447,81 @@ def _template_dir_configured(cli_config: list[str]) -> bool:
     return any(s == "init" and k == "templatedir" for _, s, k, _ in iter_global_config())
 
 
-def parse_new_repo(args: list[str]) -> tuple[str, Path] | None:
-    """(clone|init, target directory) if the command creates a repository, else None."""
+class NewRepo:
+    """What `clone` or `init` creates: `dir`, the repository's directory (the
+    gitdir itself when bare); `gitdir` when `--separate-git-dir` puts it
+    elsewhere; `auto_trust`: not for a bare repository (gitguard does not
+    handle those) nor for one built from a template, whose hooks nobody
+    reviewed ([42] [98]). Every form sets the `new` marker: the children
+    (`index-pack`, the submodule clones) run before the repository exists,
+    in it ([101])."""
+
+    def __init__(self, sub: str, dir: Path, gitdir: Path | None = None,
+                 auto_trust: bool = True) -> None:
+        self.sub, self.dir, self.gitdir, self.auto_trust = sub, dir, gitdir, auto_trust
+
+    @property
+    def paths(self) -> list[str]:
+        return [str(self.dir.resolve())] + ([str(self.gitdir.resolve())] if self.gitdir else [])
+
+
+def _guess_dir_name(repo: str, bundle: bool, bare: bool) -> str | None:
+    """git_url_basename (dir.c): the directory `git clone <repo>` creates.
+    The scheme and a `user@` before the first separator skipped; trailing
+    separators and blanks dropped, then a trailing `/.git` and the
+    separators before it (`x/.git` → `x`: the former reading gave an empty
+    name, a `new` marker covering the whole cwd, and no auto-trust [110]);
+    the `:<port>` of a bare `host:port`; the last component after a `/` or a
+    `:` (`host:repo.git` → `repo`); a `.bundle` or `.git` suffix; `.git`
+    appended for a bare clone; runs of control characters and blanks become
+    one space, none at the ends. None: git dies ("No directory name could
+    be guessed")."""
+    v = repo.partition("://")[2] if "://" in repo else repo
+    head = v.split("/", 1)[0]
+    if "@" in head:
+        v = v[head.rindex("@") + 1:]
+    v = v.rstrip("/ \t\n\r")                              # is_dir_sep, git's isspace
+    if len(v) > 5 and v[-5] == "/" and v.endswith(".git"):
+        v = v[:-5].rstrip("/")
+    if "/" not in v and ":" in v:
+        i = len(v)
+        while i > 0 and v[i - 1] in "0123456789":
+            i -= 1
+        if i > 0 and v[i - 1] == ":":
+            v = v[:i - 1]
+    i = len(v)
+    while i > 0 and v[i - 1] not in "/:":
+        i -= 1
+    name = v[i:]
+    suffix = ".bundle" if bundle else ".git"
+    if name.endswith(suffix):
+        name = name[:-len(suffix)]
+    if not name or name == "/":
+        return None
+    if bare:
+        name += ".git"
+    out, prev_space = [], True
+    for ch in name:
+        if ord(ch) < 0x20:
+            ch = " "
+        if ch == " ":
+            if prev_space:
+                continue
+            prev_space = True
+        else:
+            prev_space = False
+        out.append(ch)
+    return "".join(out).rstrip(" ")
+
+
+def parse_new_repo(args: list[str]) -> NewRepo | None:
+    """The repository the command creates (clone, init), else None."""
     o = split_global_options(args, Path.cwd())
     cwd = o.cwd.resolve()
     if not o.rest or o.rest[0] not in ("clone", "init"):
         return None
     sub, rest, positional, bare, template = o.rest[0], o.rest[1:], [], False, False
+    gitdir: Path | None = None
     longs, shorts = NEW_REPO_OPTIONS[sub]
     j = 0
     while j < len(rest):
@@ -3448,7 +3539,8 @@ def parse_new_repo(args: list[str]) -> tuple[str, Path] | None:
             elif opt in ("--bare", "--mirror"):
                 bare = not neg
             elif opt == "--separate-git-dir" and not neg:
-                return None
+                val = a.partition("=")[2] if eq else (rest[j + 1] if j + 1 < len(rest) else "")
+                gitdir = cwd / val if val else None
             j += 2 if opt is not None and longs[opt] and not neg and not eq else 1
         elif a.startswith("-") and len(a) > 1:
             # A cluster (`-qb main`): the first letter that takes a value
@@ -3457,24 +3549,23 @@ def parse_new_repo(args: list[str]) -> tuple[str, Path] | None:
             j += 2 if k == len(a) - 1 else 1
         else:
             positional.append(a); j += 1
+    auto_trust = not bare
     if template or _template_dir_configured(o.config + o.config_env):
         warn("templateDir: no auto-trust, run 'gitguard trust' after inspection")
-        return None
-    if bare:
-        return None
+        auto_trust = False
     if sub == "clone":
         if not positional:
             return None
         if len(positional) >= 2:
             d = positional[1]
         else:
-            url = positional[0].rstrip("/")
-            if url.endswith(".git"):
-                url = url[:-4]
-            d = url.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+            src = positional[0]
+            d = _guess_dir_name(src, bundle=(cwd / src).is_file(), bare=bare)
+            if d is None:
+                return None
     else:
         d = positional[0] if positional else "."
-    return sub, (cwd / d)
+    return NewRepo(sub, cwd / d, gitdir, auto_trust)
 
 
 # `git push` options taking a separate value (git 2.47 and 2.50, `git push
@@ -3689,29 +3780,37 @@ def _alias_parts(value: str) -> tuple[str | None, list[tuple[str, str | None]]]:
     return (words[i] or None) if i < len(words) else None, pairs
 
 
-def run_git(args: list[str], orig: Path, newrepo: tuple[str, Path] | None, git: str,
-            child: bool = False) -> int:
-    """Run the real git. A clone/init of the user's is waited for and the new
-    repository trusted (Auto-trust); one run by a child git (`submodule add`
-    cloning into `modules/<x>`) is not: the parent's next command sees the
-    new gitdir in its own fingerprint and asks."""
+def run_git(args: list[str], orig: Path, newrepo: NewRepo | None, git: str,
+            judged: Judged | None = None) -> int:
+    """Run the real git. A clone/init is waited for and the new repository
+    trusted (Auto-trust), by a child git too (pre-commit's cache, a hook's
+    clone [107]) — unless the marker already covers it: `submodule add`'s
+    clone into `modules/<x>`, the submodules of `clone --recurse-submodules`
+    are part of the judged repository, which the parent's next command, or
+    the clone's own auto-trust, takes as a whole."""
     os.chdir(orig)
-    if newrepo is None or child:
+    if newrepo is None:
         os.execv(git, [git, *args])
     import subprocess
-    sub, d = newrepo
+    d = newrepo.dir
     preexisting = (d / ".git").exists() or (d / ".git").is_symlink()
-    set_judged("new", str(d.resolve()))   # its submodule clones are children under it
+    set_judged("new", *newrepo.paths)     # its children, the submodule clones included
     rc = subprocess.call([git, *args])
-    if rc == 0:
+    if rc == 0 and newrepo.auto_trust:
         d = d.resolve()
         if preexisting:
-            warn(f"{d} already contained a .git before '{sub}': no auto-trust (gitguard trust after inspection)")
-        elif (d / ".git").is_dir():
+            warn(f"{d} already contained a .git before '{newrepo.sub}': no auto-trust (gitguard trust after inspection)")
+        elif (d / ".git").exists():
+            # The new repository, whatever the environment designates: a
+            # child's GIT_DIR is its parent's (git exports it to `submodule
+            # add`'s clone), and open_repo would have judged the superproject.
+            for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"):
+                os.environ.pop(k, None)
             try:
                 insp = inspect(open_repo(d))
-                save_trust(insp.repo, insp.refs, insp.new)
-                info(f"new repository trusted: {d}")
+                if judged is None or not judged.covers(insp.repo):
+                    save_trust(insp.repo, insp.refs, insp.new)
+                    info(f"new repository trusted: {d}")
             except Refuse as e:
                 warn(f"cannot trust {d} automatically: {e}")
     return rc
@@ -3916,6 +4015,7 @@ def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
 #   the list.
 TRANSPORT = {"git-receive-pack": "receive-pack", "git-upload-pack": "upload-pack",
              "git-upload-archive": "upload-archive"}
+SERVERS = tuple([v] for v in TRANSPORT.values())
 VERSION_ARGS = (["--version"], ["version"])
 PATH_QUERIES = (["--exec-path"], ["--html-path"], ["--man-path"], ["--info-path"])
 
@@ -3924,16 +4024,36 @@ def passthrough(name: str, args: list[str]) -> list[str] | None:
     """The real git's arguments when the invocation (`name` = argv[0]'s
     basename, `args` = the git arguments) is on the list above; else None."""
     if name in TRANSPORT:
-        # Its children (`index-pack`, `pack-objects`, `update-server-info`,
-        # `maintenance`) run in the served repository, a bare one gitguard
-        # does not handle: they inherit the passthrough. Without this, every
-        # ssh push to the host died in `index-pack` once gitguard sat at the
-        # exec path — the incident that created TRANSPORT, one level down.
-        set_judged("serving")
-        return [TRANSPORT[name], *args]
+        args = [TRANSPORT[name], *args]
     if args[:1] in VERSION_ARGS or args[:1] in PATH_QUERIES:
         return args
+    if args[:1] in SERVERS:
+        # Also as the first word: `git daemon`, `git http-backend` and
+        # `git-shell` run `git upload-pack <dir>` ([106]). Its children
+        # (`index-pack`, `pack-objects`, `update-server-info`,
+        # `maintenance`, the hooks) run in the served repository, a bare one
+        # gitguard does not handle: they inherit a marker for it — for it
+        # alone: a marker covering anything let a `post-receive` of the hub
+        # that runs `cd site && git pull` enter `site` unjudged. [105]
+        # Without a marker every ssh push to the host died in `index-pack`
+        # once gitguard sat at the exec path — the incident that created
+        # TRANSPORT, one level down.
+        served = _served_repository(args[1:])
+        if served is not None:
+            set_judged("repo", str(served[0]), str(served[1]), "")
+        return args
     return None
+
+
+def _served_repository(args: list[str]) -> tuple[Path, Path, Path, list[Path]] | None:
+    """The repository `receive-pack`, `upload-pack` or `upload-archive`
+    serve: their one positional argument (every option is a flag or
+    `--opt=value`; `--timeout <n>` of upload-pack takes a separate number),
+    opened as enter_repo opens it (_local_remote). None: no argument or no
+    repository there — git dies on it, and a child would judge for itself."""
+    pos = [a for i, a in enumerate(args)
+           if "--" in args[:i] or (not a.startswith("-") and not (i and args[i - 1] == "--timeout"))]
+    return _local_remote(pos[-1], Path.cwd()) if pos else None
 
 
 # ------------------------------------------------------------- child gits
@@ -3951,91 +4071,119 @@ def passthrough(name: str, args: list[str]) -> list[str] | None:
 # (`GITGUARD_REAL_GIT`, `GIT_DIR`): whoever sets the user's environment is
 # outside the model (DESIGN.md, Known limitations).
 JUDGED_ENV = "GITGUARD_JUDGED"
-JUDGED_TTL_DEFAULT = 60.0
 
 
 class Judged:
-    """The marker, parsed: `<epoch>:key=<K>` (a repository judged, by its
-    state key), `<epoch>:new=<path>` (a clone/init of the user's in
-    progress: the new repository and its submodule clones are under
-    `path`), `<epoch>:serving` (a receive-pack/upload-pack serving a
-    repository named by argument). `fresh`: within GITGUARD_JUDGED_TTL
-    seconds of the judgment — an environment variable reaches every
-    descendant, the shell opened from `git commit`'s editor included; a
-    late child judges again, today's cost and today's semantics."""
+    """The marker, parsed: `<pid>:repo=<gitdir>,<common>,<root>` (a
+    repository judged: its resolved gitdir, common dir and work tree root —
+    the root empty for a served repository, whose tree is not in question)
+    or `<pid>:new=<path>[,<gitdir>]` (a clone/init in progress: the
+    repository does not exist yet; it and its submodule clones are under
+    `path`, its gitdir at `gitdir` for `--separate-git-dir`). Paths are
+    hex-encoded: they hold anything but NUL. `pid`: the process that set
+    the marker — gitguard, which execs the real git under its own pid, or
+    stays its parent for a clone. The marker is valid while that process is
+    an ancestor of this one: the lifetime of the command, however long (a
+    `clone --recurse-submodules` of a large tree, `filter-branch`), and not
+    a moment more — an environment variable outliving its git (a detached
+    shell) names a pid that is no ancestor, and a pid reused by another
+    process is never in a live ancestor chain. A clock changed the answer
+    mid-command, not only its cost: with a 60 s TTL, every submodule of a
+    clone longer than a minute was refused. [104]"""
 
-    def __init__(self, kind: str, value: str, at: float) -> None:
-        self.kind, self.value, self.at = kind, value, at
+    def __init__(self, pid: int, kind: str, paths: list[str]) -> None:
+        self.pid, self.kind, self.paths = pid, kind, paths
 
-    @property
-    def fresh(self) -> bool:
-        # The epoch is floored at write time; a second of skew is tolerated
-        # (a rounded value sat half a second in the future and every child
-        # judged again, silently: the suite caught it, the user would not).
-        return -1 <= time.time() - self.at <= judged_ttl()
+    @cached_property
+    def alive(self) -> bool:
+        return self.pid in _ancestors()
 
     def covers(self, repo: Repo) -> bool:
-        """Is `repo` what this marker judged? The same key; or a gitdir under
-        `<judged>/.git/modules/` or `worktrees/` — its content is in the
-        judged manifest (the walk descends there), resolved gitdir and
-        common dir both; or anything under a clone/init in progress; or
-        anything, when serving."""
-        if not self.fresh:
-            return False
-        if self.kind == "serving":
-            return True
+        """Is `repo` what this marker judged? What the parent's walk hashed
+        (DESIGN.md, "What the fingerprint watches in the gitdir"): the judged
+        gitdir and common dir and every gitdir root nested under their
+        `modules/` and `worktrees/` (gitdir_roots, the walk's own
+        recognition, _child_root). The child's resolved gitdir and common
+        dir must both be among them — a gitdir planted in a volatile zone of
+        a submodule (`modules/x/refs/p`), hashed by nobody, is judged on its
+        own and refused ([103]); the former rule, the name `.git` and a
+        prefix, covered it, and covered none of a worktree's or a separate
+        gitdir's submodules ([102]). The same gitdir with another work tree
+        is another repository for the tree-side references ([72]): judged.
+        A clone in progress covers anything whose gitdir, common dir or root
+        is under the new path ([101]: the clone's index-pack runs with
+        `GIT_DIR=<new>/.git` from the user's cwd; compared by root alone,
+        every clone but of a plain local path died "never trusted")."""
         if self.kind == "new":
-            new = Path(self.value)
-            return repo.root == new or new in repo.root.parents
-        return (repo.key.name == self.value
-                or self.value in _owner_keys(repo.gitdir) & _owner_keys(repo.common))
+            return any(n == p or n in p.parents for n in map(Path, self.paths)
+                       for p in (repo.gitdir, repo.common, repo.root))
+        gitdir, common = Path(self.paths[0]), Path(self.paths[1])
+        root = Path(self.paths[2]) if self.paths[2] else None
+        roots = set(gitdir_roots(gitdir))
+        if common != gitdir:
+            roots |= set(gitdir_roots(common))
+        if repo.gitdir not in roots or repo.common not in roots:
+            return False
+        return repo.gitdir != gitdir or root is None or repo.root == root
 
 
-def _owner_keys(p: Path) -> set[str]:
-    """State keys of the repositories whose gitdir is `p` or contains it as a
-    `modules/` or `worktrees/` entry, in the standard layout `<root>/.git`.
-    Another layout (`--separate-git-dir`) yields nothing: the child judges
-    for itself, fail closed."""
-    out = set()
-    for a in (p, *p.parents):
-        if a.name == ".git":
-            rel = p.relative_to(a).parts
-            if not rel or rel[0] in ("modules", "worktrees"):
-                out.add(key_for(a.parent).name)
+def _ppid_linux(pid: int) -> int:
+    st = Path(f"/proc/{pid}/stat").read_text()
+    return int(st[st.rindex(")") + 2:].split()[1])            # state, ppid, …
+
+
+def _ppid_mac(pid: int) -> int:
+    import ctypes
+    buf = ctypes.create_string_buffer(136)                    # sizeof(struct proc_bsdinfo)
+    if ctypes.CDLL(None).proc_pidinfo(pid, 3, ctypes.c_uint64(0), buf, 136) != 136:   # PROC_PIDTBSDINFO
+        raise OSError(f"proc_pidinfo({pid}) failed")
+    return int.from_bytes(buf.raw[16:20], sys.byteorder)      # pbi_ppid
+
+
+def _ancestors() -> set[int]:
+    """The pids of this process and its ancestors. Linux: the ppid of
+    `/proc/<pid>/stat` (the second field after the command's closing
+    parenthesis); macOS: proc_pidinfo(PROC_PIDTBSDINFO), `pbi_ppid` at
+    offset 16 of struct proc_bsdinfo (libproc.h). Elsewhere, or where a
+    step fails: the chain stops there — a marker from higher up is then no
+    marker, fail closed."""
+    ppid_of = (_ppid_linux if sys.platform.startswith("linux")
+               else _ppid_mac if sys.platform == "darwin" else None)
+    out, pid = set(), os.getpid()
+    for _ in range(128):
+        out.add(pid)
+        if pid <= 1:
+            break
+        try:
+            pid = ppid_of(pid) if ppid_of else (os.getppid() if pid == os.getpid() else 0)
+        except (OSError, ValueError, IndexError):
+            break
     return out
 
 
-def judged_ttl() -> float:
-    v = os.environ.get("GITGUARD_JUDGED_TTL")
-    if v is None or v == "":
-        return JUDGED_TTL_DEFAULT
-    try:
-        f = float(v)
-        if f < 0:
-            raise ValueError
-    except ValueError:
-        raise Refuse(f"GITGUARD_JUDGED_TTL must be a number of seconds: {v!r}") from None
-    return f
-
-
 def read_judged() -> Judged | None:
-    """The marker of the environment, None without one. A malformed one is
-    refused: a child never guesses."""
+    """The marker of the environment; None without one, or when its process
+    is gone (the marker outlived its git: no marker, the user's semantics).
+    A malformed one is refused: a child never guesses."""
     v = os.environ.get(JUDGED_ENV)
     if v is None:
         return None
     try:
-        at, _, rest = v.partition(":")
-        kind, _, value = rest.partition("=")
-        if kind not in ("key", "new", "serving") or (kind == "serving") != (value == ""):
+        pid, _, rest = v.partition(":")
+        kind, eq, value = rest.partition("=")
+        paths = [os.fsdecode(bytes.fromhex(h)) for h in value.split(",")]
+        ok = (kind == "repo" and len(paths) == 3 and paths[0] and paths[1]
+              or kind == "new" and 1 <= len(paths) <= 2 and all(paths))
+        if not eq or not ok:
             raise ValueError
-        return Judged(kind, value, float(at))
+        j = Judged(int(pid), kind, paths)
     except ValueError:
         raise Refuse(f"malformed {JUDGED_ENV}: {v!r}") from None
+    return j if j.alive else None
 
 
-def set_judged(kind: str, value: str = "") -> None:
-    os.environ[JUDGED_ENV] = f"{int(time.time())}:{kind}" + (f"={value}" if value else "")
+def set_judged(kind: str, *paths: str) -> None:
+    os.environ[JUDGED_ENV] = f"{os.getpid()}:{kind}=" + ",".join(os.fsencode(p).hex() for p in paths)
 
 
 def check_wrap() -> None:
@@ -4062,12 +4210,13 @@ def check_wrap() -> None:
     except OSError:
         wrapped = False
     if not wrapped:
+        how = (f"Debian: `dpkg-divert --package gitguard --add --rename --divert {san(p)}/git.real "
+               f"{san(p)}/git && ln -s {me} {san(p)}/git`; elsewhere a GIT_EXEC_PATH directory"
+               if p else "see DESIGN-exec-path.md, Installation")
         warn(f"git's exec path ({san(p) or 'unknown'}) does not lead to gitguard: the children "
              f"of every git command run unwrapped, so a repository git enters through one (a "
              f"submodule, a repository planted in the work tree) is not judged at entry. "
-             f"Debian: `dpkg-divert --package gitguard --add --rename --divert "
-             f"{san(p)}/git.real {san(p)}/git && ln -s {me} {san(p)}/git`; elsewhere a "
-             f"GIT_EXEC_PATH directory (DESIGN-exec-path.md).")
+             f"{how} (DESIGN-exec-path.md).")
 
 
 def main(argv: list[str]) -> int:
@@ -4138,7 +4287,7 @@ def main(argv: list[str]) -> int:
         if root is None:
             if mode == "exec":
                 check_archive_outside_repo(split_global_options(argv, orig).rest)
-                return run_git(argv, orig, newrepo, git, child=judged is not None)
+                return run_git(argv, orig, newrepo, git, judged)
             if mode != "check":
                 raise Refuse(f"no git repository here: {Path.cwd()}")      # [30]
             return 0
@@ -4146,16 +4295,22 @@ def main(argv: list[str]) -> int:
         label, key = repo.label, repo.key
         if judged is not None:
             rest = split_global_options(argv, orig).rest
+            covered = judged.covers(repo)
             if os.environ.get("GITGUARD_DEBUG"):
-                err(f"child git: marker {judged.kind}={judged.value} fresh={judged.fresh}, repository "
-                    f"key={repo.key.name} owners={sorted(_owner_keys(repo.gitdir) & _owner_keys(repo.common))} "
-                    f"gitdir={repo.gitdir} → {'inherits' if judged.covers(repo) else 'judges'}")
-            # The judged repository: inherited, the command's own writes
-            # are for the next command. Not the checks on this child's
-            # arguments: a push or an archive --remote is judged on where
-            # it goes ([62] [70]), by the full path below.
-            if judged.covers(repo) and rest[:1] not in (["push"], ["archive"]):
-                return run_git(argv, orig, newrepo, git, child=True)
+                err(f"child git: marker {judged.kind}={judged.paths}, repository gitdir={repo.gitdir} "
+                    f"common={repo.common} root={repo.root} → {'inherits' if covered else 'judges'}")
+            if covered:
+                # The judged repository: inherited, the command's own writes
+                # are for the next command. Not the checks on this child's
+                # arguments: a push or an archive --remote is judged on where
+                # it goes ([62] [70]) — on that alone: judged under its own
+                # key, a submodule's push (`push --recurse-submodules`, an
+                # alias `push -u && push --tags`) was refused as never
+                # trusted or as changed by the first push. [108]
+                if rest[:1] in (["push"], ["archive"]):
+                    insp = inspect(repo)
+                    check_remote_destination(repo, rest, insp.scan.remote_names, insp.refs)
+                return run_git(argv, orig, newrepo, git, judged)
         insp = inspect(repo)
         refs, new = insp.refs, insp.new
         if mode == "exec":
@@ -4201,7 +4356,6 @@ def main(argv: list[str]) -> int:
                  f"same command. Review incoming changes to these files.")
         check_safe_bare()
         check_wrap()
-        check_wrap()
         return 0
     if mode == "diff":
         if old is None:
@@ -4230,8 +4384,8 @@ def main(argv: list[str]) -> int:
             e.recorded = True
         raise
     if mode == "exec":
-        set_judged("key", key.name)
-        return run_git(argv, orig, newrepo, git, child=judged is not None)
+        set_judged("repo", str(repo.gitdir), str(repo.common), str(repo.root))
+        return run_git(argv, orig, newrepo, git, judged)
     return 0
 
 if __name__ == "__main__":
