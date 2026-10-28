@@ -756,6 +756,35 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      ran unwatched. Fix: the parent watches each submodule's `.lfsconfig`
      as it does its config ([39]). Found reviewing the diffs of
      [113]–[124], 2026-10-28.
+[126] An active submodule entered in-process, no child to judge it. The
+     user trusted a repository holding `submodule.active = .` — what `clone
+     --recurse-submodules` writes into `.git/config`, so it is hashed and
+     trusted, and the activation is_submodule_active needs is free for the
+     sandbox. The sandbox plants a repository `vendor/x` (its config's
+     core.fsmonitor runs a payload) and commits a tree with a gitlink at
+     `vendor/x` and a `.gitmodules` naming it, moving the branch to it:
+     objects and refs are volatile, the index and the work tree carry no
+     gitlink, so gitguard's structural check (index gitlinks, `.gitmodules`
+     on disk) sees nothing and does not refuse. `git grep
+     --recurse-submodules s HEAD` reads the gitlink from the tree, finds the
+     submodule active, and enters `vendor/x/.git` in-process
+     (repo_submodule_init tries `<path>/.git` in the work tree first): its
+     core.fsmonitor runs on the index refresh, in the user's command, with
+     no child git — the exec-path wrap that would judge `vendor/x` never
+     runs. DESIGN-exec-path.md section 6 argued the activation was the
+     barrier (`.git/config` hashed); `submodule.active = .` defeats that,
+     and the claimed fallback barriers — the index check and "a tree reader
+     executes nothing of a gitdir at `<path>/.git`" — hold for every
+     in-process reader observed (ls-files, diff/log --submodule, rev-list)
+     except `grep --recurse-submodules` with a tree argument, which takes
+     the gitlink from the tree and runs the gitdir in-process. `log
+     --submodule=diff`, by contrast, enters through a child the wrap judges.
+     Found 2026-10-28 while reviewing DESIGN-exec-path.md section 6.
+     Accepted limitation (2026-10-28, DESIGN.md "Known limitations"):
+     by-name activation stays a hashed config write, refused; `trust` warns
+     on a `submodule.active` pathspec and names the way out (`git config
+     --unset-all submodule.active`; the per-name keys the same clone wrote
+     keep every real submodule active).
 """
 from __future__ import annotations
 

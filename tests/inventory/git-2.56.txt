@@ -179,3 +179,10 @@ post-index-change
 -h
 -p
 -v
+
+[detach]
+builtin/fsmonitor--daemon.c:try_to_run_foreground_daemon
+builtin/fsmonitor--daemon.c:try_to_start_background_daemon
+builtin/gc.c:cmd_gc
+builtin/gc.c:maintenance_run_tasks
+daemon.c:cmd_main

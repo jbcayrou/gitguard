@@ -172,9 +172,11 @@ def test_git_enters_control_raw_child_runs_it(gg: GG, repo: Path, tmp_path: Path
 # entered in-process only when it is *active*, which takes
 # `submodule.<name>.url` or `.active` in `.git/config` (is_submodule_active
 # reads the config, not .gitmodules), and `.git/config` is hashed; a
-# planted repository under a tracked path that the sandbox cannot activate.
-# Recorded here per command: whether the real git (raw children) runs the
-# nested config, and that gitguard refuses the activation before.
+# planted repository under a tracked path that the sandbox cannot activate
+# by name. A trusted `submodule.active` pathspec activates it for free:
+# [126], the accepted limitation, its record below. Recorded here per
+# command: whether the real git (raw children) runs the nested config, and
+# that gitguard refuses the by-name activation before.
 IN_PROCESS = {
     "ls_files": (["ls-files", "--recurse-submodules"], True),
     "grep": (["grep", "--recurse-submodules", "s"], True),
@@ -199,6 +201,28 @@ def test_in_process_entry_needs_an_activation_gitguard_refuses(gg: GG, repo: Pat
     gg.git(*cmd, cwd=repo)                                  # the real git, raw children
     assert mark.exists() == runs, (f"`git {' '.join(cmd)}` {'no longer runs' if runs else 'now runs'} "
                                    f"the nested config in-process: update IN_PROCESS and section 6")
+
+
+def test_pathspec_activation_grep_tree_enters_in_process(gg: GG, repo: Path,
+                                                         tmp_path: Path) -> None:
+    """[126], the accepted limitation's record: with a `submodule.active`
+    pathspec already trusted (what `clone --recurse-submodules` writes), a
+    gitlink in a tree object is an active submodule with no config write,
+    and `grep --recurse-submodules <tree>` opens the planted gitdir
+    in-process — wrapped children change nothing, no child runs. Every
+    other in-process reader executes nothing of it. The grep line failing
+    means git closed the entry ([126] moves to fixed); another reader
+    executing means the limitation grew (a new catalogue entry)."""
+    from tests.attacks._helpers import plant_active_gitlink
+    mark = plant_active_gitlink(gg, repo, tmp_path, planting="tree")
+    assert gg.run("git", "grep", "--recurse-submodules", "s", "HEAD", cwd=repo).rc == 0
+    assert mark.exists(), "grep no longer enters in-process: [126] is closed, move it to fixed"
+    for cmd in (["grep", "--recurse-submodules", "s"], ["ls-files", "--recurse-submodules"],
+                ["diff", "--cached", "--submodule=log"], ["rev-list", "--objects", "HEAD"],
+                ["status"]):
+        mark.unlink(missing_ok=True)
+        gg.run("git", *cmd, cwd=repo)
+        assert not mark.exists(), f"`git {' '.join(cmd)}` now executes the planted config: a new entry"
 
 
 # ============================================ NEW_REPO_OPTIONS vs `git -h`
@@ -417,6 +441,73 @@ def test_every_hook_under_a_tree_hookspath_is_watched(gg: GG, repo: Path, hook: 
     assert not gg.check(repo).blocked
     p.write_text("#!/bin/sh\ntouch RAN\n")
     assert gg.check(repo).blocked, hook
+
+
+# Every call that takes a git out of its command's process tree —
+# `daemonize()`, `setsid()`, `start_bg_command()` — as `<file>:<function>`
+# from the inventory. keep_attached (DESIGN-exec-path.md 3.2, [117]) is a
+# closed list of the two that git runs as a child of an ordinary user
+# command and that run git children after detaching: their children would
+# find the marker's process gone and judge as a user's command would. The
+# rest detach and run no git afterwards, or are never a child of a judged
+# command. Every caller must be classified here, so a future git that
+# detaches somewhere new fails first. Not in the oracle: transport-helper.c
+# forks twice (the two copy tasks of a bidirectional remote helper), but
+# the parent waits for both (tloop_join/waitpid) — nothing leaves the tree.
+DETACH = {
+    "builtin/gc.c:cmd_gc":
+        "gc --auto under gc.autoDetach: git runs it after a command; its gc/"
+        "repack/prune are git children → keep_attached turns it --no-detach",
+    "builtin/gc.c:maintenance_run_tasks":
+        "maintenance run --detach: git >= 2.47 runs it after a command (cmd_"
+        "maintenance -> here); its tasks are git children → keep_attached",
+    "daemon.c:cmd_main":
+        "git daemon: a server the user starts explicitly, never a child of an "
+        "ordinary command; the repository it serves and that repository's git "
+        "children get their own marker (TRANSPORT/SERVERS, 3.4), not an "
+        "inherited one, so its detaching needs no keep_attached",
+    "builtin/fsmonitor--daemon.c:try_to_run_foreground_daemon":
+        "`fsmonitor--daemon run --detach`, setsid() then fsmonitor_run_daemon: "
+        "listener, health and IPC threads in-process, no run_command/"
+        "start_command/git_cmd anywhere after the detach (builtin/fsmonitor--"
+        "daemon.c, compat/fsmonitor/): runs no git once detached",
+    "builtin/fsmonitor--daemon.c:try_to_start_background_daemon":
+        "`fsmonitor--daemon start` (a git child of `status` under core."
+        "fsmonitor=true, judged by the wrap): start_bg_command of `run "
+        "--detach`, waited for until ready (SBGR_READY); the only git it runs "
+        "is that child, before it is detached; the detached one runs none",
+}
+KEEP_ATTACHED = {"builtin/gc.c:cmd_gc", "builtin/gc.c:maintenance_run_tasks"}
+
+
+@pytest.mark.discovery
+def test_keep_attached_covers_every_daemonizing_child() -> None:
+    """[117] every caller of daemonize(), setsid() or start_bg_command()
+    git's source names is classified: either a git keep_attached keeps
+    attached (the two auto-run after an ordinary command, gc --auto and
+    maintenance run --detach) or one that runs no git once detached. An
+    unclassified caller is a future [117] (a git whose detached children
+    would find the marker dead)."""
+    callers = set(_inventory("detach"))
+    assert callers == set(DETACH), (callers ^ set(DETACH))
+    assert KEEP_ATTACHED <= callers
+
+
+@pytest.mark.parametrize("cmd,detach,no_detach", [
+    (["maintenance", "run", "--detach"], "--detach", "--no-detach"),
+    (["gc", "--auto"], None, "gc.autoDetach=false"),
+])
+def test_keep_attached_disarms_the_detach(cmd: list[str], detach: str | None,
+                                          no_detach: str) -> None:
+    """keep_attached rewrites the two auto-run commands so they do not leave
+    the tree: `maintenance run --detach` -> `--no-detach`, `gc` -> prefixed
+    with `-c gc.autoDetach=false`. A command that does not daemonize is left
+    untouched."""
+    out = gg_mod.keep_attached(list(cmd), Path.cwd())
+    assert no_detach in out
+    if detach is not None:
+        assert detach not in out
+    assert gg_mod.keep_attached(["status"], Path.cwd()) == ["status"]
 
 
 def test_inventory_global_options_are_known() -> None:

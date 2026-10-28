@@ -2341,3 +2341,19 @@ def test_exec_path_shim_is_built_and_checked(gg: GG, repo: Path, tmp_path: Path)
     assert "does not lead to gitguard" in t.stderr, t.stderr
     if not Path("/usr/bin/dpkg-divert").exists():
         assert "dpkg-divert" not in t.stderr and "gitguard exec-path" in t.stderr, t.stderr
+
+
+# --------------------------------------------------- [126] pathspec activation
+def test_trust_warns_on_a_pathspec_activation(gg: GG, tmp_path: Path) -> None:
+    """[126] `trust` names the hazard and the way out when the config holds a
+    `submodule.active` pathspec (what `clone --recurse-submodules` writes);
+    per-name activation, a hashed write, gets no warning."""
+    r = tmp_path / "r"
+    gg.git("init", "-q", str(r))
+    assert gg.git("config", "submodule.sub.active", "true", cwd=r).rc == 0
+    assert "submodule.active" not in gg.trust(r).err
+    assert gg.git("config", "submodule.active", ".", cwd=r).rc == 0
+    res = gg.run("trust", cwd=r)
+    assert res.rc == 0, res.text
+    assert "submodule.active" in res.err and "[126]" in res.err, res.text
+    assert "unset-all" in res.err, res.text

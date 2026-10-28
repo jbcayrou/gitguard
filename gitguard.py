@@ -1823,6 +1823,11 @@ class ConfigScan:
         # than name something git runs or reads as config (tree_named).
         self.structure: set[Path] = set()
         self.remote_names: set[str] = set()
+        # `submodule.active` pathspecs, whatever their source (`clone
+        # --recurse-submodules` writes `.` into `.git/config`): a gitlink
+        # matching one is an active submodule with no per-name config
+        # write — named by the warning at trust. [126]
+        self.active_pathspecs: set[str] = set()
         # Values of global origin and of the environment / `-c` (an alias's
         # `-c` included): resolved again against each local remote and
         # submodule. [68] [92]
@@ -1912,6 +1917,8 @@ class ConfigScan:
         `relocated`: a global or `-c` value read again against another base
         than the root (run)."""
         repo = self.repo
+        if section == "submodule" and key == "active":
+            self.active_pathspecs.add(value)
         # `git push <name>` resolves <name> through the repository's config
         # (local, global, environment: those whose base is the root), not a
         # submodule's: there, `<name>` is a path.
@@ -4178,7 +4185,11 @@ class Judged:
           own recognition, _child_root). A gitdir planted in a volatile zone
           of a submodule (`modules/x/refs/p`), hashed by nobody, is judged
           on its own ([103]); a worktree's or a separate gitdir's
-          submodules are covered ([102]). A served repository's marker
+          submodules are covered ([102]). gitdir_roots is recomputed from
+          the file system here, not from the parent's manifest: the
+          difference is the roots the command itself just created
+          (`modules/<x>` during `submodule add`), judged at the next command
+          ([107]). A served repository's marker
           names a gitdir nobody walked: that gitdir and common dir exactly
           ([121]: its `worktrees/*` and `modules/*` were covered too).
         - what its config names in its tree, when its tree is not the
@@ -4587,6 +4598,16 @@ def main(argv: list[str]) -> int:
                  f"them, a checkout/merge/reset/pull of a commit someone else created replaces "
                  f"them after the check, and git uses the new version in the same command. "
                  f"Review incoming changes to these files.")
+        if insp.scan.active_pathspecs:
+            vals = " ".join(sorted(insp.scan.active_pathspecs))
+            warn(f"submodule.active = {vals} activates submodules by pathspec (what "
+                 f"`clone --recurse-submodules` writes): a repository planted in the tree "
+                 f"and named by a gitlink in a commit someone else created is active with "
+                 f"no config write, and `git grep --recurse-submodules <tree>` reads its "
+                 f"gitdir in-process, no child git to judge it ([126], accepted "
+                 f"limitation). Way out: `git config --unset-all submodule.active` — the "
+                 f"submodule.<name>.url the same clone wrote keeps each real submodule "
+                 f"active.")
         check_safe_bare()
         check_wrap()
         return 0

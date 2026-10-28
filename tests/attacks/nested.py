@@ -5,7 +5,7 @@ import hashlib
 import shutil
 from pathlib import Path
 
-from tests.attacks._helpers import add_submodule
+from tests.attacks._helpers import add_submodule, plant_active_gitlink
 from tests.conftest import GG
 
 
@@ -239,3 +239,19 @@ def attack_gitdir_in_submodule_volatile_zone(gg: GG, repo: Path, tmp_path: Path)
     assert gg.git("update-index", "--add", "--cacheinfo", f"160000,{sha},inner", cwd=sub).rc == 0
     (sub / "inner").mkdir()
     (sub / "inner/.git").write_text("gitdir: ../../.git/modules/sub/refs/p\n")
+
+
+def attack_active_submodule_gitlink_in_head_runs_in_process(gg: GG, repo: Path,
+                                                            tmp_path: Path) -> None:
+    """[126] `submodule.active = .` (what `clone --recurse-submodules`
+    writes, hence trusted) makes the sandbox's planted `vendor/x` an active
+    submodule with only a gitlink committed to HEAD and a `.gitmodules`
+    there — objects and refs are volatile, the index and the work tree hold
+    no gitlink, so gitguard's structural check (index gitlinks, `.gitmodules`
+    on disk) sees nothing. `git grep --recurse-submodules s HEAD` reads the
+    gitlink from the tree, finds the submodule active, and enters
+    `vendor/x/.git` in-process (repo_submodule_init), running its
+    core.fsmonitor: no child git stands between git and the planted gitdir,
+    so the exec-path wrap never judges it. gitguard does not refuse the
+    repository; the payload runs."""
+    plant_active_gitlink(gg, repo, tmp_path, planting="tree", gitfile=False)

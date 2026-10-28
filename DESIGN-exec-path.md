@@ -168,7 +168,12 @@ the judged common dir, and every root nested under their `modules/` and
 `worktrees/` (`gitdir_roots`, the same recognition as the walk's
 `_child_root`: a `HEAD` or a `commondir` under those two directories, and
 nowhere else). Covered means hashed: the content of those roots is in the
-judged manifest, so the judgment extends to them. This is what makes a
+judged manifest, so the judgment extends to them. `covers` recomputes
+`gitdir_roots` from the file system at the child, not from the parent's
+manifest: the difference is exactly the roots the command itself just
+created (`modules/<x>` during a `submodule add`), which the rule "what a
+command writes into a judged repository is judged at the next command"
+(section 2) covers, consistent with [107]. This is what makes a
 real submodule's `git status --porcelain=2` pass without a `trust` of its
 own, lets `git worktree add` run its `git reset --hard` in the new
 worktree, and covers a worktree's own submodules
@@ -377,6 +382,7 @@ system-wide replay; keep the `git.real` layout.
 | git enters another repository through a child | [6] [7] [14] [24] [36] [60] [66] [77] [78] [86] [87] | covered twice: the parent's structural refusals, the child's refusal at entry |
 | the submodule content diff | [89] | **closed** (XPASS on the VM); the accepted-limitation text and the `trust` warning go |
 | a tracked include read by the `maintenance` child | [95] [123] | **stays**: same repository, same command (section 2). Joins [44] as an accepted limitation; `trust` names every file the config names in the tree. A re-check by the child was tried and reverted ([124]) |
+| an active submodule entered in-process (`submodule.active` pathspec, `grep --recurse-submodules <tree>`) | [126] | **accepted limitation**: by-name activation stays hashed and refused; `trust` warns on a pathspec, with the way out |
 | tracked hooks, sh readings | [44] [71] [74] | unchanged |
 | everything else (fingerprint scope, parsers, discovery, options, remotes, FPs) | ~75 | unchanged, untouched |
 
@@ -398,16 +404,22 @@ documented the loss).
   (`repo_submodule_init`). Measured (git 2.50 and 2.47.3): `ls-files` and
   `grep` **do run** the nested repository's `core.fsmonitor` in-process
   (its index is refreshed); `diff --submodule=log` and `rev-list --objects`
-  do not. What keeps this out of the catalogue: an in-process entry only
-  happens for an *active* submodule, which takes `submodule.<name>.url` or
-  `.active` in `.git/config` (is_submodule_active reads the config, not
-  `.gitmodules`), and `.git/config` is hashed — the sandbox cannot activate
-  a planted repository without a refusal. The day `status` goes in-process,
+  do not. What stands in the way is two barriers, not one: an in-process
+  entry needs an *active* submodule, and activation **by name** takes
+  `submodule.<name>.url` or `.active` in `.git/config`
+  (is_submodule_active reads the config, not `.gitmodules`), which is
+  hashed; the readers that take the gitlink from the index meet the
+  structural refusal first. Neither bars a **pathspec** activation already
+  trusted — `submodule.active = .`, what `clone --recurse-submodules`
+  writes — met by a gitlink in a tree object: `grep --recurse-submodules
+  <tree>` then opens the planted gitdir in-process ([126], accepted
+  limitation; `trust` warns on the pathspec and names the way out). The
+  day `status` goes in-process,
   the barrier vanishes without a test going red — unless the test exists.
   Hence (section 7, implemented): a claims test "git enters a planted
   repository through a child process" with a positive control, and a table
   of the in-process entries with, for each, whether it runs the nested
-  config and the refusal of the activation. Replayed at each git release,
+  config and what bars the activation. Replayed at each git release,
   like `tests/inventory/`.
 - **Cost per child**: 25 ms on the VM, ~35 ms on macOS, inheritance
   included (the Python floor dominates). `pull` ≈ +3 children, `status`

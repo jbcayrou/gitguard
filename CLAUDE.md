@@ -100,11 +100,11 @@ are honoured as git honours them.
 | child gits: the marker (pid + start + judged gitdir/common/root/label), coverage by `gitdir_roots` and `tree_named`, `new`, the served repository, no detach, the exec-path wrap, its check and its macOS shim | `Judged`, `_ancestors`, `_proc_lineage`, `read_judged`, `set_judged`, `NewRepo`, `_served_repository`, `keep_attached`, `check_wrap`, `cmd_exec_path`, `PATH_QUERIES`, `run_git` | Nested repositories; DESIGN-exec-path.md |
 | performance | PERF.md | Nested repositories (end) |
 | what git writes then reads in one command ([44] [66] [77] [86] [88] [95] [123] [124]) | `Judged.covers`, `_hard_link` | The command that writes what it then reads |
-| accepted limitations [44], [71], [74], out-of-scope cases | — | Known limitations |
+| accepted limitations [44], [71], [74], [126], out-of-scope cases | — | Known limitations |
 
 ## Tests
 
-`python3 -m pytest` (~1300 tests, expected failures: [44], [71], [74], [95], [123], the accepted limitations; ~280 s), before
+`python3 -m pytest` (~1300 tests, expected failures: [44], [71], [74], [95], [123], [126], the accepted limitations; ~280 s), before
 any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
 && venv/bin/pip install pytest`.
 

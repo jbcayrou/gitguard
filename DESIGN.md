@@ -1003,7 +1003,7 @@ into the tree was not watched.
 
 ## Tests
 
-**`python3 -m pytest`** (~1300 tests, expected failures [44], [71], [74], [95], [123] — accepted
+**`python3 -m pytest`** (~1300 tests, expected failures [44], [71], [74], [95], [123], [126] — accepted
 limitations; ~280 s, ~60 s with `-n 8` on the command line),
 to run before any change:
 
@@ -1363,6 +1363,25 @@ the files, not the order.
   names in the tree. A re-check by the child was tried and reverted ([124],
   "The command that writes what it then reads"). xfail record:
   `test_merge_checks_out_a_tracked_include_then_reads_it`.
+- **Accepted limitation [126]** (decided 2026-10-28, xfail record:
+  `attack_active_submodule_gitlink_in_head_runs_in_process`): a trusted
+  `submodule.active` **pathspec** — the `.` that `clone
+  --recurse-submodules` writes — makes any gitlink an active submodule
+  with no config write; a gitlink in a tree object (objects and refs:
+  volatile) then lets `git grep --recurse-submodules <tree>` open the
+  planted repository's gitdir **in-process** (repo_submodule_init tries
+  `<path>/.git` in the work tree first) and run its `core.fsmonitor` — no
+  child process for the exec-path wrap to judge. The index readers meet
+  the structural refusal first (the index gitlink); every other in-process
+  reader observed executes nothing (the record:
+  `test_pathspec_activation_grep_tree_enters_in_process`). Why accepted:
+  the only closure gitguard owns is refusing pathspec activation, which
+  would alert on every recursive clone for ever — gitguard never rewrites
+  a config — and a guard on the parent's arguments would be the guessed
+  routes again. Mitigation: `trust` warns on a `submodule.active` pathspec
+  and names the way out (`git config --unset-all submodule.active`; the
+  `submodule.<name>.url` the same clone wrote keeps each real submodule
+  active, and by-name activation is a hashed write, refused).
 - `git --work-tree=<other> …` changes the set of hooks git runs, so the
   fingerprint differs from the repository's own tree ([72]): the tree is
   blessed with `GIT_WORK_TREE=<other> gitguard trust` (same state key),

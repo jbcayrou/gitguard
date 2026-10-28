@@ -195,3 +195,77 @@ def payload(tmp_path: Path) -> Path:
     p.write_text(f"#!/bin/sh\ntouch '{tmp_path}/RAN'\nexit 1\n")
     p.chmod(0o755)
     return p
+
+
+# ------------------------------- in-process entries, the activation pre-trusted
+# Every key a reader entering a repository in-process could run, all pointed
+# at `payload`: the fsmonitor (run on an index refresh), a hooks directory
+# with the hooks a read or a refresh could reach, and the program keys.
+PLANTED_HOOKS = ("post-index-change", "post-checkout", "pre-commit", "post-commit",
+                 "reference-transaction", "fsmonitor-watchman", "pre-auto-gc", "post-merge")
+PLANTED_KEYS = ("core.fsmonitor", "core.sshCommand", "credential.helper", "core.pager",
+                "core.editor", "diff.external", "core.gitProxy", "gpg.program",
+                "core.alternateRefsCommand", "uploadpack.packObjectsHook")
+
+
+def plant_active_gitlink(gg: GG, repo: Path, tmp_path: Path, planting: str = "tree",
+                         gitfile: bool = False) -> Path:
+    """The user trusted a repository whose config holds `submodule.active = .`
+    (what `clone --recurse-submodules` leaves): the activation an in-process
+    submodule entry needs (is_submodule_active) is already in the trusted
+    config, the sandbox has nothing to write in `.git/`. The sandbox: a
+    repository `vendor/x` whose config runs `payload` (PLANTED_KEYS, hooks,
+    an include, an alias), a commit on top of HEAD whose tree holds a
+    gitlink at `vendor/x` and a `.gitmodules` naming it, the branch moved
+    to that commit (objects and refs: volatile). `planting` = "tree": the
+    index and the disk are left alone — gitlink and `.gitmodules` exist in
+    HEAD's tree only (git reads `.gitmodules` from HEAD when neither the
+    tree nor the index has it); "index": the index reset to HEAD (the
+    gitlink and `.gitmodules` entries) and `.gitmodules` checked out.
+    `gitfile`: `vendor/x/.git` is a gitfile to a gitdir the sandbox keeps
+    elsewhere in the volume rather than a directory. Returns the mark
+    `payload` touches when it runs."""
+    import os
+    from tests.conftest import write_exec
+    assert gg.git("config", "submodule.active", ".", cwd=repo).rc == 0
+    gg.trust(repo)
+    mark = tmp_path / "RAN"
+    p = payload(tmp_path)
+    x = repo / "vendor/x"
+    assert gg.git("init", "-q", str(x)).rc == 0
+    (x / "s").write_text("s\n")
+    gg.git("add", "s", cwd=x)
+    gg.git("commit", "-qm", "s", cwd=x)
+    sub = gg.git("rev-parse", "HEAD", cwd=x).out.strip()
+    gitdir = x / ".git"
+    if gitfile:
+        import shutil
+        planted = tmp_path / "planted.git"
+        shutil.move(str(gitdir), str(planted))
+        gitdir = planted
+        (x / ".git").write_text(f"gitdir: {os.path.relpath(planted, x)}\n")
+    for h in PLANTED_HOOKS:
+        write_exec(gitdir / "planted-hooks" / h, f"#!/bin/sh\ntouch '{mark}'\n")
+    for k in PLANTED_KEYS:
+        assert gg.git("config", k, str(p), cwd=x).rc == 0
+    assert gg.git("config", "core.hooksPath", str(gitdir / "planted-hooks"), cwd=x).rc == 0
+    assert gg.git("config", "alias.status", f"!{p}", cwd=x).rc == 0
+    assert gg.git("config", "log.showSignature", "true", cwd=x).rc == 0
+    (gitdir / "inc").write_text(f"[core]\n\tfsmonitor = {p}\n")
+    assert gg.git("config", "include.path", str(gitdir / "inc"), cwd=x).rc == 0
+    (x / "s").write_text("dirty\n")
+    # the commit: HEAD's tree + .gitmodules + the gitlink, the branch moved
+    blob = _git_input(gg, repo, '[submodule "x"]\n\tpath = vendor/x\n\turl = ./vendor/x\n',
+                      "hash-object", "-w", "--stdin")
+    vt = _git_input(gg, repo, f"160000 commit {sub}\tx\n", "mktree", "--missing")
+    tree = _git_input(gg, repo, gg.git("ls-tree", "HEAD", cwd=repo).out
+                      + f"100644 blob {blob}\t.gitmodules\n040000 tree {vt}\tvendor\n", "mktree")
+    c = gg.git("commit-tree", "-p", "HEAD", "-m", "evil", tree, cwd=repo).out.strip()
+    assert gg.git("update-ref", "HEAD", c, cwd=repo).rc == 0
+    if planting == "index":
+        assert gg.git("read-tree", "HEAD", cwd=repo).rc == 0
+        assert gg.git("checkout", "--", ".gitmodules", cwd=repo).rc == 0
+    else:
+        assert planting == "tree", planting
+    assert not mark.exists(), "the planting itself ran the payload"
+    return mark

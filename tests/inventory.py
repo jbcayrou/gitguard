@@ -23,6 +23,13 @@ Sections (one item per line, `# ` comments, blank lines ignored):
   curated by hand, test_claims.py PROGRAM_KEYS, from Documentation/config.)
   [hooks]     hook names, from Documentation/githooks.adoc.
   [options]   git's global options, from git.c.
+  [detach]    `<relpath>:<function>` of every caller of `daemonize()`,
+              `setsid()` or `start_bg_command()` outside run-command.c,
+              setup.c (the definitions) and compat/: the ways a git leaves
+              its command's process tree. The gits keep_attached must keep
+              attached (those git runs as a child of an ordinary command)
+              are among them ([117]). A bare `fork()` is not a signature:
+              transport-helper.c forks two copy tasks and waits for both.
 
 Extraction is by regular expression over C and AsciiDoc: good enough to be
 complete on what it targets, reviewed by eye at each regeneration (the
@@ -94,6 +101,34 @@ def global_options(src: Path) -> set[str]:
     return out
 
 
+def detach_callers(src: Path) -> set[str]:
+    """`<relpath>:<function>` for every call that takes a git out of its
+    command's process tree: libgit's `daemonize()` (setup.c), `setsid()`
+    and `start_bg_command()` (run-command.c), outside their definitions
+    and compat/. The enclosing top-level function is the last `^type
+    name(` above the call. keep_attached (3.2, [117]) must turn the ones
+    git runs as a child of an ordinary command into `--no-detach`; the
+    test classifies each caller. A bare `fork()` is not listed: the one
+    outside run-command.c (transport-helper.c, two copy tasks of a
+    bidirectional helper) is waited for by its parent."""
+    call = re.compile(r'(?<![\w>.])(daemonize|setsid|start_bg_command)\s*\(')
+    defn = re.compile(r'^\w[\w ]*\b(daemonize|setsid|start_bg_command)\s*\(')
+    fn_def = re.compile(r'^[A-Za-z_].*?(\w+)\s*\(')
+    out: set[str] = set()
+    for p in c_files(src):
+        rel = p.relative_to(src).as_posix()
+        if rel in ("run-command.c", "setup.c") or rel.startswith("compat/"):
+            continue
+        fn = None
+        for line in p.read_text(errors="replace").splitlines():
+            m = fn_def.match(line)
+            if m:
+                fn = m.group(1)
+            if call.search(line) and not defn.match(line):
+                out.add(f"{rel}:{fn}")
+    return out
+
+
 def version(src: Path) -> str:
     """DEF_VER of GIT-VERSION-GEN (the release line) and the commit."""
     m = re.search(r"DEF_VER=v?([\w.]+)", (src / "GIT-VERSION-GEN").read_text())
@@ -115,6 +150,8 @@ def main() -> None:
     print("\n".join(hooks(src)))
     print("\n[options]")
     print("\n".join(sorted(global_options(src))))
+    print("\n[detach]")
+    print("\n".join(sorted(detach_callers(src))))
 
 
 if __name__ == "__main__":
