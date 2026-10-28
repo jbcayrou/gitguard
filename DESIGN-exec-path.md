@@ -342,7 +342,7 @@ Verification from any directory:
 git -c alias.w='!readlink -f $(which git)' w     # /usr/bin/gitguard
 ```
 
-### 4.2 macOS: a shim exec path
+### 4.2 macOS, or no root: a shim exec path
 
 Homebrew has no diversion; `brew upgrade git` replaces the Cellar. The
 only clean handle is `GIT_EXEC_PATH`, which git honours before its
@@ -358,7 +358,10 @@ it ([119]). The trust-time verification (3.7) says when it is stale:
 entries of the real exec path missing, or links to nothing. Weaker than Debian:
 a process that does not inherit the variable has unwrapped children, i.e.
 today's protection. The same shim is the test tool for experiments without
-root (it is how the per-child numbers above were measured).
+root (it is how the per-child numbers above were measured), and the
+per-user install on Linux (README, "Per user"); `_core_exec_path` takes
+`git.real` of the real exec path when the diversion left one, whatever
+gitguard that path's `git` is.
 
 ### 4.3 The VM
 

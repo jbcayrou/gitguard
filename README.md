@@ -103,15 +103,41 @@ or config; see "Day to day" for how much of that is automated.
 
 ## Install
 
+Two things to wrap: the `git` you type, and the `git` every git runs its
+children through — git's **exec path** (`git --exec-path`). A command
+enters other repositories only through children (`git status` in a
+submodule, `git pull` in a hook, the `index-pack` of a clone, a repository
+planted in the work tree), and a child that is gitguard judges the
+repository it enters; a raw one does not (DESIGN-exec-path.md). Without
+the second wrap gitguard checks the repositories you run git in, as
+before, and `gitguard trust` says so.
+
+### Per user (Linux, macOS)
+
 ```sh
 install -m 755 gitguard.py ~/bin/gitguard
 ln -s ~/bin/gitguard ~/bin/git      # a directory ahead of the real git in your PATH
+gitguard exec-path                  # builds ~/.local/lib/gitguard-exec (or the directory you give)
 ```
 
-gitguard detects it is called `git` and switches to exec mode. The real git
-is the first `git` of the `PATH` that is not gitguard itself (or
-`GITGUARD_REAL_GIT`). If you only want the `git` you type wrapped, an alias
-is enough, with the limits described above:
+then, in your shell profile:
+
+```sh
+export GIT_EXEC_PATH=~/.local/lib/gitguard-exec
+```
+
+gitguard detects it is called `git` and switches to exec mode. `gitguard
+exec-path` links every entry of the real git's exec path into the
+directory, `git` to gitguard and `git.real` to the real binary, which
+gitguard runs before looking at the `PATH` (a GUI app's `PATH` may hold
+another git). Run it again after a git upgrade; `gitguard trust` tells
+you when it is stale. The variable reaches what your login shell starts;
+cron, systemd units and GUI apps need it set their own way (`launchctl
+setenv GIT_EXEC_PATH …` on macOS, `Environment=` in a unit, the crontab)
+— or the system-wide install below.
+
+If you only want the `git` you type wrapped, an alias is enough, with the
+limits described above:
 
 ```sh
 alias git='gitguard git'
@@ -120,12 +146,9 @@ alias git='gitguard git'
 ### System-wide (Debian/Ubuntu)
 
 To wrap every git on the machine, cron and GUIs included, install gitguard
-*as* `/usr/bin/git` and divert the real one — and do the same at git's
-**exec path**, `/usr/lib/git-core/git`: that is the `git` every git runs
-its children through (`git status` in a submodule, `git pull` in a hook,
-the `index-pack` of a clone), and the wrap is what lets a child judge the
-repository it enters (DESIGN-exec-path.md). `dpkg-divert` keeps both
-diversions across `apt upgrade git`:
+*as* `/usr/bin/git` and divert the real one — and do the same at the exec
+path, `/usr/lib/git-core/git`. `dpkg-divert` keeps both diversions across
+`apt upgrade git`:
 
 ```sh
 sudo install -m 755 gitguard.py /usr/bin/gitguard
@@ -143,10 +166,8 @@ systemd and GUIs would not get one). The 160 dashed builtins of
 command; under `git-receive-pack`, `git-upload-pack` and
 `git-upload-archive` (sshd, for every push and fetch *to* the machine) it
 passes straight to the real git, since they serve a repository named by
-argument and run nothing of the caller's. `gitguard trust`, `list` and
-`retrust` warn while the exec path is not wrapped: gitguard then checks
-the repositories you run git in, as before, but not the ones git enters
-on its own. To undo:
+argument and run nothing of the caller's. Upgrading gitguard is
+overwriting `/usr/bin/gitguard`. To undo:
 
 ```sh
 sudo rm /usr/bin/git /usr/lib/git-core/git
@@ -154,21 +175,44 @@ sudo dpkg-divert --package gitguard --rename --remove /usr/bin/git
 sudo dpkg-divert --package gitguard --rename --remove /usr/lib/git-core/git
 ```
 
-On macOS `/usr/bin/git` is protected by SIP and renaming Homebrew's git is
-undone by `brew upgrade`: keep the `PATH` symlink (it covers everything
-started from a login shell, VS Code included), set `git.path` in VS Code,
-and for the exec path let gitguard build a directory of your own:
+Other distributions have no `dpkg-divert`: renaming the two binaries by
+hand (`git` → `git.real`, a symlink to gitguard in its place, under
+`/usr/bin` and `$(git --exec-path)`) works until the next package upgrade
+puts the real git back, which `gitguard trust` reports. Or build the exec
+path once for everyone and set the variable system-wide:
 
 ```sh
-gitguard exec-path                    # ~/.local/lib/gitguard-exec, or give a directory
-export GIT_EXEC_PATH=~/.local/lib/gitguard-exec            # shell profile
-launchctl setenv GIT_EXEC_PATH ~/.local/lib/gitguard-exec  # GUI apps
+sudo gitguard exec-path /usr/local/lib/gitguard-exec
+echo 'GIT_EXEC_PATH=/usr/local/lib/gitguard-exec' | sudo tee -a /etc/environment
 ```
 
-It links every entry of the real git's exec path, `git` to gitguard and
-`git.real` to the real binary (a GUI app would otherwise run Apple's git
-as the real one). Run it again after `brew upgrade git`; `gitguard trust`
-tells you when it is stale.
+### macOS
+
+`/usr/bin/git` is protected by SIP and renaming Homebrew's git is undone
+by `brew upgrade`: use the per-user install above. The `PATH` symlink
+covers everything started from a login shell, VS Code included (set
+`git.path` there); for GUI apps:
+
+```sh
+launchctl setenv GIT_EXEC_PATH ~/.local/lib/gitguard-exec
+```
+
+`git.real` matters here: a GUI app's `PATH` holds only Apple's git, which
+would become the real one without it. Run `gitguard exec-path` again after
+`brew upgrade git`.
+
+### Check the install
+
+In any repository:
+
+```sh
+gitguard trust          # no warning about the exec path: children are wrapped
+git --exec-path         # the directory whose `git` is gitguard
+```
+
+`gitguard trust`, `list` and `retrust` warn while the exec path does not
+lead to gitguard, or leads to a stale directory (a git upgrade added or
+removed entries), and say what to run.
 
 ### First trust
 
@@ -308,7 +352,9 @@ gitguard pending ~/work/api      # decide; then read /tmp/git.log
 
 A new version may change what the fingerprint contains; `gitguard list`
 then shows the repositories as "legacy". `gitguard retrust` re-validates in
-bulk the ones that are unchanged and skips the modified ones.
+bulk the ones that are unchanged and skips the modified ones. Installed at
+the same path, the new version is what the exec path's `git` already
+links to; nothing else to redo.
 
 ## Commands
 
@@ -324,6 +370,7 @@ bulk the ones that are unchanged and skips the modified ones.
 | `gitguard forget <repo>…` / `--missing` | Remove entries; the repository becomes "never trusted" again. |
 | `gitguard prune` | Same as `forget --missing`. |
 | `gitguard retrust` | Re-validate unchanged repositories after an upgrade. |
+| `gitguard exec-path [<dir>]` | Build or rebuild an exec path whose `git` is gitguard, for `GIT_EXEC_PATH` (default `~/.local/lib/gitguard-exec`). |
 
 Management commands write to stdout (`gitguard list | grep modified`
 works); refusals and diagnostics go to stderr.

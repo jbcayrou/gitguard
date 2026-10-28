@@ -73,7 +73,7 @@ gitguard git <args>      check, then exec the real git (symlink `git → gitguar
                          tracking auto-accepted; other changes: diff + [y/N] on /dev/tty
 gitguard list | forget <repo>… | --missing | prune | retrust
 gitguard pending [<repo>… | -a | -c <repo>…]   decisions of terminal-less gits
-gitguard exec-path [<dir>]   (re)build an exec path whose git is gitguard (macOS)
+gitguard exec-path [<dir>]   (re)build an exec path whose git is gitguard (macOS, no root)
 ```
 
 Environment: `GITGUARD_STATE`, `GITGUARD_REAL_GIT`, `GITGUARD_ALLOW_REBASE_EXEC`,

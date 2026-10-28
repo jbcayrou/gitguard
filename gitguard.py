@@ -22,8 +22,9 @@ Usage:
   gitguard forget <repo>... | --missing
   gitguard prune         = forget --missing
   gitguard retrust       re-validate unchanged repositories (after an upgrade)
-  gitguard exec-path [<dir>]  (re)build an exec path whose git is gitguard (macOS;
-                        default ~/.local/lib/gitguard-exec), for GIT_EXEC_PATH
+  gitguard exec-path [<dir>]  (re)build an exec path whose git is gitguard, for
+                        GIT_EXEC_PATH where git's own cannot be diverted (macOS,
+                        no root; default ~/.local/lib/gitguard-exec)
   gitguard help
 
 Alias:    alias git='gitguard git'      Wrapper: ln -s ~/bin/gitguard ~/bin/git
@@ -4334,8 +4335,9 @@ SHIM_DEFAULT = "~/.local/lib/gitguard-exec"
 
 def _core_exec_path() -> tuple[Path, Path]:
     """The real git's own exec path and binary: `git --exec-path` without
-    GIT_EXEC_PATH (which it would echo), and the `git` there — or its
-    `git.real` when that `git` is gitguard (the Debian diversion)."""
+    GIT_EXEC_PATH (which it would echo), and the binary there: `git.real`
+    when the exec path is diverted (Debian; its `git` is then a gitguard,
+    this one or another install's), else `git`."""
     import subprocess
     env = {k: v for k, v in os.environ.items() if k != "GIT_EXEC_PATH"}
     try:
@@ -4347,9 +4349,9 @@ def _core_exec_path() -> tuple[Path, Path]:
     if r.returncode or not core.is_absolute() or not core.is_dir():
         raise Refuse(f"the real git gave no exec path: {r.stdout.strip()!r}")
     me = Path(__file__).resolve()
-    real = core / "git"
-    if real.resolve() == me:
-        real = core / "git.real"
+    real = core / "git.real"
+    if not real.is_file():
+        real = core / "git"
     if not real.is_file() or real.resolve() == me:
         raise Refuse(f"no real git binary in {core}")
     return core, real
@@ -4358,7 +4360,7 @@ def _core_exec_path() -> tuple[Path, Path]:
 def cmd_exec_path(args: list[str]) -> None:
     """`gitguard exec-path [<dir>]`: (re)build an exec path whose `git` is
     gitguard, for GIT_EXEC_PATH where git's own cannot be diverted (macOS:
-    SIP, Homebrew's Cellar). Every entry of the real exec path is linked by
+    SIP, Homebrew's Cellar; a user without root). Every entry of the real exec path is linked by
     its unresolved path (Homebrew's `opt/git/libexec/git-core` survives
     `brew upgrade`); a dashed builtin to `git` (gitguard, as the real
     layout has it); `git.real` to the real binary, which gitguard runs
