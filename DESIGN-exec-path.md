@@ -57,10 +57,8 @@ there is no longer a question "will this command enter a submodule?" —
 whatever enters, enters through gitguard. The third sentence is the
 boundary kept on purpose: [44] (a tracked hook checked out, then run) and
 [95] (a tracked include checked out, then read by the `maintenance` child)
-are the same repository, the same command. [44] stays an accepted
-limitation (section 5); [95] was closed on 2026-10-27 because its reader is
-a child: a covered child in the judged repository itself re-hashes the
-tree-side references before it runs (`check_tree_refs`).
+are the same repository, the same command; they stay accepted limitations
+(section 5).
 
 What it replaces, to be removed once the install is verified (section
 3.8): `with_ignored_submodule_dirt`, `SWITCH_EXEMPT`, `exempt_from_switch`,
@@ -97,13 +95,15 @@ When gitguard has judged a repository and runs the real git, it puts in
 that process's environment:
 
 ```
-GITGUARD_JUDGED=<pid>:repo=<gitdir>,<common dir>,<root>
+GITGUARD_JUDGED=<pid>.<start>:repo=<gitdir>,<common dir>,<root>,<label>
 ```
 
-the three paths resolved and hex-encoded (a path holds anything but NUL,
-the one byte an environment value cannot), `pid` the process that set it:
-gitguard itself, which execs the real git under its own pid, or stays the
-parent of a clone it waits for.
+the paths resolved and hex-encoded (a path holds anything but NUL, the
+one byte an environment value cannot; `label` is the directory the state
+key is named after, for a child that must read the parent's manifest),
+`pid` and `start` the process that set it and its start time: gitguard
+itself, which execs the real git under its own pid, or stays the parent of
+a clone it waits for.
 
 Not signed, on purpose. The marker could only be forged by whoever sets
 the environment of the user's git: the user's shell, a `direnv allow`, a
@@ -118,14 +118,25 @@ and a signed marker would be the one exception, a secret to store, prune
 and permission for no threat in the model.
 
 The marker **lives as long as the process that set it**: a child accepts
-it only while `pid` is one of its ancestors (`_ancestors`: `/proc/<pid>/stat`
-on Linux, `proc_pidinfo` on macOS; a chain that cannot be read stops
-there, fail closed). That is the lifetime of the command, however long —
-a `clone --recurse-submodules` of a large tree, a `filter-branch`, a
-`bisect run` — and not a moment more: an environment variable that
-outlived its git (a detached shell) names a pid that is no ancestor, and
-a pid reused by another process is never in a live ancestor chain. A
-marker whose process is gone is **no marker**: the user's semantics. The
+it only while that process — pid and start time — is one of its
+ancestors (`_ancestors`: fields 4 and 22 of `/proc/<pid>/stat` on Linux,
+`pbi_ppid` and `pbi_start` of `proc_pidinfo` on macOS; a chain that cannot
+be read stops there, fail closed; the reading process is not its own
+ancestor). That is the lifetime of the command, however long — a `clone
+--recurse-submodules` of a large tree, a `filter-branch`, a `bisect run`
+— and not a moment more: an environment variable that outlived its git (a
+detached shell, an editor's daemon) names a process that is no ancestor.
+The pid alone was not enough ([114]): a process holding an old marker long
+enough (an Emacs daemon started from the editor of `git commit`, `code
+--wait`, a tmux server) saw the counter wrap and one of its own children
+get the marker's pid; the start time tells them apart. A marker whose
+process is gone is **no marker**: the user's semantics. A child git does
+not leave the tree either: `maintenance run --detach` (what git ≥ 2.47
+passes to the auto-maintenance after a command) and `gc --auto` under
+`gc.autoDetach` daemonize, and their gc, repack, prune found the marker
+dead — in a submodule, refused at every fetch ([117]). `keep_attached`
+turns them into `--no-detach`: the auto-gc runs before the command
+returns. The
 first design expired the marker by the clock instead (a TTL of 60 s,
 [104]); the 15th adversarial pass showed the clock changing the *answer*
 mid-command, not only its cost — every submodule of a clone longer than a
@@ -148,13 +159,6 @@ child is judged on where it goes and on that alone (`check_remote_destination`,
 [62] [70] [108]: a hook or alias of the trusted config may legitimately
 run `git push`, and a submodule's push must not be judged under the
 submodule's own key); `parse_new_repo` sets the `new` marker (3.4).
-A covered child in the **judged repository itself** (its gitdir is the
-marker's) also re-hashes the manifest's tree-side references (scope `wt`:
-a relative `core.hooksPath`, an `include.path` into the tree) and refuses
-if they changed: the command may have checked out a commit that rewrote
-them, and this child is their first reader ([95]: `merge`, then its
-`maintenance run --auto` reading a tracked include; `check_tree_refs`,
-~0.5 ms, the refs only, never the tree).
 
 ### 3.3 Covered by the judged repository
 
@@ -182,16 +186,27 @@ index the same planting is caught one step earlier, `check_nested_git`
 requiring a gitdir root, which it did not before). A gitfile pointing
 outside the roots ([7] [24]) gets its own key and is never trusted.
 
-The **same gitdir with another work tree** is another repository: the
-tree-side references ([72], a relative `core.hooksPath`) resolve
-elsewhere. A child whose gitdir is the judged one must have the judged
-root; a trusted alias `!git --work-tree=<site> checkout -f main` is
-judged there and refused until `<site>` is trusted ([111]). Linked
-worktrees keep their own trust key for the **user's** commands, as before.
+A child at **another work tree root** — a submodule, a linked worktree,
+the same gitdir with `--work-tree=<site>` or `filter-branch`'s
+`.git-rewrite/t` — has its gitdir hashed, not its tree: what its config
+names there (a relative `core.hooksPath`, an include, a script:
+`tree_named`, every `wt` reference but the tree's own structure,
+`.gitmodules` and gitfiles) resolves under a root the parent did not walk
+([72]). Covered when every one of those paths was hashed by the parent (a
+submodule's hooks: the parent's scan resolves each submodule's config
+against its tree, [39]) or holds the same content at the same place in the
+judged tree (a linked worktree of a branch with the trusted hooks);
+otherwise judged on its own key. The rule replaces two that each failed
+one way: "the same gitdir must have the same root" refused every
+`filter-branch` ([115]), and "any other root is fine" let `worktree
+remove` run a hook the sandbox wrote in the linked worktree ([120]). A
+trusted alias `!git --work-tree=<site> checkout -f main` with a relative
+hooksPath is still judged at `<site>` ([111]). Linked worktrees keep their
+own trust key for the **user's** commands, as before.
 
 ### 3.4 Two more marker values
 
-- `GITGUARD_JUDGED=<pid>:new=<path>[,<gitdir>]` — set by `run_git` for
+- `GITGUARD_JUDGED=<pid>.<start>:new=<path>[,<gitdir>]` — set by `run_git` for
   `clone` and `init` (the parent judges nothing: the repository does not
   exist yet; auto-trust comes after git returns). Covered: anything whose
   gitdir, common dir **or** root is `<path>` or under it, or at `<gitdir>`
@@ -208,12 +223,17 @@ worktrees keep their own trust key for the **user's** commands, as before.
   `git-shell` run, [106]) serve the repository named by their argument, a
   bare one gitguard does not handle, and run nothing of the cwd's. The
   passthrough sets an ordinary `repo` marker for that repository, opened
-  as enter_repo opens it (`_local_remote`), with an empty root (its tree,
-  for a non-bare remote, is the push's business). Its children
-  (`index-pack`, `pack-objects`, `update-server-info`, `maintenance`, the
-  hooks' gits in that repository) inherit; a hook that enters **another**
-  repository (`cd site && git pull`) does not: that git judges `site`
-  ([105]; the first value, `serving`, covered everything). Without a
+  as enter_repo opens it (`_local_remote`), with an empty root and label:
+  nobody judged it as a whole. Its children (`index-pack`, `pack-objects`,
+  `update-server-info`, `maintenance`, the hooks' gits in that repository,
+  `upload-archive--writer <dir>` [118]) inherit when they are in that
+  gitdir and common dir **exactly** — not its `worktrees/*` or `modules/*`,
+  which nobody walked ([121]) — and in a tree where its config names
+  nothing: push-to-deploy's `update-index` in a non-bare remote whose
+  relative hooksPath names its tree is judged under the remote's own key
+  ([122]). A hook that enters **another** repository (`cd site && git
+  pull`) judges `site` ([105]; the first value, `serving`, covered
+  everything). Without a
   marker every ssh push *to* the machine fails at `index-pack` — the
   incident that created `TRANSPORT` on the VM, one level down.
 
@@ -328,10 +348,14 @@ Homebrew has no diversion; `brew upgrade git` replaces the Cellar. The
 only clean handle is `GIT_EXEC_PATH`, which git honours before its
 compiled path: a directory `~/.local/lib/gitguard-exec/` holding `git →
 gitguard`, `git.real → <Cellar>/libexec/git-core/git`, and a symlink for
-every other entry of that directory, regenerated by `gitguard
-exec-path --refresh` after an upgrade; `GIT_EXEC_PATH` set for the session
-(`launchctl setenv` for GUI apps, the shell profile for terminals). The
-trust-time verification (3.7) says when it is stale. Weaker than Debian:
+every other entry of that directory, built and rebuilt by `gitguard
+exec-path [<dir>]` (it links the entries by Homebrew's stable
+`opt/git/libexec/git-core` path, so an upgrade breaks only what it adds
+or removes); `GIT_EXEC_PATH` set for the session (`launchctl setenv` for
+GUI apps, the shell profile for terminals). `git.real` is not optional: a
+GUI app's PATH holds only Apple's git, which became the real one without
+it ([119]). The trust-time verification (3.7) says when it is stale:
+entries of the real exec path missing, or links to nothing. Weaker than Debian:
 a process that does not inherit the variable has unwrapped children, i.e.
 today's protection. The same shim is the test tool for experiments without
 root (it is how the per-child numbers above were measured).
@@ -349,7 +373,7 @@ system-wide replay; keep the `git.real` layout.
 |---|---|---|
 | git enters another repository through a child | [6] [7] [14] [24] [36] [60] [66] [77] [78] [86] [87] | covered twice: the parent's structural refusals, the child's refusal at entry |
 | the submodule content diff | [89] | **closed** (XPASS on the VM); the accepted-limitation text and the `trust` warning go |
-| a tracked include read by the `maintenance` child | [95] | **closed** (2026-10-27): the covered child in the same repository re-hashes the tree-side references and refuses a change (section 2) |
+| a tracked include read by the `maintenance` child | [95] [123] | **stays**: same repository, same command (section 2). Joins [44] as an accepted limitation; `trust` names every file the config names in the tree. A re-check by the child was tried and reverted ([124]) |
 | tracked hooks, sh readings | [44] [71] [74] | unchanged |
 | everything else (fingerprint scope, parsers, discovery, options, remotes, FPs) | ~75 | unchanged, untouched |
 
@@ -444,7 +468,7 @@ documented the loss).
 | 2 | conftest two exec paths; claims tests of section 7 | 1 day |
 | 3 | positive controls inverted, legit scenarios, pty test for children, PERF.md | 1 day |
 | 4 | verification at trust (3.7); Debian install script and `.deb` skeleton; VM update and replay | ½–1 day |
-| 5 | removal of the switch, `SWITCH_EXEMPT`, `exempt_from_switch`, `EXEMPT_FORMS`; DESIGN.md "Nested repositories" rewritten; [89] moved from accepted to fixed ([95] closed later, 2026-10-27, by `check_tree_refs`); catalogue entry for this design | ½ day |
+| 5 | removal of the switch, `SWITCH_EXEMPT`, `exempt_from_switch`, `EXEMPT_FORMS`; DESIGN.md "Nested repositories" rewritten; [89] moved from accepted to fixed, [95] warning on includes in the tree; catalogue entry for this design | ½ day |
 
 Step 1 alone leaves gitguard working on an unwrapped machine exactly as
 today; the removal in step 5 is the only step that requires the install.
@@ -458,10 +482,9 @@ today; the removal in step 5 is the only step that requires the install.
    break macOS while the wrap there is fragile.
 2. *Decided 2026-10-27*: no TTL. The marker lives with the process that
    set it (3.2, [104]).
-3. Worktree children (3.3): inherit the main repository's judgment
-   (proposed) or carry their own key and make `worktree add` auto-trust
-   the new worktree as `clone` does? The second is cleaner on paper and
-   adds a third auto-trust path to maintain; the first is today's exposure.
+3. *Decided 2026-10-27*: worktree children inherit the main repository's
+   judgment for their gitdir, and for their tree only what the parent
+   hashed (3.3, [120]); no third auto-trust path.
 4. *Decided*: the `-c diff.ignoreSubmodules=dirty` switch is removed (see 1).
 5. The Rust port: not a condition of this design, but the per-child floor
    is its first concrete justification. Not before the design has settled

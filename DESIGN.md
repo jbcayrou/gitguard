@@ -392,9 +392,10 @@ removed or redirected therefore changes the fingerprint, at any depth. Scope
 
 **Tree files that drive git** (scope `wt`): the root gitfile (linked
 worktree), `.gitmodules`, `.lfsconfig` (git-lfs reads
-`lfs.customtransfer.*.path` from it, a program it runs — [34]), the gitfile of
-each submodule or nested worktree (`Repo.gitfiles`). Tracked or not, a change
-requires a `trust`.
+`lfs.customtransfer.*.path` from it, a program it runs — [34]; each
+submodule's too, read there during `submodule update` — [125]), the gitfile
+of each submodule or nested worktree (`Repo.gitfiles`). Tracked or not, a
+change requires a `trust`.
 
 **Paths referenced by the config** (`config_refs`): `core.hooksPath` (husky,
 lefthook, pre-commit put the hooks in the tree), `include.path`/`includeIf`
@@ -680,16 +681,22 @@ trusted" again: intended, a `mv` by the sandbox must not inherit a trust.
 `clone`/`init` and derives the target directory (2nd positional, or the URL's
 basename without `.git`). After git succeeds, `save_trust` is called
 **unless**:
-- a `.git` already existed in the target before the command (a `git init`
-  "reinitialises" without erasing: it would bless a trapped repository);
-- `--template=`, **or** a template directory from any source git reads
+- a gitdir already existed before the command, at `<target>/.git` or at
+  the `--separate-git-dir` value (a `git init` "reinitialises" without
+  erasing: it would bless a trapped repository; with the second spelling
+  it did, a gitdir the sandbox prepared in the volume and a README naming
+  it, [113]);
+- `--template=<dir>`, **or** a template directory from any source git reads
   (`_template_dir_configured`): `init.templateDir` in the global/system
   config or a file it includes, global `-c`/`--config-env`,
   `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`, `GIT_CONFIG_PARAMETERS`,
   `GIT_TEMPLATE_DIR` ([42]) — it copies hooks from an arbitrary directory the
   sandbox can write. (clone's own `-c` is applied after the template: no
-  effect, verified with git 2.50);
-- `--bare`, `--mirror`, `--separate-git-dir`.
+  effect, verified with git 2.50). An **empty** `--template=` is no
+  template at all, a configured one included (`create_default_files`
+  returns on an empty path): pre-commit creates its caches that way, and
+  refusing it broke its first use inside every `git commit` ([116]);
+- `--bare`, `--mirror`.
 The options are read as git's parse-options reads them (`NEW_REPO_OPTIONS`,
 `_long_option`): any unique prefix of a long option is that option, `--no-`
 forms negate, a short cluster ends at its first letter taking a value.
@@ -697,9 +704,12 @@ forms negate, a short cluster ends at its first letter taking a value.
 trusted with them ([98]); anything that may stand for `--template`, an
 ambiguous prefix included, now counts as it. The table is held to `git
 clone -h` and `git init -h` of the git under test (`tests/test_claims.py`).
-With a template we warn and leave a manual `gitguard trust`; bare, mirror
-and `--separate-git-dir` are silently left alone (a bare repository cannot
-be trusted at all).
+With a template we warn and leave a manual `gitguard trust`; bare and
+mirror are silently left alone (a bare repository cannot be trusted at
+all). A fresh `--separate-git-dir` is trusted with its gitdir where the
+option puts it. A clone or init run by a child git (pre-commit, a hook)
+is the user's: same rules, unless the marker already covers the new
+repository (`submodule add`'s clone into `modules/<x>`, [107]).
 
 ## Exec-mode shortcuts: auto-accept, prompt, pending
 
@@ -900,15 +910,26 @@ report fails, the gitlink is written, the next command is refused
 structurally. A child in the judged repository, or in a gitdir root the
 walk descended (`modules/<x>`, `worktrees/<x>`, `gitdir_roots`), inherits
 the judgment through a marker in the environment (`GITGUARD_JUDGED`: the
-judged gitdir, common dir and root, and the pid of the process that set
-it, valid while that pid is an ancestor — the command's lifetime, not a
-clock [104]): the command's own writes (`submodule add`, `remote add`,
-`push -u`) are for the next command, as always. Covered means hashed: a
-gitdir planted in a volatile zone of a submodule's gitdir is nobody's
-([103]), the same gitdir with another work tree is another repository
-([111]), a served repository covers itself alone ([105]). No route is
-guessed any more: whatever enters, enters through gitguard. `trust`, `retrust` and `list`
-warn when the exec path does not lead to gitguard (`check_wrap`).
+judged gitdir, common dir, root and state key's directory, and the
+process that set it — pid **and start time**, valid while that process is
+an ancestor: the command's lifetime, not a clock [104], and not a pid the
+counter gave to a newcomer [114]): the command's own writes (`submodule
+add`, `remote add`, `push -u`) are for the next command, as always.
+Covered means hashed, and only that: a gitdir planted in a volatile zone of
+a submodule's gitdir is nobody's ([103]); a child at another work tree
+root (a submodule, a linked worktree, `filter-branch`'s `.git-rewrite/t`,
+`--work-tree=<site>`) is covered only when every path its config names in
+its tree (a relative hooksPath, an include, a script: `tree_named`) was
+hashed by the parent, or is the same content at the same place in the
+judged tree — otherwise it is judged on its own ([111] [115] [120]); a
+served repository covers its gitdir and common dir exactly, and nothing
+in a tree ([105] [121] [122]). A child git does not detach either
+(`keep_attached`): a daemonized `maintenance run --detach` left the
+command's process tree and found the marker dead ([117]). No route is
+guessed any more: whatever enters, enters through gitguard. `trust`,
+`retrust` and `list` warn when the exec path does not lead to gitguard or
+is stale (`check_wrap`); `gitguard exec-path` builds one where git's own
+cannot be diverted ([119]).
 
 History, kept because its lessons are the reason for the design above.
 From 2026-10-23 to 2026-10-26 the parent tried to keep git out of the
@@ -942,7 +963,7 @@ marker already covers it (`submodule add`'s clone into `modules/<x>`: the
 parent's next command sees it). A covered child's `push` is judged on its
 destination alone ([108]). The children of a served repository
 (`git-receive-pack`, `git-upload-pack`, `git upload-pack <dir>` through
-`TRANSPORT` and `SERVERS`, whose `index-pack` runs in a bare repository
+`TRANSPORT` and `SERVERS`, `upload-archive--writer <dir>` [118], whose `index-pack` runs in a bare repository
 gitguard does not handle) inherit a marker for that repository, opened as
 enter_repo opens it; the submodule clones and the `index-pack` of a clone
 in progress inherit `new` ([101]). What stays
@@ -982,8 +1003,8 @@ into the tree was not watched.
 
 ## Tests
 
-**`python3 -m pytest`** (~1260 tests, expected failures [44], [71], [74] — accepted limitations;
-~180 s, ~40 s with `-n 8` on the command line),
+**`python3 -m pytest`** (~1300 tests, expected failures [44], [71], [74], [95], [123] — accepted
+limitations; ~280 s, ~60 s with `-n 8` on the command line),
 to run before any change:
 
 - `tests/attacks/` — **the attack corpus**, one module per family (`gitdir`,
@@ -1098,14 +1119,17 @@ Rule: any new vector or false positive discovered must first become a test.
 
 ## Adversarial review playbook
 
-gitguard has been through fourteen adversarial review passes (the numbered
-catalogue in `tests/attacks/__init__.py` is their output: 99 bypasses and
+gitguard has been through sixteen adversarial review passes (the numbered
+catalogue in `tests/attacks/__init__.py` is their output: 125 bypasses and
 false positives, two of them RCEs found after the tool was believed solid,
 [58]–[65] from the tenth and eleventh, replayed and fixed on 2026-10-22;
 [66]–[70], [72], [73], [75], [76] from the twelfth, fixed on 2026-10-23;
 [77]–[83] from the thirteenth, fixed on 2026-10-24; [84], [85] from a
 design review; [86]–[99] from the fourteenth (six agents, 2026-10-24),
-fixed on 2026-10-25 but [89], closed on 2026-10-26 by the exec-path design (DESIGN-exec-path.md), and [95], closed on 2026-10-27 (the child re-hashes the tree-side references);
+fixed on 2026-10-25 but [89], closed on 2026-10-26 by the exec-path design (DESIGN-exec-path.md), and [95], accepted;
+[101]–[112] from the fifteenth and [113]–[124] from the sixteenth, both on
+the exec-path design and fixed on 2026-10-27 but [123], accepted; [125]
+from the review of those fixes, 2026-10-28;
 [44], [71] and [74] are accepted limitations, see "Known limitations"; the ninth pass was the
 promotion of the git-parity `xfail`s [46]–[50]).
 The method that worked, for the next pass — by a human or by agents that know
@@ -1205,22 +1229,24 @@ The rule for a new member of the class: if the reading is done by a
 **child git in another repository**, nothing to do — the child is gitguard
 and refuses it (Nested repositories, DESIGN-exec-path.md; [66] [77] [86]
 [89] closed this way); if the file is a link, the structure check refuses
-it ([88]); if the reading is done by a **child git in the same
-repository** — an include checked out by `merge`, then read by its
-`maintenance run --auto` ([95]) — the child inherits the judgment but not
-blindly: before running, it re-hashes the tree-side references of the
-manifest (scope `wt`: the files and directories the trusted config names
-inside the work tree) and refuses if they changed (`check_tree_refs`,
-~0.5 ms; only the refs, never a walk of the tree). The cost is a refusal
-of that child when the change is legitimate (a pull bringing a colleague's
-hook): git ignores the exit of its maintenance child, the command
-succeeds, and the next command asks, as it would have anyway. If the
-reading is done by the **command's own process** — a hook checked out and
-run by the same `checkout` ([44]) — no gitguard runs between the write
-and the read: an accepted limitation with a `trust`-time warning, and the
-prevention layer is the answer (a global `core.hooksPath` outside every tree,
-`safe.bareRepository=explicit`, a mount the sandbox cannot write `.git/`
-on). Finding the next member is a reading of a command's flow in git's
+it ([88]); if the reading is done in the **same repository, in the same
+command** — a hook checked out and run ([44]), an include checked out and
+read by the `maintenance` child, which inherits the judgment ([95] [123])
+— it is an accepted limitation with a `trust`-time warning (every file the
+config names in the tree), and the prevention layer is the answer (a
+global `core.hooksPath` outside every tree, `safe.bareRepository=explicit`,
+a mount the sandbox cannot write `.git/` on).
+
+Ruled out for that last case, after trying it ([124]): a covered child in
+the judged repository re-hashing the tree-side references and refusing a
+change. The `maintenance` child is not the only git a command starts after
+its checkout, and git ignores the failure of that one alone: the
+autostash's `stash apply` and `stash store`, the sequencer's `commit`,
+`rebase --exec`'s commands, `submodule add`'s `git add`, `pull`'s `submodule
+update`, bisect's steps all ran there and failed — the uncommitted work of
+an autostash vanished with rc 0 on any merge bringing a colleague's hook
+change. A child refusing what its own command just wrote contradicts the
+rule above it: the command's writes are judged at the next command. Finding the next member is a reading of a command's flow in git's
 source (`builtin/<cmd>.c`: what it writes under the gitdir or the tree,
 what it reads after, in which process), not a grep: the inventory lists
 the files, not the order.
@@ -1276,7 +1302,9 @@ the files, not the order.
   or leaves it for the next `pull` — objects and refs are volatile. The
   files on disk and the config are still the trusted ones when gitguard
   checks; `git checkout`/`merge`/`pull`/`reset --hard` of that commit
-  writes the new hook, then runs it, in the same command. Its general form,
+  writes the new hook, then runs it, in the same command; `git worktree
+  add ../wt <branch>` too, its `reset --hard` child starting on an empty
+  tree. Its general form,
   the gitlink brought by the command ([66]), is entered through a child
   git, which is gitguard and refuses; a tracked hook is run by the parent
   itself: git runs the file as checked out. Ruled out: forcing git onto the trusted copy (`-c
@@ -1288,7 +1316,7 @@ the files, not the order.
   versioned hooks are the user's decision to execute what the repository
   contains, the same boundary as `make` or `npm install` after a pull;
   gitguard guards `.git`, not that choice. Mitigations in place: `gitguard
-  trust` warns when a hooks directory is in the tree and says to review
+  trust` names every file the config names in the tree and says to review
   incoming changes to those files; the prevention layer is a global
   `core.hooksPath` outside every tree (CLAUDE.md), which git's local config
   can still override — a trusted repository's `.git/config` naming
@@ -1326,13 +1354,15 @@ the files, not the order.
   in the judged repository skips its check, one typed in another refuses
   without asking (the record is in `gitguard pending`). One repository, a
   process the user started by hand: documented, not closed ([104]).
-- [95], the [44] boundary for config, is closed only where a child git
-  reads the file (the `maintenance` of a `merge`): a tracked file the
-  trusted config names, checked out and then read by the command's own
-  process, is [44]. A legitimate change to such a file makes that child
-  refuse during the command (noise on stderr, the command succeeds); the
-  next command asks. Submodule children are not re-checked this way: their
-  own tree-side references are judged at the next command in them.
+- **Accepted [95]**, the [44] boundary for config: a tracked `.gitconfig`
+  the trusted `.git/config` includes (`include.path = ../.gitconfig`). The
+  sandbox commits a new version and moves a branch; `git merge` checks it
+  out, then its `git maintenance run --auto` reads it. [123]: the same
+  with an include absent at trust (an optional local config), which
+  nothing watches until it exists. `trust` names every file the config
+  names in the tree. A re-check by the child was tried and reverted ([124],
+  "The command that writes what it then reads"). xfail record:
+  `test_merge_checks_out_a_tracked_include_then_reads_it`.
 - `git --work-tree=<other> …` changes the set of hooks git runs, so the
   fingerprint differs from the repository's own tree ([72]): the tree is
   blessed with `GIT_WORK_TREE=<other> gitguard trust` (same state key),

@@ -548,16 +548,14 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      link's), gitguard against the target's. The sandbox writes the file
      git reads, gitguard watches another. Fix: included files are queued as
      opened.
-[95] variant of [44] for config: a tracked `.gitconfig` the trusted
+[95] OPEN — variant of [44] for config: a tracked `.gitconfig` the trusted
      `.git/config` includes (`include.path = ../.gitconfig`). The sandbox
      writes objects and a ref only; `git merge` checks the new file out,
      then spawns `git maintenance run --auto`, which reads it and starts
-     its `pager.maintenance` on the user's terminal. Fix (2026-10-27): the
-     child is gitguard (exec-path design); covered, in the judged
-     repository itself, it re-hashes the tree-side references (scope `wt`)
-     against the manifest and refuses (`check_tree_refs`). Closes the
-     reading by a child git only; a reading by the command's own process
-     stays [44].
+     its `pager.maintenance` on the user's terminal. Accepted (2026-10-27),
+     like [44]: same repository, same command; `trust` names every file the
+     config names in the tree. A re-check by the covered child was tried
+     and reverted: [124]. Variant [123].
 [96] a path glued to a short option (`core.sshCommand = ssh
      -F./deploy/ssh_config`) is one token starting with `-`, dropped;
      ssh reads the file, a ProxyCommand planted there runs on `git fetch`.
@@ -581,7 +579,7 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      adversarial review (six agents, 2026-10-24), replayed against git 2.50
      and 2.54; replayed against 2.47.3 (Debian VM) on 2026-10-26. All fixed
      on 2026-10-25 but [89] (closed on 2026-10-26, exec-path design) and
-     [95] (closed on 2026-10-27, the child re-hashes the tree-side refs).
+     [95] (accepted on 2026-10-27).
 [100] False positives from the inventory of git's source (tests/inventory.py,
      2026-10-26): every name git opens under a gitdir, held to gitguard's
      tables by test_claims.py. Four edit buffers at the gitdir root were
@@ -667,6 +665,97 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      repository ([102]).
 [112] `GITGUARD_REAL_GIT` naming gitguard itself (`<exec-path>/git` after
      the diversion) exec'd gitguard for ever. Fix: refused.
+     [101]–[112] found by the fifteenth adversarial pass (five agents,
+     2026-10-26), fixed on 2026-10-27.
+[113] `init --separate-git-dir=<X>` with X a gitdir the sandbox prepared:
+     git reinitialises X and keeps its hooks and config; gitguard looked for
+     an existing repository at `<dir>/.git` only and auto-trusted X, whose
+     planted pre-commit then ran. Fix: an existing `--separate-git-dir`
+     target is pre-existing (no auto-trust).
+[114] A stale marker revived by pid reuse: a long-lived process left by
+     the editor of `git commit` (an Emacs daemon, `code --wait`, a tmux
+     server) keeps GITGUARD_JUDGED; once the pid counter wraps to the
+     marker's pid, a git it starts (or a process in between) counts the
+     marker as an ancestor's, and inherits the old judgment of a repository
+     planted since. Fix: the marker names the pid and its start time; the
+     reading process is not its own ancestor.
+[115] False positive: `filter-branch` always failed. Its gits run with
+     `GIT_DIR=<repo>/.git` from `.git-rewrite/t`, and [111]'s rule judged
+     any other root as another repository, never trusted. Fix: [120]'s
+     rule — another root is covered when nothing the config names lies in
+     its tree.
+[116] False positive: pre-commit's first use died inside `git commit`. It
+     creates its caches with `init --template=`; gitguard read the empty
+     value as a template and withheld auto-trust, and the next `remote add`
+     was refused. An empty `--template=` copies no template at all, a
+     configured one included. Fix: auto-trusted.
+[117] False positive: git ≥ 2.47 runs `maintenance run --auto --detach`,
+     which daemonizes; its gc, repack, prune left the command's process
+     tree, found the marker dead and judged as the user's commands: in a
+     submodule (never trusted under its own key) gc was refused at every
+     fetch, recorded, notified; in the judged repository after a hashed
+     change, it waited GITGUARD_WAIT. Fix: a child git does not detach
+     (`--no-detach`, `gc.autoDetach=false`); the auto-gc runs before the
+     command returns.
+[118] False positive: `upload-archive--writer <dir>` (started by
+     `upload-archive`, which sshd runs from `~`) was judged against its cwd:
+     every `archive --remote` failed where `~` is an untrusted repository.
+     Fix: a server like the others ([106]).
+[119] macOS install: the README's shim recipe had no `git.real` (a GUI
+     app's PATH has only Apple's git, which then ran as the real one), a
+     shim left stale by `brew upgrade` went unnoticed (`'submodule' is not a
+     git command`), and the unwrapped warning printed a Debian command.
+     Fix: `gitguard exec-path [<dir>]` builds the shim; `trust` reports a
+     stale one; the hint fits the platform.
+[120] A child at another root inherited what the parent never hashed:
+     `worktree remove ../wt` runs `git status` in the linked worktree, whose
+     gitdir the parent hashed but whose tree it did not; with husky's
+     layout (`core.hooksPath = .husky/_`, ignored) the sandbox's
+     `post-index-change` there ran, then the worktree was deleted, evidence
+     included. Pre-existing (master's children are raw). Fix: a child whose
+     root is not the judged one is covered only when every path its config
+     names in its tree was hashed by the parent, or is the same content at
+     the same place in the judged tree; otherwise judged. Values of global
+     origin are read there as the parent reads them against a submodule's
+     tree: explicit relative paths only ([92]). Not closed with it, a [44]
+     member: `worktree add ../wt <sandbox's branch>` — its `reset --hard`
+     child starts on an empty tree, then checks the branch's hooks out and
+     runs `post-index-change` itself.
+[121] The served repository's marker covered every gitdir root under it,
+     which nobody hashed: a linked worktree planted in a non-bare remote
+     with `receive.denyCurrentBranch = updateInstead` (its own gitdir root,
+     or a commondir naming a root planted under `modules/`) ran its
+     core.fsmonitor during an ordinary push. [105]'s fix held only for a
+     common dir outside the remote. Pre-existing. Fix: the served gitdir
+     and common dir, exactly.
+[122] Push-to-deploy children (`update-index`, `read-tree`) run in the
+     remote's work tree; the served marker has no root and covered them
+     whatever their tree: a relative `core.hooksPath` of the remote ran a
+     hook the sandbox wrote there. Pre-existing. Fix: [120]'s rule, with
+     nothing hashed — the child is judged under the remote's own key.
+[123] [95] with a file absent at trust: an include (or a hooks directory)
+     the trusted config names but that does not exist is not watched
+     (ConfigScan.add records what exists); the command checks it out and
+     its child reads it. Accepted with [95]; the next command sees it.
+[124] False positives of a re-check tried for [95] (a covered child in the
+     judged repository re-hashed the tree-side references and refused a
+     change): autostash (`rebase`/`merge`/`pull`) across an incoming hook
+     change lost the uncommitted work, rc 0; `bisect run` gave wrong
+     verdicts; `submodule add` of a second submodule, `pull
+     --recurse-submodules`, `rebase --exec`, `revert`, `stash -k` stopped
+     half-way. git does not ignore those children's failure. Reverted;
+     the legit tests stay.
+     [113]–[124] found by the sixteenth adversarial pass (four agents,
+     2026-10-27).
+[125] False positive, and a gap: a submodule holding a `.lfsconfig`. Its
+     child gits name it in their tree (git-lfs reads it where it runs, the
+     submodule during `submodule update`'s smudge), the parent watched the
+     root's only: every `git status` of the superproject died "never
+     trusted" in the submodule ([120]'s rule), and on master, where the
+     child was raw, a `lfs.customtransfer.*.path` the sandbox wrote there
+     ran unwatched. Fix: the parent watches each submodule's `.lfsconfig`
+     as it does its config ([39]). Found reviewing the diffs of
+     [113]–[124], 2026-10-28.
 """
 from __future__ import annotations
 

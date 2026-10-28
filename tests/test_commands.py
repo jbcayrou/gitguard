@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.attacks._helpers import make_source
+from tests.attacks._helpers import commit, make_source
 from tests.conftest import GG, REAL_GIT, write_exec
 
 
@@ -930,8 +930,22 @@ def test_trust_warns_hooks_in_tree(gg: GG, repo: Path) -> None:
     write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
     gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
     r = gg.run("trust", cwd=repo)
-    assert r.rc == 0 and "hooks in the work tree (.githooks)" in r.err, r.text
-    assert "hooks in the work tree" not in gg.run("trust", cwd=gg_plain(gg, repo)).err
+    assert r.rc == 0 and "names in the work tree (.githooks)" in r.err, r.text
+    assert "in the work tree" not in gg.run("trust", cwd=gg_plain(gg, repo)).err
+
+
+def test_trust_warns_include_in_tree_not_submodule_files(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[95] accepted limitation made visible: an include in the tree is
+    named; `.gitmodules` and a submodule's gitfile, the tree's own
+    structure, are not."""
+    from tests.attacks._helpers import add_submodule
+    add_submodule(gg, repo, tmp_path)
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0 and "in the work tree" not in r.err, r.text
+    (repo / ".gitconfig").write_text("[alias]\n\tst = status\n")
+    gg.git("config", "include.path", "../.gitconfig", cwd=repo)
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0 and "names in the work tree (.gitconfig)" in r.err, r.text
 
 
 def gg_plain(gg: GG, repo: Path) -> Path:
@@ -1442,8 +1456,7 @@ def test_work_tree_alone_to_a_missing_directory_is_refused(gg: GG, repo: Path, t
 # [90]–[94] [96]); their controls are here, calling the attack function
 # itself (its payload touches tmp_path/RAN). [89] closed by the exec-path
 # design (the `git diff` in the planted repository is a child, gitguard);
-# [95] closed by the child in the same repository re-hashing the tree-side
-# references (`check_tree_refs`).
+# [95] [123] accepted: same repository, same command (DESIGN.md, Known limitations).
 from tests.attacks import config_scope as _cs, nested as _nested, symlinks as _links  # noqa: E402
 from tests.attacks._helpers import git_has  # noqa: E402
 from tests.conftest import GITGUARD  # noqa: E402
@@ -1648,15 +1661,16 @@ def _on_tty(argv: list[str], env: dict, cwd: Path) -> bytes:
     return out
 
 
-def _tracked_include_branch(gg: GG, tmp_path: Path, mark: Path) -> Path:
+def _tracked_include_branch(gg: GG, tmp_path: Path, mark: Path, absent: bool = False) -> Path:
     """[95] The user: a tracked project config `.gitconfig`, included from
     `.git/config` (`include.path = ../.gitconfig`), trusted. The sandbox:
     objects and a ref only — a branch `agent` whose `.gitconfig` sets
-    `pager.maintenance`."""
+    `pager.maintenance`. [123] `absent`: the include names a file that does
+    not exist at trust (an optional local config), which nothing watches."""
     r = tmp_path / "r"
     gg.git("init", "-q", str(r))
-    (r / ".gitconfig").write_text("[alias]\n\tst = status\n")
-    gg.git("add", ".gitconfig", cwd=r)
+    (r / ("README" if absent else ".gitconfig")).write_text("[alias]\n\tst = status\n")
+    gg.git("add", "-A", cwd=r)
     gg.git("commit", "-qm", "init", cwd=r)
     gg.git("config", "include.path", "../.gitconfig", cwd=r)
     gg.trust(r)
@@ -1670,25 +1684,30 @@ def _tracked_include_branch(gg: GG, tmp_path: Path, mark: Path) -> Path:
     return r
 
 
-def test_merge_checks_out_a_tracked_include_then_reads_it(gg: GG, tmp_path: Path) -> None:
+@pytest.mark.parametrize("absent", [False, True])
+@pytest.mark.xfail(strict=True, reason="[95] [123] accepted limitation (DESIGN.md, Known limitations)")
+def test_merge_checks_out_a_tracked_include_then_reads_it(gg: GG, tmp_path: Path, absent: bool) -> None:
     """[95] Variant of [44] for config: a tracked file the trusted config
     includes. Nothing in the fingerprint changes (objects, refs); `git merge
     --ff-only agent` checks the new `.gitconfig` out, then spawns `git
     maintenance run --auto`, which reads it and starts its "pager" on the
-    user's terminal. That child is gitguard, covered by the parent's
-    marker: in the judged repository itself it re-hashes the tree-side
-    references (`check_tree_refs`) and refuses the changed include."""
+    user's terminal. With gitguard at the exec path that child is gitguard,
+    but it is the same repository and the same command: it inherits the
+    parent's judgment, by design — a child that re-judged the tree there
+    broke ordinary commands and lost uncommitted work ([124]). `trust`
+    names the file. [123] The same with an include absent at trust."""
     mark = tmp_path / "RAN"
-    r = _tracked_include_branch(gg, tmp_path, mark)
+    r = _tracked_include_branch(gg, tmp_path, mark, absent)
     assert not gg.check(r).blocked
     _on_tty([sys.executable, str(GITGUARD), "git", "merge", "-q", "--ff-only", "agent"], gg.env, r)
     assert not mark.exists(), "pager.maintenance from the sandbox's branch ran during the merge"
 
 
-def test_tracked_include_control_real_git_runs_it(gg: GG, tmp_path: Path) -> None:
-    """[95] positive control: the real git, on a terminal, runs it."""
+@pytest.mark.parametrize("absent", [False, True])
+def test_tracked_include_control_real_git_runs_it(gg: GG, tmp_path: Path, absent: bool) -> None:
+    """[95] [123] positive control: the real git, on a terminal, runs it."""
     mark = tmp_path / "RAN"
-    r = _tracked_include_branch(gg, tmp_path, mark)
+    r = _tracked_include_branch(gg, tmp_path, mark, absent)
     _on_tty(["git", "merge", "-q", "--ff-only", "agent"], gg.raw_env, r)
     assert mark.exists(), "the merge no longer reads the checked-out include: [95] may be moot"
 
@@ -2036,3 +2055,289 @@ def test_real_git_naming_gitguard_is_refused(gg: GG, repo: Path) -> None:
     r = subprocess.run([sys.executable, str(GITGUARD), "git", "status"], cwd=repo, env=env,
                        capture_output=True, text=True, timeout=30)
     assert r.returncode != 0 and "names gitguard itself" in r.stderr, r.stderr
+
+
+def _planted_gitdir(gg: GG, tmp_path: Path, mark: Path) -> Path:
+    """[113] The sandbox: a gitdir in the volume with a planted hook, for a
+    `--separate-git-dir` the project's README names."""
+    g = tmp_path / "ws" / "meta.git"
+    assert gg.git("init", "-q", "--bare", str(g)).rc == 0
+    write_exec(g / "hooks/pre-commit", f"#!/bin/sh\ntouch {mark}\n")
+    return g
+
+
+def _commit_in(gg: GG, proj: Path, guarded: bool) -> None:
+    """A commit in `proj` through gitguard, or with the raw git (control)."""
+    import subprocess
+    (proj / "f").write_text("x\n")
+    for a in (["add", "f"], ["commit", "-qm", "one"]):
+        subprocess.run([sys.executable, str(GITGUARD), "git", *a] if guarded else ["git", *a],
+                       cwd=proj, env=gg.env if guarded else gg.raw_env, capture_output=True)
+
+
+def test_init_separate_git_dir_into_an_existing_gitdir_is_not_trusted(gg: GG, tmp_path: Path) -> None:
+    """[113] `init --separate-git-dir=<X>` with X already a gitdir
+    reinitialises X and keeps its hooks and config; gitguard looked for a
+    pre-existing repository at `<dir>/.git` only, and trusted X."""
+    mark = tmp_path / "RAN"
+    g = _planted_gitdir(gg, tmp_path, mark)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    r = gg.run("git", "init", "-q", f"--separate-git-dir={g}", str(proj), cwd=tmp_path)
+    assert r.rc == 0 and "new repository trusted" not in r.err, r.text
+    _commit_in(gg, proj, True)
+    assert not mark.exists(), "the planted pre-commit of the reinitialised gitdir ran"
+
+
+def test_init_separate_git_dir_control_real_git_runs_it(gg: GG, tmp_path: Path) -> None:
+    """[113] positive control."""
+    mark = tmp_path / "RAN"
+    g = _planted_gitdir(gg, tmp_path, mark)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert gg.git("init", "-q", f"--separate-git-dir={g}", str(proj)).rc == 0
+    _commit_in(gg, proj, False)
+    assert mark.exists(), "git no longer keeps an existing gitdir's hooks on reinit: [113] may be moot"
+
+
+def test_empty_template_is_no_template(gg: GG, tmp_path: Path) -> None:
+    """[116] `init --template=` (pre-commit's cache repositories) copies no
+    template at all, a configured one included: auto-trusted. A real
+    template still withholds it ([42])."""
+    tpl = tmp_path / "tpl"
+    (tpl / "hooks").mkdir(parents=True)
+    gg.git("config", "--global", "init.templateDir", str(tpl))
+    for form in (["--template="], ["--template", ""]):
+        d = tmp_path / f"cache{len(form)}"
+        r = gg.run("git", "init", "-q", *form, str(d), cwd=tmp_path)
+        assert r.rc == 0 and "new repository trusted" in r.err, r.text
+        assert not (d / ".git/hooks").exists(), "git copied a template: [116] reading wrong"
+        assert gg.run("git", "remote", "add", "origin", "file:///x", cwd=d).rc == 0
+    r = gg.run("git", "init", "-q", f"--template={tpl}", str(tmp_path / "t"), cwd=tmp_path)
+    assert r.rc == 0 and "new repository trusted" not in r.err, r.text
+
+
+# --------------------------------- a child at another work tree root [115] [120]–[122]
+def _husky_worktree(gg: GG, tmp_path: Path, mark: Path) -> tuple[Path, Path]:
+    """[120] husky's layout (`core.hooksPath = .husky/_`, the directory
+    ignored), a linked worktree the sandbox works in, both trusted; the
+    sandbox drops `.husky/_/post-index-change` in its worktree (ignored:
+    the tree stays clean) and touches a tracked file."""
+    main, wt = tmp_path / "main", tmp_path / "wt"
+    gg.git("init", "-q", str(main))
+    (main / ".husky/_").mkdir(parents=True)
+    (main / ".husky/_/.gitignore").write_text("*\n")
+    write_exec(main / ".husky/_/pre-commit", "#!/bin/sh\nexit 0\n")
+    (main / "a").write_text("a\n")
+    gg.git("add", "a", cwd=main)
+    gg.git("commit", "-qm", "a", cwd=main)
+    gg.git("config", "core.hooksPath", ".husky/_", cwd=main)
+    gg.git("worktree", "add", "-q", "-b", "agent", str(wt), cwd=main)
+    (wt / ".husky/_").mkdir(parents=True)
+    (wt / ".husky/_/.gitignore").write_text("*\n")
+    write_exec(wt / ".husky/_/pre-commit", "#!/bin/sh\nexit 0\n")
+    gg.trust(main)
+    gg.trust(wt)
+    write_exec(wt / ".husky/_/post-index-change", f"#!/bin/sh\ntouch {mark}\n")
+    import time
+    time.sleep(1.1)           # past the index's timestamp: `status` refreshes the entry, post-index-change fires
+    (wt / "a").touch()
+    return main, wt
+
+
+def test_worktree_remove_judges_the_linked_worktree(gg: GG, tmp_path: Path) -> None:
+    """[120] `worktree remove` runs `git status` in the linked worktree: a
+    child whose gitdir the parent hashed, but whose tree it did not — the
+    hooks a relative `core.hooksPath` names there. Covered, it ran the
+    sandbox's hook, then deleted the worktree, evidence included."""
+    mark = tmp_path / "RAN"
+    main, wt = _husky_worktree(gg, tmp_path, mark)
+    gg.run("git", "worktree", "remove", str(wt), cwd=main)
+    assert not mark.exists(), "the hook planted in the linked worktree ran"
+
+
+def test_worktree_remove_control_real_git_runs_it(gg: GG, tmp_path: Path) -> None:
+    """[120] positive control."""
+    mark = tmp_path / "RAN"
+    main, wt = _husky_worktree(gg, tmp_path, mark)
+    import subprocess
+    subprocess.run(["git", "worktree", "remove", str(wt)], cwd=main, env=gg.raw_env, capture_output=True)
+    assert mark.exists(), "worktree remove no longer refreshes the worktree's index: [120] may be moot"
+
+
+def _deploy_remote(gg: GG, tmp_path: Path) -> tuple[Path, Path]:
+    """A non-bare local remote with `receive.denyCurrentBranch =
+    updateInstead` (push-to-deploy), and the user's clone of it, trusted."""
+    deploy, proj = tmp_path / "deploy", tmp_path / "proj"
+    gg.git("init", "-q", str(deploy))
+    (deploy / "a").write_text("a\n")
+    gg.git("add", "a", cwd=deploy)
+    gg.git("commit", "-qm", "a", cwd=deploy)
+    gg.git("branch", "feature", cwd=deploy)
+    gg.git("config", "receive.denyCurrentBranch", "updateInstead", cwd=deploy)
+    gg.git("clone", "-q", str(deploy), str(proj))
+    gg.trust(proj)
+    (proj / "b").write_text("b\n")
+    gg.git("add", "b", cwd=proj)
+    gg.git("commit", "-qm", "b", cwd=proj)
+    return deploy, proj
+
+
+def _plant_served_worktree(deploy: Path, mark: Path, inside: bool) -> None:
+    """[121] A linked worktree planted in the remote's gitdir, its own gitdir
+    root (or, `inside`, its commondir a root planted under `modules/`),
+    with a core.fsmonitor: push-to-deploy refreshes the index there."""
+    import shutil
+    g = deploy / ".git"
+    pc = g / ("modules/x" if inside else "worktrees/evil")
+    (pc / "refs/heads").mkdir(parents=True)
+    shutil.copytree(g / "objects", pc / "objects")
+    shutil.copy(g / "HEAD", pc / "HEAD")
+    for r in (g / "refs/heads").iterdir():
+        shutil.copy(r, pc / "refs/heads" / r.name)
+    write_exec(deploy.parent / "fsm.sh", f"#!/bin/sh\ntouch {mark}\n")
+    (pc / "config").write_text(f"[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+                               f"\tfsmonitor = {deploy.parent / 'fsm.sh'}\n")
+    w = g / "worktrees/evil"
+    w.mkdir(parents=True, exist_ok=True)
+    (w / "HEAD").write_text("ref: refs/heads/feature\n")
+    if inside:
+        (w / "commondir").write_text("../../modules/x\n")
+    tree = deploy.parent / "evtree"
+    tree.mkdir()
+    (w / "gitdir").write_text(f"{tree}/.git\n")
+    shutil.copy(g / "index", w / "index")
+    (tree / ".git").write_text(f"gitdir: {w}\n")
+    (tree / "a").write_text("a\n")
+
+
+@pytest.mark.parametrize("inside", [False, True])
+def test_served_marker_covers_the_served_gitdir_alone(gg: GG, tmp_path: Path, inside: bool) -> None:
+    """[121] The served repository's marker covered every gitdir root under
+    it; the push hashed none of them (a local push watches the remote's
+    config and hooks, not its `worktrees/` or `modules/`). It covers the
+    served gitdir and common dir, exactly."""
+    mark = tmp_path / "RAN"
+    deploy, proj = _deploy_remote(gg, tmp_path)
+    _plant_served_worktree(deploy, mark, inside)
+    gg.run("git", "push", "-q", "origin", "HEAD:feature", cwd=proj)
+    assert not mark.exists(), "the planted worktree's fsmonitor ran during push-to-deploy"
+
+
+@pytest.mark.parametrize("inside", [False, True])
+def test_served_worktree_control_real_git_runs_it(gg: GG, tmp_path: Path, inside: bool) -> None:
+    """[121] positive control."""
+    import subprocess
+    mark = tmp_path / "RAN"
+    deploy, proj = _deploy_remote(gg, tmp_path)
+    _plant_served_worktree(deploy, mark, inside)
+    subprocess.run(["git", "push", "-q", "origin", "HEAD:feature"], cwd=proj, env=gg.raw_env,
+                   capture_output=True)
+    assert mark.exists(), "push-to-deploy no longer refreshes a linked worktree's index: [121] may be moot"
+
+
+def _deploy_tree_hook(gg: GG, tmp_path: Path, mark: Path) -> Path:
+    """[122] The remote's trusted config names a hooks directory in its tree
+    (`core.hooksPath = .githooks`); the sandbox writes one file there."""
+    deploy, proj = _deploy_remote(gg, tmp_path)
+    (deploy / ".githooks").mkdir()
+    gg.git("config", "core.hooksPath", ".githooks", cwd=deploy)
+    gg.trust(proj)                      # the remote's config is watched by the push
+    write_exec(deploy / ".githooks/post-index-change", f"#!/bin/sh\ntouch {mark}\n")
+    return proj
+
+
+def test_push_to_deploy_children_judge_the_remote_tree(gg: GG, tmp_path: Path) -> None:
+    """[122] push-to-deploy's `update-index`/`read-tree` run in the remote's
+    work tree; the served marker has no root and covered them whatever
+    their tree: they ran a hook from it nobody hashed."""
+    mark = tmp_path / "RAN"
+    proj = _deploy_tree_hook(gg, tmp_path, mark)
+    gg.run("git", "push", "-q", "origin", "main", cwd=proj)
+    assert not mark.exists(), "a hook in the remote's work tree ran during push-to-deploy"
+
+
+def test_push_to_deploy_tree_hook_control_real_git_runs_it(gg: GG, tmp_path: Path) -> None:
+    """[122] positive control."""
+    import subprocess
+    mark = tmp_path / "RAN"
+    proj = _deploy_tree_hook(gg, tmp_path, mark)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=proj, env=gg.raw_env, capture_output=True)
+    assert mark.exists(), "push-to-deploy no longer runs post-index-change: [122] may be moot"
+
+
+def test_child_maintenance_stays_in_the_command(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[117] git ≥ 2.47 runs `maintenance run --auto --detach`, which
+    daemonizes: its gc, repack, prune left the command's process tree, the
+    marker was dead for them, and in a submodule (never trusted under its
+    own key) gc was refused at every fetch, recorded, notified. A child
+    git does not detach: the auto-gc is done before the command returns,
+    nothing is recorded."""
+    from tests.attacks._helpers import add_submodule
+    import subprocess
+    sub = add_submodule(gg, repo, tmp_path)
+    src = tmp_path / "subsrc"
+    objs = tmp_path / "objs"
+    objs.mkdir()
+    for i in range(600):
+        (objs / str(i)).write_text(f"o{i}\n")
+    subprocess.run(["git", "hash-object", "-w", "--stdin-paths"], cwd=sub, env=gg.raw_env, check=True,
+                   input="\n".join(str(objs / str(i)) for i in range(600)), text=True,
+                   capture_output=True)
+    gg.git("config", "gc.auto", "1", cwd=sub)
+    gg.trust(repo)
+    commit(gg, src, "u", "2")
+    loose = lambda: sum(1 for d in (repo / ".git/modules/sub/objects").glob("??") for _ in d.iterdir())
+    before = loose()
+    r = gg.run("git", "-c", "protocol.file.allow=always", "submodule", "update", "--remote", cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+    assert loose() < before, "the submodule's auto-gc did not run within the command"
+    assert not list(gg.state.glob("*.pending")), "a maintenance child was judged as a top-level command"
+
+
+def test_upload_archive_writer_serves_its_argument(gg: GG, tmp_path: Path) -> None:
+    """[118] `upload-archive` (sshd runs it from `~`) starts `git
+    upload-archive--writer <dir>`, which enters `<dir>` itself: a server
+    like the others ([106]). Judged against its cwd, every `archive
+    --remote` failed where `~` is a repository nobody trusted."""
+    import subprocess
+    src, hub, home = tmp_path / "src", tmp_path / "hub.git", tmp_path / "home"
+    gg.git("init", "-q", str(src))
+    commit(gg, src, "a", "a")
+    gg.git("clone", "-q", "--bare", str(src), str(hub))
+    gg.git("init", "-q", str(home))
+    r = subprocess.run([sys.executable, str(GITGUARD), "git", "upload-archive", str(hub)], cwd=home,
+                       env=gg.env, input=b"0012argument HEAD\n0000", capture_output=True)
+    assert r.returncode == 0 and b"never trusted" not in r.stdout + r.stderr, r.stderr
+
+
+def test_exec_path_shim_is_built_and_checked(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[119] `gitguard exec-path <dir>` builds the exec path a macOS install
+    points GIT_EXEC_PATH at: every entry of the real git's exec path,
+    `git` → gitguard, `git.real` → the real binary (a GUI app's PATH has
+    only Apple's git: without it the real git became that one). `trust`
+    says when the directory is stale (an upgrade removed or added
+    entries), and names `gitguard exec-path`, not a Debian command."""
+    import subprocess
+    shim = tmp_path / "shim"
+    env = {k: v for k, v in gg.env.items() if k != "GIT_EXEC_PATH"}
+    r = subprocess.run([sys.executable, str(GITGUARD), "exec-path", str(shim)], env=env,
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and str(shim) in r.stdout, r.stderr
+    assert (shim / "git").resolve() == GITGUARD.resolve()
+    core = Path(subprocess.run([REAL_GIT, "--exec-path"], env=env, capture_output=True,
+                               text=True).stdout.strip())
+    assert (shim / "git.real").resolve() != GITGUARD.resolve() and (shim / "git.real").is_file()
+    assert {p.name for p in core.iterdir()} | {"git.real"} >= {p.name for p in shim.iterdir()}
+    wenv = dict(env, GIT_EXEC_PATH=str(shim))
+    t = subprocess.run([sys.executable, str(GITGUARD), "trust"], cwd=repo, env=wenv, capture_output=True, text=True)
+    assert t.returncode == 0 and "exec path" not in t.stderr, t.stderr
+    victim = next(p for p in shim.iterdir() if p.name not in ("git", "git.real"))
+    victim.unlink()
+    (shim / "git-gone").symlink_to(tmp_path / "nowhere")
+    t = subprocess.run([sys.executable, str(GITGUARD), "trust"], cwd=repo, env=wenv, capture_output=True, text=True)
+    assert "stale" in t.stderr and "gitguard exec-path" in t.stderr, t.stderr
+    t = subprocess.run([sys.executable, str(GITGUARD), "trust"], cwd=repo, env=env, capture_output=True, text=True)
+    assert "does not lead to gitguard" in t.stderr, t.stderr
+    if not Path("/usr/bin/dpkg-divert").exists():
+        assert "dpkg-divert" not in t.stderr and "gitguard exec-path" in t.stderr, t.stderr

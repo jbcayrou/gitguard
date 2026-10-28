@@ -9,7 +9,7 @@ the host runs it. gitguard is detection; `safe.bareRepository=explicit` and
 a global `core.hooksPath` are the prevention layers it assumes.
 
 **`DESIGN.md` is the design record** (threat model, every check and why,
-ruled-out alternatives, the catalogue of 112 bypasses). Read the section named below
+ruled-out alternatives, the catalogue of 125 bypasses). Read the section named below
 before touching the matching code; it is long because every paragraph was
 paid for by a bypass.
 
@@ -44,10 +44,16 @@ paid for by a bypass.
 - **Exclusions are anchored** to a position under a gitdir root, never to a
   bare name (`_child_root`, paths relative to a root in `VOLATILE_*`).
 - **A child inherits only what the parent hashed**: the marker names the
-  judged gitdir, common dir and root, and covers the gitdir roots the walk
-  descends (`gitdir_roots`), never a name or a prefix ([102] [103]); it
-  lives as long as the process that set it (`_ancestors`), never a clock
-  ([104]).
+  judged gitdir, common dir, root and label, and covers the gitdir roots
+  the walk descends (`gitdir_roots`), never a name or a prefix ([102]
+  [103]); at another work tree root, only if what its config names there
+  was hashed ([115] [120]); a served repository, exactly ([121] [122]). It
+  lives as long as the process that set it, pid and start time
+  (`_ancestors`), never a clock ([104] [114]); a child git does not
+  detach (`keep_attached`, [117]).
+- **A child never refuses what its own command just wrote**: those
+  writes are judged at the next command ([124]: a re-check lost
+  autostashed work).
 - **A directory is watched only for keys git reads it from** (`DIR_KEYS`);
   one that contains the repository, at depth 1 only;
   a file is not watched for keys git reads as data (`DATA_KEYS`).
@@ -67,6 +73,7 @@ gitguard git <args>      check, then exec the real git (symlink `git → gitguar
                          tracking auto-accepted; other changes: diff + [y/N] on /dev/tty
 gitguard list | forget <repo>… | --missing | prune | retrust
 gitguard pending [<repo>… | -a | -c <repo>…]   decisions of terminal-less gits
+gitguard exec-path [<dir>]   (re)build an exec path whose git is gitguard (macOS)
 ```
 
 Environment: `GITGUARD_STATE`, `GITGUARD_REAL_GIT`, `GITGUARD_ALLOW_REBASE_EXEC`,
@@ -90,14 +97,14 @@ are honoured as git honours them.
 | state files, keys, locking | `save_trust`, `load_manifest`, `update_pending` | Storage |
 | exec mode: options, clone/init, prompt, pending | `split_global_options`, `parse_new_repo`, `check_or_die`, `ask_on_tty`, `wait_for_decision` | Auto-trust; Exec-mode shortcuts |
 | passthroughs that read no repository | `TRANSPORT`, `main` | Which git runs |
-| child gits: the marker (pid + judged gitdir/common/root), coverage by `gitdir_roots`, `new`, the served repository, the exec-path wrap and its check | `Judged`, `_ancestors`, `read_judged`, `set_judged`, `NewRepo`, `_served_repository`, `check_wrap`, `PATH_QUERIES`, `run_git` | Nested repositories; DESIGN-exec-path.md |
+| child gits: the marker (pid + start + judged gitdir/common/root/label), coverage by `gitdir_roots` and `tree_named`, `new`, the served repository, no detach, the exec-path wrap, its check and its macOS shim | `Judged`, `_ancestors`, `_proc_lineage`, `read_judged`, `set_judged`, `NewRepo`, `_served_repository`, `keep_attached`, `check_wrap`, `cmd_exec_path`, `PATH_QUERIES`, `run_git` | Nested repositories; DESIGN-exec-path.md |
 | performance | PERF.md | Nested repositories (end) |
-| what git writes then reads in one command ([44] [66] [77] [86] [88] [95]) | `Judged.covers`, `check_tree_refs`, `_hard_link` | The command that writes what it then reads |
+| what git writes then reads in one command ([44] [66] [77] [86] [88] [95] [123] [124]) | `Judged.covers`, `_hard_link` | The command that writes what it then reads |
 | accepted limitations [44], [71], [74], out-of-scope cases | — | Known limitations |
 
 ## Tests
 
-`python3 -m pytest` (~1200 tests, expected failures: [44], [71], [74], the accepted limitations; ~180 s), before
+`python3 -m pytest` (~1300 tests, expected failures: [44], [71], [74], [95], [123], the accepted limitations; ~280 s), before
 any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
 && venv/bin/pip install pytest`.
 

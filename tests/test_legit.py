@@ -6,14 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.attacks._helpers import add_submodule, make_source
+from tests.attacks._helpers import add_submodule, commit, make_source
 from tests.conftest import GG, write_exec
-
-
-def commit(gg: GG, repo: Path, name: str = "f", content: str = "b") -> None:
-    (repo / name).write_text(content + "\n")
-    assert gg.git("add", name, cwd=repo).rc == 0
-    assert gg.git("commit", "-qm", f"c-{name}-{content}", cwd=repo).rc == 0
 
 
 def test_no_repo_passes(gg: GG, tmp_path: Path) -> None:
@@ -141,13 +135,10 @@ def test_hookspath_ordinary_commits(gg: GG, repo: Path) -> None:
     assert not gg.check(repo).blocked
 
 
-def test_merge_bringing_a_tracked_hook_change_succeeds(gg: GG, repo: Path) -> None:
-    """[95] The cost of closing it: a merge that brings a legitimate change
-    to a tracked hook the trusted config names (`core.hooksPath =
-    .githooks`). The merge's `maintenance run --auto` child sees the hook
-    changed since the check and refuses; git ignores that child's exit, the
-    merge succeeds, and the next command asks about the hook, as it did
-    before the child checked anything."""
+def _tracked_hooks_upstream(gg: GG, repo: Path) -> None:
+    """A tracked hooks directory the trusted config names (`core.hooksPath
+    = .githooks`), and a branch `up` whose last commit changes the hook (a
+    colleague's lint), forked from where the user stays. Trusted there."""
     hooks = repo / ".githooks"
     hooks.mkdir()
     (hooks / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
@@ -155,17 +146,142 @@ def test_merge_bringing_a_tracked_hook_change_succeeds(gg: GG, repo: Path) -> No
     gg.git("add", ".githooks", cwd=repo)
     gg.git("commit", "-qm", "hooks", cwd=repo)
     gg.git("checkout", "-qb", "up", cwd=repo)
+    commit(gg, repo, "g", "1")
     (hooks / "pre-commit").write_text("#!/bin/sh\n# a colleague's lint\nexit 0\n")
     gg.git("commit", "-qam", "lint", cwd=repo)
+    commit(gg, repo, "g", "2")
     gg.git("checkout", "-q", "-", cwd=repo)
     gg.trust(repo)
-    r = gg.run("git", "merge", "-q", "--ff-only", "up", cwd=repo)
-    assert r.rc == 0, r.text
-    assert "colleague" in (hooks / "pre-commit").read_text()
+
+
+@pytest.mark.parametrize("cmd", [["merge", "--no-edit", "--autostash", "up"],
+                                 ["rebase", "--autostash", "up"]])
+def test_autostash_across_a_tracked_hook_change_keeps_the_work(gg: GG, repo: Path,
+                                                              cmd: list[str]) -> None:
+    """[124] The command checks out a commit that changes a file the trusted
+    config names in the tree, then applies the autostash through child gits
+    (`stash apply`, `stash store` when it fails) in the same repository. A
+    child that re-judged the tree there refused both: the uncommitted work
+    vanished, rc 0. The change is judged at the next command."""
+    _tracked_hooks_upstream(gg, repo)
+    (repo / "f").write_text("my uncommitted work\n")
+    r = gg.run("git", "-c", "core.editor=true", *cmd, cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+    assert (repo / "f").read_text() == "my uncommitted work\n"
+    assert "colleague" in (repo / ".githooks/pre-commit").read_text()
     c = gg.check(repo)
     assert c.blocked and "pre-commit" in c.err, c.text
+
+
+def test_rebase_exec_and_bisect_run_across_a_tracked_hook_change(gg: GG, repo: Path) -> None:
+    """[124] `rebase --exec` and `bisect run` run the user's command, which
+    runs git, after each checkout; some checkouts change the tracked hook.
+    Every one of those gits is in the judged repository: none refuses."""
+    _tracked_hooks_upstream(gg, repo)
+    gg.git("checkout", "-qb", "topic", cwd=repo)
+    commit(gg, repo, "t", "1")
     gg.trust(repo)
-    assert not gg.check(repo).blocked
+    r = gg.run("git", "rebase", "-q", "--exec", "git log -1 --format=%s", "up", cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+    gg.git("checkout", "-q", "up", cwd=repo)
+    gg.trust(repo)
+    first = gg.git("rev-list", "--max-parents=0", "HEAD", cwd=repo).out.strip()
+    assert gg.run("git", "bisect", "start", "HEAD", first, cwd=repo).rc == 0
+    gg.trust(repo)            # the midpoint's hook: the prompt of the next command, as on master
+    script = "test \"$(git show HEAD:g 2>/dev/null)\" != 2"     # bad from the last commit on
+    r = gg.run("git", "bisect", "run", "sh", "-c", script, cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+    bad = gg.git("rev-parse", "refs/bisect/bad", cwd=repo).out.strip()
+    assert bad == gg.git("rev-parse", "up", cwd=repo).out.strip()
+
+
+def test_second_submodule_add(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[124] `submodule add` rewrites `.gitmodules` (a tree-side reference of
+    the trusted config once a submodule exists), then stages it through a
+    child `git add` in the same repository: that child does not refuse."""
+    add_submodule(gg, repo, tmp_path)
+    gg.trust(repo)
+    src = make_source(gg, tmp_path)
+    r = gg.run("git", "submodule", "add", "-q", str(src), "lib2", cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+    assert gg.git("diff", "--cached", "--quiet", "--", ".gitmodules", cwd=repo).rc == 1
+
+
+@pytest.mark.parametrize("filt", [["--msg-filter", "sed s/c/C/"],
+                                  ["--index-filter", "git rm -q --cached --ignore-unmatch g"],
+                                  ["--tree-filter", "echo x >> f"]])
+def test_filter_branch(gg: GG, repo: Path, filt: list[str]) -> None:
+    """[115] filter-branch runs its gits with `GIT_DIR=<repo>/.git` from
+    `.git-rewrite/t`: the judged gitdir with another work tree. Nothing the
+    config names lives in a tree here: covered, as before [111]."""
+    gg.env["FILTER_BRANCH_SQUELCH_WARNING"] = "1"
+    commit(gg, repo, "g", "1")
+    commit(gg, repo, "f", "2")
+    gg.trust(repo)
+    r = gg.run("git", "filter-branch", "-f", *filt, "--", "HEAD~2..HEAD", cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+    assert "nothing pending" in gg.run("pending", cwd=repo).out
+
+
+def test_worktree_add_with_tracked_hooks(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[120] A linked worktree of a branch whose tracked hooks are the
+    trusted ones: the content the parent hashed, at the same place in the
+    other tree. `worktree add`'s `reset --hard` there is covered."""
+    write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    gg.git("add", ".githooks", cwd=repo)
+    gg.git("commit", "-qm", "hooks", cwd=repo)
+    gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
+    gg.trust(repo)
+    wt = tmp_path / "wt"
+    r = gg.run("git", "worktree", "add", "-q", "-b", "x", str(wt), cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+    assert (wt / ".githooks/pre-commit").is_file()
+
+
+def test_submodule_with_lfsconfig(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[125] A submodule holding a `.lfsconfig`: its child gits name it in
+    their tree (git-lfs reads it there), and the parent hashes it as it
+    does the submodule's config. Watched at the root only, every `git
+    status` of the superproject died "never trusted" in the submodule."""
+    sub = add_submodule(gg, repo, tmp_path)
+    (sub / ".lfsconfig").write_text("[lfs]\n\turl = https://example.invalid/lfs\n")
+    gg.git("add", ".lfsconfig", cwd=sub)
+    gg.git("commit", "-qm", "lfs", cwd=sub)
+    gg.trust(repo)
+    r = gg.run("git", "status", "--short", cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+    r = gg.run("git", "-c", "protocol.file.allow=always", "submodule", "update", "--remote", cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+    (sub / ".lfsconfig").write_text("[lfs \"customtransfer.x\"]\n\tpath = /tmp/x\n")
+    c = gg.check(repo)
+    assert c.blocked and "sub/.lfsconfig" in c.err, c.text
+
+
+def test_nested_submodule_children(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[125] A submodule's submodule: `.gitmodules` and the gitfile of the
+    inner one are the tree's structure, named by nobody; its children are
+    covered."""
+    sub = add_submodule(gg, repo, tmp_path)
+    add_submodule(gg, sub, tmp_path / "i", name="inner")
+    gg.git("commit", "-qam", "sub", cwd=repo)
+    gg.trust(repo)
+    r = gg.run("git", "status", "--short", cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+    r = gg.run("git", "submodule", "foreach", "--recursive", "git status --short", cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err, r.text
+
+
+def test_submodule_with_relative_hookspath(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[120] A submodule whose own config names hooks in its tree: the
+    parent's scan resolves that config against the submodule's tree and
+    hashes them ([39]); its children are covered."""
+    sub = add_submodule(gg, repo, tmp_path)
+    write_exec(sub / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    gg.git("config", "core.hooksPath", ".githooks", cwd=sub)
+    gg.trust(repo)
+    (sub / "s").write_text("changed\n")
+    r = gg.run("git", "status", "--short", cwd=repo)
+    assert r.rc == 0 and "✗" not in r.err and "sub" in r.out, r.text
 
 
 def test_hookspath_system_readonly_ignored(gg: GG, repo: Path) -> None:

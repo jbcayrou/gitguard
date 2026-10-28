@@ -90,12 +90,12 @@ def test_catalogue_cross_references() -> None:
     import re
     root = Path(__file__).resolve().parent.parent
     catalogue_file = root / "tests/attacks/__init__.py"
-    catalogue = {int(n) for n in re.findall(r"^\s*\[(\d+)\]", catalogue_file.read_text(), re.M)}
+    catalogue = {int(n) for n in re.findall(r"^\s*\[(\d+)\]", catalogue_file.read_text(encoding="utf-8"), re.M)}
     assert catalogue, "no catalogue entry found"
     cite = re.compile(r"(?<![\w)\]])\[(\d+)\]")
 
     def cited(p: Path) -> set[int]:
-        return {int(n) for n in cite.findall(p.read_text()) if int(n) > 0}   # `[0]`: a list
+        return {int(n) for n in cite.findall(p.read_text(encoding="utf-8")) if int(n) > 0}   # `[0]`: a list
 
     code = cited(root / "gitguard.py")
     tests: set[int] = set()

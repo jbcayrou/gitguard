@@ -253,23 +253,36 @@ def _hex(p: str) -> str:
     return os.fsencode(p).hex()
 
 
+def _as_parent(monkeypatch) -> None:
+    """set_judged in this process as the parent gitguard would: the marker
+    names an ancestor (pytest's parent), never the reading process."""
+    real = gg_mod.set_judged
+    monkeypatch.setattr(gg_mod, "set_judged", lambda kind, *paths: real(kind, *paths, pid=os.getppid()))
+
+
 def test_judged_marker_round_trip(monkeypatch) -> None:
     monkeypatch.delenv("GITGUARD_JUDGED", raising=False)
+    _as_parent(monkeypatch)
     assert gg_mod.read_judged() is None
-    gg_mod.set_judged("repo", "/g/.git", "/g/.git", "/g")
+    gg_mod.set_judged("repo", "/g/.git", "/g/.git", "/g", "/g")
     j = gg_mod.read_judged()
-    assert j.kind == "repo" and j.paths == ["/g/.git", "/g/.git", "/g"] and j.pid == os.getpid() and j.alive
-    gg_mod.set_judged("repo", "/srv/x.git", "/srv/x.git", "")          # served: no tree
-    assert gg_mod.read_judged().paths == ["/srv/x.git", "/srv/x.git", ""]
+    assert j.kind == "repo" and j.paths == ["/g/.git", "/g/.git", "/g", "/g"] and j.pid == os.getppid() and j.alive
+    gg_mod.set_judged("repo", "/srv/x.git", "/srv/x.git", "", "")      # served: no tree, no state
+    assert gg_mod.read_judged().paths == ["/srv/x.git", "/srv/x.git", "", ""]
     gg_mod.set_judged("new", "/p=a:th,\N{EURO SIGN}", "/else/where")   # anything but NUL
     j = gg_mod.read_judged()
     assert j.kind == "new" and j.paths == ["/p=a:th,\N{EURO SIGN}", "/else/where"]
 
 
-@pytest.mark.parametrize("bad", ["", "x", "123", "123:other=1", "123:repo", "123:repo=", "abc:repo=2f",
-                                 f"123:repo={_hex('/a')}", f"123:repo=,{_hex('/a')},{_hex('/a')}",
-                                 f"123:new=", f"123:new={_hex('/a')},{_hex('/b')},{_hex('/c')}",
-                                 "123:repo=zz,zz,zz", "123:serving"])
+@pytest.mark.parametrize("bad", ["", "x", "123", "123.4:other=1", "123.4:repo", "123.4:repo=",
+                                 "abc.4:repo=2f", "123.x:repo=2f",
+                                 f"123:repo={_hex('/a')},{_hex('/a')},{_hex('/a')},{_hex('/a')}",   # no start time
+                                 f"123.4:repo={_hex('/a')},{_hex('/a')},{_hex('/a')}",   # no label
+                                 f"123.4:repo={_hex('/a')},{_hex('/a')},{_hex('/a')},",  # a root without its label
+                                 f"123.4:repo={_hex('/a')},{_hex('/a')},,{_hex('/a')}",  # a label without a root
+                                 f"123.4:repo={_hex('/a')}", f"123.4:repo=,{_hex('/a')},{_hex('/a')}",
+                                 f"123.4:new=", f"123.4:new={_hex('/a')},{_hex('/b')},{_hex('/c')}",
+                                 "123.4:repo=zz,zz,zz", "123.4:serving"])
 def test_judged_marker_malformed_is_refused(monkeypatch, bad: str) -> None:
     monkeypatch.setenv("GITGUARD_JUDGED", bad)
     with pytest.raises(gg_mod.Refuse):
@@ -279,19 +292,29 @@ def test_judged_marker_malformed_is_refused(monkeypatch, bad: str) -> None:
 def test_judged_marker_dies_with_its_process(monkeypatch) -> None:
     """[104] the marker is valid while the process that set it is an
     ancestor: a dead pid, or a live one outside the chain, is no marker —
-    and no TTL: a clock changed the answer mid-command."""
+    and no TTL: a clock changed the answer mid-command. [114] An ancestor
+    is a pid and its start time: a pid reused since (a long-lived process
+    an editor of `git commit` left behind, the counter wrapped) is not the
+    process that judged; nor is the reading process itself."""
     import subprocess
     anc = gg_mod._ancestors()
-    assert os.getpid() in anc and os.getppid() in anc
-    body = f"123:repo={_hex('/a')},{_hex('/a')},{_hex('/a')}"
-    monkeypatch.setenv("GITGUARD_JUDGED", f"{os.getpid()}:" + body.partition(":")[2])
+    ppid = os.getppid()
+    start = gg_mod._proc_lineage(ppid)[1]
+    assert (ppid, start) in anc and all(p != os.getpid() for p, _ in anc)
+    body = f"repo={_hex('/a')},{_hex('/a')},{_hex('/a')},{_hex('/a')}"
+    monkeypatch.setenv("GITGUARD_JUDGED", f"{ppid}.{start}:{body}")
     assert gg_mod.read_judged() is not None
+    monkeypatch.setenv("GITGUARD_JUDGED", f"{ppid}.{start + 1}:{body}")
+    assert gg_mod.read_judged() is None, "the pid of an ancestor, another start time: reused"
+    me = gg_mod._proc_lineage(os.getpid())[1]
+    monkeypatch.setenv("GITGUARD_JUDGED", f"{os.getpid()}.{me}:{body}")
+    assert gg_mod.read_judged() is None, "the reading process is not its own ancestor"
     dead = subprocess.Popen(["true"]); dead.wait()
-    monkeypatch.setenv("GITGUARD_JUDGED", f"{dead.pid}:" + body.partition(":")[2])
+    monkeypatch.setenv("GITGUARD_JUDGED", f"{dead.pid}.0:{body}")
     assert gg_mod.read_judged() is None
     alive = subprocess.Popen(["sleep", "5"])
     try:
-        monkeypatch.setenv("GITGUARD_JUDGED", f"{alive.pid}:" + body.partition(":")[2])
+        monkeypatch.setenv("GITGUARD_JUDGED", f"{alive.pid}.{gg_mod._proc_lineage(alive.pid)[1]}:{body}")
         assert gg_mod.read_judged() is None, "alive but not an ancestor"
     finally:
         alive.kill(); alive.wait()
@@ -324,9 +347,13 @@ def test_judged_covers_what_the_walk_hashed(tmp_path: Path, monkeypatch) -> None
     submodule, a submodule's submodule, a worktree's submodule, whatever
     the gitdir's name; never a gitdir planted in a volatile zone, nor
     `hooks/x`, nor another repository; the same gitdir with another tree
-    is judged."""
+    is covered while its config names nothing in a tree ([115]), judged
+    when it does ([72] [120])."""
     root, g = _layout(tmp_path)
-    gg_mod.set_judged("repo", str(g), str(g), str(root))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    _as_parent(monkeypatch)
+    gg_mod.set_judged("repo", str(g), str(g), str(root), str(root))
     j = gg_mod.read_judged()
     assert j.covers(_repo(root, g))
     assert j.covers(_repo(root / "sub", g / "modules/sub"))
@@ -336,23 +363,31 @@ def test_judged_covers_what_the_walk_hashed(tmp_path: Path, monkeypatch) -> None
     assert not j.covers(_repo(root / "vendor/x", g / "modules/sub/refs/p")), "[103] volatile zone"
     assert not j.covers(_repo(root / "h", g / "hooks/x"))
     assert not j.covers(_repo(tmp_path / "other", tmp_path / "other/.git"))
-    assert not j.covers(_repo(tmp_path / "elsewhere", g)), "same gitdir, another tree [72]"
+    assert j.covers(_repo(tmp_path / "elsewhere", g)), "same gitdir, another tree, nothing named there [115]"
+    (g / "config").write_text("[core]\n\thooksPath = .githooks\n")
+    (tmp_path / "elsewhere/.githooks").mkdir(parents=True)
+    assert not j.covers(_repo(tmp_path / "elsewhere", g)), "same gitdir, hooks in another tree [72]"
+    (g / "config").unlink()
     assert not j.covers(_repo(tmp_path / "wt", g / "worktrees/wt", tmp_path / "planted")), "planted commondir"
     # judged from the worktree (its own key): its submodule is covered, the main's too (common)
-    gg_mod.set_judged("repo", str(g / "worktrees/wt"), str(g), str(tmp_path / "wt"))
+    gg_mod.set_judged("repo", str(g / "worktrees/wt"), str(g), str(tmp_path / "wt"), str(tmp_path / "wt"))
     j = gg_mod.read_judged()
     assert j.covers(_repo(tmp_path / "wt/a", g / "worktrees/wt/modules/a"))
     assert j.covers(_repo(root / "sub", g / "modules/sub"))
     assert not j.covers(_repo(root / "vendor/x", g / "modules/sub/refs/p"))
     # judged from inside the submodule: its own submodule is covered, the superproject is not
-    gg_mod.set_judged("repo", str(g / "modules/sub"), str(g / "modules/sub"), str(root / "sub"))
+    gg_mod.set_judged("repo", str(g / "modules/sub"), str(g / "modules/sub"), str(root / "sub"), str(root / "sub"))
     j = gg_mod.read_judged()
     assert j.covers(_repo(root / "sub/inner", g / "modules/sub/modules/inner"))
     assert not j.covers(_repo(root, g))
-    # served: any tree of the same gitdir, nothing else
-    gg_mod.set_judged("repo", str(g), str(g), "")
+    # served: that gitdir exactly, in a tree where its config names nothing [121] [122]
+    gg_mod.set_judged("repo", str(g), str(g), "", "")
     j = gg_mod.read_judged()
-    assert j.covers(_repo(tmp_path / "whatever", g)) and j.covers(_repo(root / "sub", g / "modules/sub"))
+    assert j.covers(_repo(tmp_path / "whatever", g)) and not j.covers(_repo(root / "sub", g / "modules/sub"))
+    (g / "config").write_text("[core]\n\thooksPath = .githooks\n")
+    (tmp_path / "whatever/.githooks").mkdir(parents=True)
+    assert not j.covers(_repo(tmp_path / "whatever", g)), "served, hooks named in its tree [122]"
+    (g / "config").unlink()
     assert not j.covers(_repo(tmp_path / "other", tmp_path / "other/.git"))
     # a clone in progress: gitdir, common or root under the new path
     gg_mod.set_judged("new", str(tmp_path / "new"), str(tmp_path / "sep"))

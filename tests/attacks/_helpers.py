@@ -7,6 +7,13 @@ from pathlib import Path
 from tests.conftest import GG
 
 
+def commit(gg: GG, repo: Path, name: str = "f", content: str = "b") -> None:
+    """One commit of `name` holding `content`, with the raw git."""
+    (repo / name).write_text(content + "\n")
+    assert gg.git("add", name, cwd=repo).rc == 0
+    assert gg.git("commit", "-qm", f"c-{name}-{content}", cwd=repo).rc == 0
+
+
 def make_source(gg: GG, tmp_path: Path, name: str = "subsrc") -> Path:
     s = tmp_path / name
     if not s.exists():

@@ -253,13 +253,19 @@ def test_prune_removes_orphan_records_and_legacy_locks(gg: GG, repo: Path, tmp_p
     assert gg.key_for(repo).is_file() and not gg.check(repo).blocked
 
 
+def _start(pid: int) -> int:
+    """The start time a marker carries for `pid` (DESIGN-exec-path.md 3.2)."""
+    import gitguard
+    return gitguard._proc_lineage(pid)[1]
+
+
 def test_child_git_never_waits(gg: GG, repo: Path) -> None:
     """DESIGN-exec-path.md: a child git (a marker in its environment, here
     for another repository) refuses a changed repository at once — no wait
     for `gitguard pending`, however long GITGUARD_WAIT — and records."""
     gg.git("config", "core.hooksPath", "/nowhere", cwd=repo)
     h = os.fsencode("/elsewhere/.git").hex()
-    env = dict(gg.env, GITGUARD_WAIT="30", GITGUARD_JUDGED=f"{os.getpid()}:repo={h},{h},{os.fsencode('/elsewhere').hex()}")
+    env = dict(gg.env, GITGUARD_WAIT="30", GITGUARD_JUDGED=f"{os.getpid()}.{_start(os.getpid())}:repo={h},{h},{os.fsencode('/elsewhere').hex()},{os.fsencode('/elsewhere').hex()}")
     t0 = time.monotonic()
     r = subprocess.run([sys.executable, str(GITGUARD), "git", "status"], cwd=repo, env=env,
                        capture_output=True, text=True, start_new_session=True)
@@ -277,7 +283,7 @@ def test_dead_marker_is_no_marker(gg: GG, repo: Path) -> None:
     dead.wait()
     h = os.fsencode("/elsewhere/.git").hex()
     env = dict(gg.env, GITGUARD_WAIT="2",
-               GITGUARD_JUDGED=f"{dead.pid}:repo={h},{h},{os.fsencode('/elsewhere').hex()}")
+               GITGUARD_JUDGED=f"{dead.pid}.0:repo={h},{h},{os.fsencode('/elsewhere').hex()},{os.fsencode('/elsewhere').hex()}")
     t0 = time.monotonic()
     r = subprocess.run([sys.executable, str(GITGUARD), "git", "status"], cwd=repo, env=env,
                        capture_output=True, text=True, start_new_session=True)

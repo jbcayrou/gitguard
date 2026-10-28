@@ -157,12 +157,18 @@ sudo dpkg-divert --package gitguard --rename --remove /usr/lib/git-core/git
 On macOS `/usr/bin/git` is protected by SIP and renaming Homebrew's git is
 undone by `brew upgrade`: keep the `PATH` symlink (it covers everything
 started from a login shell, VS Code included), set `git.path` in VS Code,
-and for the exec path give git a directory of your own: copy or link the
-content of `$(git --exec-path)` into `~/.local/lib/git-core`, replace its
-`git` by a symlink to gitguard and relink the dashed builtins to it, then
-export `GIT_EXEC_PATH=~/.local/lib/git-core` in your shell profile (and
-`launchctl setenv GIT_EXEC_PATH …` for GUI apps). Redo it after `brew
-upgrade git`; `gitguard trust` tells you when it is stale.
+and for the exec path let gitguard build a directory of your own:
+
+```sh
+gitguard exec-path                    # ~/.local/lib/gitguard-exec, or give a directory
+export GIT_EXEC_PATH=~/.local/lib/gitguard-exec            # shell profile
+launchctl setenv GIT_EXEC_PATH ~/.local/lib/gitguard-exec  # GUI apps
+```
+
+It links every entry of the real git's exec path, `git` to gitguard and
+`git.real` to the real binary (a GUI app would otherwise run Apple's git
+as the real one). Run it again after `brew upgrade git`; `gitguard trust`
+tells you when it is stale.
 
 ### First trust
 
@@ -183,14 +189,15 @@ gitguard trust
 
 `gitguard list` shows every registered repository and its status. New
 repositories need nothing: a successful `git clone` / `git init` through the
-wrapper is trusted automatically (unless a template directory or
-`--separate-git-dir` is involved, in which case it says so).
+wrapper is trusted automatically (unless a template directory is involved,
+or the target already held a gitdir, in which case it says so).
 
 ## Day to day
 
-Commit, checkout, merge, rebase, stash, bisect, gc, worktree and submodule
-operations touch only volatile files: nothing to do. When a command finds
-the repository changed, one of three things happens.
+Commit, checkout, merge, rebase, stash, bisect and gc touch only volatile
+files: nothing to do. `worktree add`, `submodule add` and `submodule update
+--init` write to the gitdir: the next command asks once. When a command
+finds the repository changed, one of three things happens.
 
 `git --version` is never checked: it reads no repository, and the tools
 that run it first (lazygit, fugitive) took a refusal for an old git.
