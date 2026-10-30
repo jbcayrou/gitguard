@@ -796,6 +796,104 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      planted index and objects, and runs nothing. The warning was also
      moved to the auto-trust of the clone that writes the pathspec, where
      the user is (warn_accepted_limitations).
+[127] Hard link of a hook outside the tree. A trusted hooks
+     directory outside the tree but inside the volume (`core.hooksPath =
+     ../shared-hooks`, local or global — the layout of [16]; scope `ext`):
+     the sandbox hard-links its `commit-msg` to `.git/COMMIT_EDITMSG` and
+     moves HEAD to a commit whose message is a script, as in [88]; `git
+     commit --amend` writes the message into the shared inode and runs it.
+     The refusal of [88] reads st_nlink inside `link_zones` only — the
+     tree, the gitdir, the common dir — and an `ext` entry lies outside
+     all three, though the sandbox can link() it: both names of the link
+     are on its mount. Replayed on git 2.47.3 and 2.50.0, relative,
+     absolute and global forms. Found by the seventeenth adversarial pass,
+     2026-10-30. Fix: the rule carried to the pair of names — an `ext`
+     entry with several names on a gitdir's device has its inode looked
+     for in the gitdirs, volatile zones included (objects/ and lfs/ apart,
+     written by rename), and is refused when found there
+     (check_hard_links_into_gitdir); nothing is walked otherwise.
+[128] `%(prefix)/` in a pathname value. git's interpolate_path
+     (path.c) replaces a leading `%(prefix)/` by its installation prefix
+     (`/usr`, `/opt/homebrew/opt/git`) before it expands `~`, for every
+     git_config_pathname key and for include.path (handle_path_include);
+     _expand2 knows `~` only. A trusted `core.hooksPath = %(prefix)/../
+     <path to the volume>/vol-hooks` was watched as the literal
+     `<root>/%(prefix)/…`, which does not exist, and git ran the hooks of
+     `vol-hooks` unwatched; the same through `include.path`. git keeps
+     `./%(prefix)/x`, `%(prefix)x`, `~/%(prefix)/x` and a bare `%(prefix)`
+     literal; `%(prefix)//x` is `/x` (system_path takes an absolute rest
+     as is). Replayed on git 2.47.3 and 2.50.0. Found by the seventeenth
+     adversarial pass, 2026-10-30. Fix: _expand2 ports interpolate_path's
+     first step for pathname values and include paths (`pathname=True`);
+     the prefix is asked of the real git itself (git_prefix), the one
+     thing gitguard runs git to learn — from `/`, no repository, no
+     user config, no GIT_* variable, no pager — since it is a constant of
+     the binary nothing else knows (`%(prefix)` is not the exec path:
+     /usr vs /usr/lib/git-core); no absolute answer is a refusal.
+[129] False positive: every token of every config value that names
+     a file of the tree is watched, booleans and plain strings included.
+     `git init` writes `core.filemode = true`, `core.bare = false`,
+     `core.repositoryformatversion = 0`; a global config holds
+     `init.defaultBranch = main`, `user.name = t`. A tree file named
+     `true`, `false`, `0`, `main` or `t` (a Go build output, a binary) is
+     watched at trust and refused at the next command once it changes,
+     with no sandbox at all; a `touch` by the sandbox refuses every
+     command. The generic rule is right for a value git hands to a shell
+     or a program ([5] [37] [58] [92]); a value git reads as a boolean or
+     a string names nothing. Noted as "a broader, older rule" by
+     test_boolean_fsmonitor_names_no_path; named as a flaw by the
+     seventeenth adversarial pass, 2026-10-30. Fix, for booleans and
+     numbers: VALUE_KEYS, exactly the `[bool]` and `[int]` sections of
+     the inventory (the keys git's source compares before a
+     git_config_bool / git_config_int), no token on them when the value
+     is one (`_git_maybe_bool`); the former core.fsmonitor case is one of
+     them. Strings (`main`, `t`) stay an accepted limitation: no reader
+     proves them, no curated list without a real case (DESIGN.md, Known
+     limitations; xfail record test_tree_file_named_like_a_string_value_is_silent).
+[130] DoS: a config token longer than NAME_MAX (255 bytes) — a JWT
+     in `http.<url>.extraHeader`, local, global or `-c` — reaches
+     Path.exists in ConfigScan.add, which raises ENAMETOOLONG (Python ≤
+     3.13; 3.14's exists swallows every OSError): `internal error` on
+     every command and on `trust` itself, the repository unrecoverable
+     until the value is removed. A component longer than NAME_MAX cannot
+     be a file git runs. Found by the seventeenth adversarial pass,
+     2026-10-30. Fix: an OSError from the stat in ConfigScan.add means
+     no file git, the same user, could run there — the token is dropped.
+[131] DoS: a gitdir file whose name is not UTF-8
+     (`hooks/pre-commit-\xff`; a Linux filesystem accepts it, APFS does
+     not). The check refuses it as an added file; `trust`, the way out,
+     dies with UnicodeEncodeError in save_trust (`json.dumps(…,
+     ensure_ascii=False)` of a surrogate-escaped name, written through a
+     strict UTF-8 write_text) after showing the diff. `diff`, `list`,
+     `restore` survive. Found by the seventeenth adversarial pass,
+     2026-10-30. Fix: the manifest and the pending record are written
+     `ensure_ascii` (the surrogate becomes `\udcff`, read back as the
+     same str, fsencode gives the byte back); `san` shows a lone
+     surrogate as `?`.
+[132] keep_attached rewrote exactly `--detach`; parse-options takes
+     any unique prefix (`--det`, `--d`) and git detaches on it, the
+     marker's process gone for the children of that maintenance ([117]
+     again). Only a user's own hook or alias passes an abbreviation (git
+     itself passes `--detach`): a hole in the promise, not a sandbox
+     vector; `_long_option` already resolves abbreviations for clone,
+     init and push. Found by the seventeenth adversarial pass,
+     2026-10-30. Fix: the arguments of `maintenance run` are read as
+     parse-options reads them (MAINTENANCE_RUN_OPTIONS, held to `git
+     maintenance run -h`; a value of --task/--schedule and anything after
+     `--` left alone).
+[133] GIT_CONFIG_NOSYSTEM not honoured: git reads no system config
+     under it (git_config_system, a git_env_bool), whatever
+     GIT_CONFIG_SYSTEM names; global_config_files always reads
+     `/etc/gitconfig` and the prefix's. With git-lfs installed
+     system-wide (`filter.lfs.required = true`) and [129], a tree file
+     named `true` was watched where git reads no such value — and the
+     suite's own test_boolean_fsmonitor_names_no_path, run under
+     GIT_CONFIG_NOSYSTEM=1, failed on such a machine (the Debian VM).
+     The superset of global_config_files is about which of the user's
+     files git picks; a file git was told to skip is a divergence. Found
+     by the seventeenth adversarial pass, 2026-10-30. Fix: no system file
+     under GIT_CONFIG_NOSYSTEM, read as git_env_bool reads it (`_env_bool`
+     now a git boolean: `2` is true).
 """
 from __future__ import annotations
 

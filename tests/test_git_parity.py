@@ -206,13 +206,30 @@ def _git_path(tmp_path: Path, value: str, env: dict) -> str | None:
     pytest.param(f"~{getpass.getuser()}/x", id="tilde_user"),   # [50]
     pytest.param(f"~{getpass.getuser()}", id="tilde_user_bare"),
     "~",
+    pytest.param("%(prefix)/x", id="prefix"),                   # [128]
+    pytest.param("%(prefix)/../x", id="prefix_dotdot"),
+    pytest.param("%(prefix)//x", id="prefix_absolute_rest"),
+    pytest.param("%(prefix)/~/x", id="prefix_then_tilde"),
 ])
 def test_path_expansion_matches_git(gg: GG, tmp_path: Path, monkeypatch, value: str) -> None:
     monkeypatch.setenv("HOME", gg.env["HOME"])
     want = _git_path(tmp_path, value, gg.env)
     assert want is not None and os.path.isabs(want)
-    literal, _ = _expand2(value, tmp_path / "root")
+    literal, _ = _expand2(value, tmp_path / "root", pathname=True)
     assert str(literal) == want
+
+
+@pytest.mark.parametrize("value", ["./%(prefix)/x", "%(prefix)x", "%(Prefix)/x", "~/%(prefix)/x",
+                                   "%(prefix)"])
+def test_prefix_mark_kept_literal_like_git(gg: GG, tmp_path: Path, monkeypatch, value: str) -> None:
+    """[128] what git does not interpolate, gitguard does not either: the
+    literal, relative to the base (git: as written)."""
+    monkeypatch.setenv("HOME", gg.env["HOME"])
+    want = _git_path(tmp_path, value, gg.env)
+    assert want is not None
+    literal, _ = _expand2(value, tmp_path / "root", pathname=True)
+    expanded = os.path.expanduser(value) if value.startswith("~") else value
+    assert str(literal) == (want if os.path.isabs(want) else str(tmp_path / "root" / expanded))
 
 
 # ================================================ 3. includes: what git follows
@@ -714,6 +731,27 @@ def test_global_config_files_cover_git(gg: GG, tmp_path: Path, monkeypatch, vari
     assert want, "git reads no file: broken harness"
     got = {p.resolve() for p in global_config_files()}
     assert want <= got, f"git reads {want - got}, which gitguard does not parse"
+
+
+@pytest.mark.parametrize("nosystem", ["1", "true", "2", "0", "off"])
+def test_global_config_files_honour_nosystem(gg: GG, tmp_path: Path, monkeypatch, nosystem: str) -> None:
+    """[133] under GIT_CONFIG_NOSYSTEM (a git_env_bool: `1`, `true`, `2`;
+    `0`, `off` are unset) git reads no system config, whatever
+    GIT_CONFIG_SYSTEM names. gitguard reads exactly the system files git
+    reads: one too many
+    brought tokens git never sees (a system `filter.lfs.required = true`
+    and a tree file named `true`, [129]). The oracle is git's own origins."""
+    env = dict(gg.env)
+    sysf = tmp_path / "s.cfg"
+    sysf.write_text("[a]\n\te = 1\n")
+    env["GIT_CONFIG_SYSTEM"] = str(sysf)
+    env["GIT_CONFIG_NOSYSTEM"] = nosystem
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    want = _git_origins(env, tmp_path)
+    got = {p.resolve() for p in global_config_files()}
+    assert want <= got, f"git reads {want - got}, which gitguard does not parse"
+    assert (sysf.resolve() in want) == (sysf.resolve() in got), (want, got)
 
 
 def test_system_config_of_real_git_is_read(tmp_path: Path, monkeypatch) -> None:

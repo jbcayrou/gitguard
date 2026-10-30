@@ -18,6 +18,19 @@ Sections (one item per line, `# ` comments, blank lines ignored):
               arguments of repo_git_path/git_path (printf patterns dropped).
   [pathname]  config keys read through git_config_pathname /
               *_config_get_pathname: a value that is a path git opens.
+  [bool]      config keys read through git_config_bool / git_config_maybe_bool
+              / git_parse_maybe_bool / git_config_bool_or_int /
+              *_config_get_(maybe_)bool: a value that is a boolean, never a
+              path — a tree file named `true` or `false` is nothing git runs
+              from it ([129]; gitguard's VALUE_KEYS is exactly this list and
+              [int]). Keys of a wildcard section compared on their last part
+              only (`skip_prefix(var, "remote.")` then `strcmp(subkey,
+              ".prune")`) are not seen: they keep the generic rule, a file
+              too many watched. A key of another program (git-lfs's
+              `filter.lfs.required`) is not here either.
+  [int]       the same for git_config_int / git_config_ulong /
+              git_config_ssize_t / git_config_int64 / *_config_get_(int|
+              ulong|ssize_t): a number, with a k/m/g unit.
   (no [program] section: a key whose value git runs has no single signature
   in the source and the documentation phrases it a dozen ways; that list is
   curated by hand, test_claims.py PROGRAM_KEYS, from Documentation/config.)
@@ -86,6 +99,49 @@ def pathname_keys(src: Path) -> set[str]:
     return out
 
 
+_KEY = re.compile(r'"([a-zA-Z][\w]*\.[\w.<>*-]+)"')
+_BOOL_CALLS = ("git_config_bool(", "git_config_maybe_bool(", "git_parse_maybe_bool(",
+               "git_config_bool_or_int(")
+_INT_CALLS = ("git_config_int(", "git_config_ulong(", "git_config_ssize_t(", "git_config_int64(")
+_GET_BOOL = re.compile(r'config_get_(?:maybe_)?bool\(\s*(?:[\w>.&-]+,\s*)?"([^"]+)"')
+_GET_INT = re.compile(r'config_get_(?:int|ulong|ssize_t)\(\s*(?:[\w>.&-]+,\s*)?"([^"]+)"')
+
+
+def _value_keys(src: Path, calls: tuple[str, ...], getter: re.Pattern) -> set[str]:
+    """Keys read through one of `calls`: the key compared in the closest
+    strcmp / skip_prefix above the call that names one (within 8 lines;
+    a `strcasecmp(value, "always")` in between is skipped, it names no
+    key), the literal key of the `getter` form, and a literal key as the
+    call's own first argument. [129]"""
+    out: set[str] = set()
+    # `git_config_bool("core.logallrefupdates", value)`: the key as the call's
+    # first argument, no strcmp around (refs.c).
+    literal = re.compile("(?:" + "|".join(re.escape(c) for c in calls)
+                         + r')\s*"([a-zA-Z][\w]*\.[\w.<>*-]+)"')
+    for p in c_files(src):
+        lines = p.read_text(errors="replace").splitlines()
+        for i, line in enumerate(lines):
+            if any(c in line for c in calls) and "define" not in line:
+                for j in range(i, max(i - 8, -1), -1):
+                    if "strcmp" in lines[j] or "skip_prefix" in lines[j]:
+                        found = [k.lower() for k in _KEY.findall(lines[j])]
+                        if found:
+                            out.update(found)
+                            break
+            m = getter.search(line) or literal.search(line)
+            if m:
+                out.add(m.group(1).lower())
+    return out
+
+
+def bool_keys(src: Path) -> set[str]:
+    return _value_keys(src, _BOOL_CALLS, _GET_BOOL)
+
+
+def int_keys(src: Path) -> set[str]:
+    return _value_keys(src, _INT_CALLS, _GET_INT) - bool_keys(src)
+
+
 def hooks(src: Path) -> list[str]:
     """Section titles of githooks.adoc (a name over a `~~~` underline)."""
     lines = (src / "Documentation" / "githooks.adoc").read_text().splitlines()
@@ -146,6 +202,10 @@ def main() -> None:
     print("\n".join(sorted(gitdir_names(src))))
     print("\n[pathname]")
     print("\n".join(sorted(pathname_keys(src))))
+    print("\n[bool]")
+    print("\n".join(sorted(bool_keys(src))))
+    print("\n[int]")
+    print("\n".join(sorted(int_keys(src))))
     print("\n[hooks]")
     print("\n".join(hooks(src)))
     print("\n[options]")

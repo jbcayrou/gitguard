@@ -23,11 +23,18 @@ paid for by a bypass.
   `branch_tracking_only` (three keys git cannot execute) and
   `PINNED_CONFIG` (`core.fsmonitor=false`, the one key an in-process
   reader executes from a repository nobody judged, [126]; the proof is the
-  in-process table of `tests/test_claims.py`).
+  in-process table of `tests/test_claims.py`). The exclusion lists
+  (`DATA_KEYS`, `VALUE_KEYS`) are mechanical where they can be:
+  `VALUE_KEYS` is the `[bool]`/`[int]` sections of the inventory, taken
+  from git's source, never curated ([129]); a string key stays under the
+  generic rule, documented as a cost.
 - **Never run git to learn about a repository.** Discovery, config, gitfile,
   index, todo files: all read by gitguard's own ports of git's readers
   (`find_root`, `parse_git_config`, `index_gitlinks`, `_read_path_file`…).
-  `git rev-parse`/`git config` would honour the config being judged.
+  `git rev-parse`/`git config` would honour the config being judged. The
+  one git gitguard runs to learn anything is `git_prefix` ([128]): a
+  constant of the binary, asked from `/` with no repository, no user
+  config and no GIT_* variable — never anything about a repository.
 - **Read every file exactly as git does.** Bytes, git's `isspace`, one
   trailing newline, no `strip()`/`splitlines()`; a line git dies on is
   refused, not reinterpreted. Every reader has a parity test with git as
@@ -108,7 +115,7 @@ are honoured as git honours them.
 
 ## Tests
 
-`python3 -m pytest` (~1300 tests, expected failures: [44], [71], [74], [95], [123], [126], the accepted limitations; ~280 s), before
+`python3 -m pytest` (~1300 tests, expected failures: [44], [71], [74], [95], [123], [126], [129], the accepted limitations; ~280 s), before
 any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
 && venv/bin/pip install pytest`.
 

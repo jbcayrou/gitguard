@@ -1861,6 +1861,31 @@ def test_hardlink_is_what_runs_the_message(gg: GG, repo: Path, tmp_path: Path) -
     assert not (tmp_path / "RAN").exists()
 
 
+@pytest.mark.parametrize("where", ["ext", "global"])
+def test_hardlink_ext_hook_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path,
+                                                    where: str) -> None:
+    """[127] a hook outside the tree, local or global core.hooksPath: git
+    writes COMMIT_EDITMSG in place and runs the shared inode all the same."""
+    getattr(_links, f"attack_hardlink_commit_editmsg_to_{where}_hook")(gg, repo, tmp_path)
+    gg.git("commit", "-q", "--amend", "--no-edit", cwd=repo)
+    assert (tmp_path / "RAN").exists(), "git no longer writes COMMIT_EDITMSG in place: [127] may be moot"
+
+
+def test_prefix_hookspath_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[128] git expands `%(prefix)/` in core.hooksPath and runs the hook
+    found there."""
+    _cs.attack_hookspath_prefix(gg, repo, tmp_path)
+    gg.git("checkout", "-q", "-b", "x", cwd=repo)
+    assert (tmp_path / "RAN").exists(), "git no longer expands %(prefix)/: [128] may be moot"
+
+
+def test_prefix_include_control_real_git_reads_it(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[128] git expands `%(prefix)/` in include.path and honours what the
+    included file says."""
+    _cs.attack_include_prefix(gg, repo, tmp_path)
+    assert gg.git("config", "--get", "core.fsmonitor", cwd=repo).out.strip() == "/tmp/evil"
+
+
 @pytest.mark.skipif(not git_has("alias_subsection"), reason="git without `[alias \"x\"] command`")
 def test_alias_subsection_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path) -> None:
     """[90] git 2.54 runs `git ci` with the alias's hooksPath."""
@@ -2406,3 +2431,28 @@ def test_pinned_config_reaches_git_after_the_users_parameters(gg: GG, repo: Path
     r = gg.run("git", "config", "--get-all", "core.fsmonitor", cwd=repo)
     assert r.rc == 0 and r.out.splitlines() == ["false"], r.text
     assert gg.run("git", "--version", cwd=repo).rc == 0          # the passthrough is pinned too
+
+
+# ------------------------------------------------- [131] a name that is not UTF-8
+def test_trust_survives_a_non_utf8_name_in_the_gitdir(gg: GG, repo: Path) -> None:
+    """[131] a planted `hooks/pre-commit-\\xff`: the check refuses it (an
+    added file), and `trust`, the documented way out, records it instead of
+    dying in save_trust (UnicodeEncodeError on the surrogate-escaped name);
+    `diff` and `list` must survive too, and a trusted state must show it.
+    Skipped where the filesystem refuses the name (APFS)."""
+    name = os.fsdecode(b"pre-commit-\xff")
+    try:
+        write_exec(repo / ".git/hooks" / name, "#!/bin/sh\n")
+    except OSError as e:
+        pytest.skip(f"the filesystem refuses a non-UTF-8 name: {e}")
+    assert gg.check(repo).blocked
+    r = gg.run("diff", cwd=repo)
+    assert r.rc == 0 and "internal error" not in r.text, r.text
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0 and "internal error" not in r.text, r.text
+    assert not gg.check(repo).blocked
+    r = gg.run("list", cwd=repo)
+    assert r.rc == 0 and "internal error" not in r.text, r.text
+    (repo / ".git/hooks" / name).write_text("#!/bin/sh\ntouch RAN\n")
+    r = gg.check(repo)
+    assert r.blocked and "internal error" not in r.text, r.text

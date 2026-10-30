@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -683,6 +684,39 @@ def test_global_program_path_that_is_a_hard_link(gg: GG, repo: Path, tmp_path: P
         assert not gg.check(repo).blocked, gg.check(repo).text
 
 
+def test_template_dir_under_the_prefix(gg: GG, repo: Path) -> None:
+    """[128] `init.templateDir = %(prefix)/share/git-core/templates`, the
+    value git documents as its default: resolved to the installed
+    templates (watched if the user can write there, else nothing), never
+    the literal `<root>/%(prefix)/…`; every command silent."""
+    assert gg.git("config", "--global", "init.templateDir",
+                  "%(prefix)/share/git-core/templates").rc == 0
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0 and "%(prefix)" not in r.text, r.text
+    assert not gg.run("git", "status", "--short", cwd=repo).blocked
+
+
+def test_ext_hook_with_another_name_outside_the_gitdir(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[127] a hook outside the tree (`core.hooksPath = ../shared-hooks`)
+    whose inode has a second name next to it (a hooks directory built by
+    `ln`, or a package manager's store): git writes nothing there by name,
+    the file is watched by its bytes, never refused. Only another name in
+    the gitdir is."""
+    hook = tmp_path / "shared-hooks/commit-msg"
+    write_exec(hook, "#!/bin/sh\nexit 0\n")
+    os.link(hook, tmp_path / "shared-hooks/commit-msg.orig")
+    assert gg.git("config", "core.hooksPath", "../shared-hooks", cwd=repo).rc == 0
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0, r.text
+    assert not gg.check(repo).blocked, gg.check(repo).text
+    (repo / "f").write_text("b\n")
+    assert not gg.run("git", "commit", "-qam", "x", cwd=repo).blocked
+    (repo / ".git/COMMIT_EDITMSG").unlink(missing_ok=True)
+    os.link(hook, repo / ".git/COMMIT_EDITMSG")      # a name in the gitdir, volatile: refused
+    r = gg.check(repo)
+    assert r.blocked and "hard link into the gitdir" in r.err, r.text
+
+
 def test_linked_worktree_of_a_submodule(gg: GG, repo: Path, tmp_path: Path) -> None:
     """[76] `git -C sub worktree add ../subwt`: git ignores the
     common config's core.worktree in a linked worktree; open_repo applied
@@ -983,3 +1017,74 @@ def test_boolean_fsmonitor_names_no_path(gg: GG, repo: Path) -> None:
     assert watched("") == []                    # a transient value leaves with its command [48]
     del gg.env["GIT_CONFIG_PARAMETERS"]
     assert not gg.run("git", "status", "--short", cwd=repo).blocked     # pinned, nothing seen
+
+
+# ------------------------------------------------- [129] [130] values that name no file
+def _watched_at_trust(gg: GG, repo: Path) -> list[str]:
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0, r.text
+    return [l.strip() for l in r.text.splitlines() if "references outside the gitdir" in l]
+
+
+def test_tree_file_named_like_a_boolean_or_number_value_is_silent(gg: GG, repo: Path) -> None:
+    """[129] `git init` writes `core.filemode = true`, `core.bare = false`,
+    `core.logAllRefUpdates = true`, `core.repositoryformatversion = 0`; a
+    user sets `gc.auto = 0`, `commit.gpgSign = yes`. A tree file of one of those
+    names (a binary `true`, a build output `0`) is nothing git runs from a
+    value it reads as a boolean or a number (VALUE_KEYS, the inventory): not
+    watched at trust, and changing it refuses nothing. A program key naming
+    it stays watched (the generic rule, test_claims.py's PROGRAM_KEYS), and
+    so does a boolean key holding a path (core.fsmonitor = ./hook)."""
+    assert gg.git("config", "gc.auto", "0", cwd=repo).rc == 0
+    assert gg.git("config", "--global", "commit.gpgSign", "yes", cwd=repo).rc == 0
+    names = ("true", "false", "0", "yes")
+    for n in names:
+        (repo / n).write_text("ELF\n")
+    assert _watched_at_trust(gg, repo) == []
+    for n in names:
+        (repo / n).write_text("ELF, rebuilt\n")
+    r = gg.run("git", "status", "--short", cwd=repo)
+    assert not r.blocked and "gitguard:" not in r.err, r.text
+    (repo / "hook").write_text("x\n")
+    assert gg.git("config", "core.fsmonitor", "./hook", cwd=repo).rc == 0
+    assert any("wt:" in l and l.endswith("hook → watched too") for l in _watched_at_trust(gg, repo))
+
+
+@pytest.mark.xfail(strict=True, reason="[129] accepted limitation (DESIGN.md, Known limitations): "
+                   "a string value's token names a tree file")
+def test_tree_file_named_like_a_string_value_is_silent(gg: GG, repo: Path) -> None:
+    """[129] OPEN — the global config of the suite holds `init.defaultBranch
+    = main` and `user.name = t`: a tree file named `main` or `t` is watched.
+    git reads those keys through git_config_string, the reader of
+    core.editor too, so nothing in its source proves them harmless; a
+    curated list is the fix if a real case comes up (the xfail record)."""
+    names = ("main", "t")
+    for n in names:
+        (repo / n).write_text("ELF\n")
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0, r.text
+    watched = [l.strip() for l in r.text.splitlines() if "references outside the gitdir" in l]
+    assert watched == [], watched
+    for n in names:
+        (repo / n).write_text("ELF, rebuilt\n")
+    r = gg.run("git", "status", "--short", cwd=repo)
+    assert not r.blocked and "gitguard:" not in r.err, r.text
+
+
+@pytest.mark.parametrize("scope", ["local", "global", "env"])
+def test_config_token_longer_than_name_max_is_no_path(gg: GG, repo: Path, scope: str) -> None:
+    """[130] a JWT in `http.<url>.extraHeader` (a token of 300+ bytes, longer
+    than NAME_MAX): nothing of that length is a file, so it must not crash
+    the scan (Path.exists raised ENAMETOOLONG before Python 3.14) — `trust`
+    must succeed and the next command run. Local, global, and the
+    environment / `-c` (every source config_refs reads)."""
+    value = "Authorization: Bearer " + "A" * 300
+    if scope == "env":
+        gg.env["GIT_CONFIG_PARAMETERS"] = f"'http.https://example.com/.extraheader'='{value}'"
+    else:
+        args = ["--global"] if scope == "global" else []
+        assert gg.git("config", *args, "http.https://example.com/.extraheader", value, cwd=repo).rc == 0
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0 and "internal error" not in r.text, r.text
+    r = gg.run("git", "status", "--short", cwd=repo)
+    assert not r.blocked and "gitguard:" not in r.err, r.text

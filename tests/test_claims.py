@@ -440,6 +440,17 @@ def test_every_pathname_key_is_classified(key: str) -> None:
     assert key in PATHNAME_PROGRAMS, f"{key}: a pathname key gitguard has not classified"
 
 
+def test_value_keys_are_the_inventory() -> None:
+    """[129] VALUE_KEYS is exactly the `[bool]` and `[int]` sections of the
+    inventory: a key git reads as a boolean or a number, taken from its
+    source, nothing curated by hand. A new git adds keys here first."""
+    want = set(_inventory("bool")) | set(_inventory("int"))
+    assert set(gg_mod.VALUE_KEYS) == want, (set(gg_mod.VALUE_KEYS) ^ want)
+    assert gg_mod._value_key("core", "bare") and gg_mod._value_key("http", "sslverify")
+    assert gg_mod._value_key("http.https://x/", "sslverify")
+    assert not gg_mod._value_key("user", "name") and not gg_mod._value_key("core", "pager")
+
+
 @pytest.mark.parametrize("hook", _inventory("hooks"))
 def test_every_hook_under_a_tree_hookspath_is_watched(gg: GG, repo: Path, hook: str) -> None:
     """[1] for every hook git documents: under a core.hooksPath in the tree,
@@ -519,6 +530,65 @@ def test_keep_attached_disarms_the_detach(cmd: list[str], detach: str | None,
     if detach is not None:
         assert detach not in out
     assert gg_mod.keep_attached(["status"], Path.cwd()) == ["status"]
+
+
+@pytest.mark.parametrize("abbr", ["--det", "--d"])
+def test_keep_attached_disarms_an_abbreviated_detach(gg: GG, repo: Path, abbr: str) -> None:
+    """[132] parse-options takes any unique prefix of a long option: git
+    accepts `--det` and `--d` for `maintenance run` where it refuses
+    `--detx` (the oracle), and detaches on them. keep_attached reads them
+    as `--detach` (_long_option, as clone, init and push are read); a value
+    of `--task`/`--schedule` is never an option, `--no-det` and anything
+    after `--` are left alone."""
+    assert gg.git("maintenance", "run", "--detx", "--auto", cwd=repo).rc == 129
+    assert gg.git("maintenance", "run", abbr, "--auto", cwd=repo).rc == 0
+    out = gg_mod.keep_attached(["maintenance", "run", abbr, "--auto"], repo)
+    assert "--no-detach" in out and abbr not in out, out
+    k = lambda *a: gg_mod.keep_attached(["maintenance", "run", *a], repo)[2:]
+    assert k("--task", abbr) == ["--task", abbr]
+    assert k("--task=" + abbr, abbr) == ["--task=" + abbr, "--no-detach"]
+    assert k("--no-det") == ["--no-det"]
+    assert k("--", abbr) == ["--", abbr]
+    assert k("-q", abbr, "--auto") == ["-q", "--no-detach", "--auto"]
+
+
+def test_git_prefix_is_what_git_substitutes(gg: GG, repo: Path, monkeypatch) -> None:
+    """[128] git_prefix(), asked of the real git outside any repository, is
+    what git substitutes for `%(prefix)/` inside one, with the user's config
+    in place; GIT_EXEC_PATH (the wrapped one, in the suite) moves nothing."""
+    gg_mod._PREFIX.clear()
+    for k, v in gg.env.items():
+        monkeypatch.setenv(k, v)
+    want = gg.git("-c", "x.p=%(prefix)/", "config", "--type=path", "x.p", cwd=repo).out.strip()
+    assert want.startswith("/"), want
+    assert gg_mod.git_prefix() == (want.rstrip("/") or "/")
+    assert gg_mod.git_prefix() is gg_mod._PREFIX[0]                 # cached
+    gg_mod._PREFIX.clear()
+
+
+def test_git_prefix_not_asked_without_the_mark(gg: GG, repo: Path, monkeypatch) -> None:
+    """[128] a repository whose config carries no `%(prefix)/` never runs
+    git for the prefix: the scan stays free of any process."""
+    for k, v in gg.env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(gg_mod, "STATE", gg.state)
+    def boom() -> str:
+        raise AssertionError("git_prefix called")
+    monkeypatch.setattr(gg_mod, "git_prefix", boom)
+    assert gg.git("config", "core.hooksPath", ".githooks", cwd=repo).rc == 0
+    assert gg.git("config", "--global", "include.path", "~/inc.cfg").rc == 0
+    gg_mod.config_refs(gg_mod.open_repo(repo))
+
+
+def test_maintenance_run_options_match_git(gg: GG, repo: Path) -> None:
+    """[132] MAINTENANCE_RUN_OPTIONS is `git maintenance run -h` (in a
+    repository: git 2.47 wants one even for `-h`): every long option, and
+    whether it takes a value (`<...>`). An option git adds is a prefix
+    keep_attached would resolve wrongly: fails here first."""
+    r = gg.git("maintenance", "run", "-h", cwd=repo)
+    opts = {"--" + m.group(1): bool(m.group(2)) for m in re.finditer(
+        r"^\s+(?:-\w, )?--(?:\[no-\])?([\w-]+)((?: <[^>]+>)?)", r.text, re.M)}
+    assert opts == gg_mod.MAINTENANCE_RUN_OPTIONS, opts
 
 
 def test_inventory_global_options_are_known() -> None:

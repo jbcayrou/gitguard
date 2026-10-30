@@ -708,3 +708,47 @@ def attack_ssh_config_glued_in_option_cluster(gg: GG, repo: Path, tmp_path: Path
     gg.trust(repo)
     (repo / "deploy/ssh_config").write_text(
         f"Host *\n\tProxyCommand sh -c \"touch '{tmp_path}/RAN'; exit 1\"\n")
+
+
+# ------------------------------------------------ [128] git's installation prefix
+def git_prefix(gg: GG) -> Path:
+    """What git substitutes for `%(prefix)/` (interpolate_path), asked of
+    the git the scenario is built with: the attack needs the value git
+    computes; gitguard must find it without running git."""
+    r = gg.git("-c", "x.p=%(prefix)/", "config", "--type=path", "x.p")
+    assert r.rc == 0 and r.out.startswith("/"), r.text
+    return Path(r.out.strip())
+
+
+def prefix_relative(gg: GG, target: Path) -> str:
+    """`%(prefix)/../../<target>`: the volume reached from git's prefix. The
+    `..` are resolved by the kernel on the installed path (on Homebrew
+    `opt/git` is a symlink to `Cellar/git/<v>`), so the relative path is
+    computed from the prefix's real location."""
+    import os
+    return "%(prefix)/" + os.path.relpath(target, os.path.realpath(git_prefix(gg)))
+
+
+def attack_hookspath_prefix(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[128] core.hooksPath = %(prefix)/../…/vol-hooks: git expands its
+    installation prefix (interpolate_path, before `~`), _expand2 watches the
+    literal `<root>/%(prefix)/…`, which does not exist"""
+    hooks = tmp_path / "vol-hooks"
+    write_exec(hooks / "post-checkout", OK_HOOK)
+    assert gg.git("config", "core.hooksPath", prefix_relative(gg, hooks), cwd=repo).rc == 0
+    r = gg.git("rev-parse", "--path-format=absolute", "--git-path", "hooks", cwd=repo)
+    assert Path(r.out.strip()).resolve() == hooks.resolve(), r.text
+    gg.trust(repo)
+    write_exec(hooks / "post-checkout", _evil(tmp_path))
+
+
+def attack_include_prefix(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[128] include.path = %(prefix)/../…/shared.gitconfig in the volume:
+    git opens it (handle_path_include expands the prefix too), gitguard
+    never does"""
+    inc = tmp_path / "shared.gitconfig"
+    inc.write_text("[x]\n\tincluded = 1\n")
+    assert gg.git("config", "include.path", prefix_relative(gg, inc), cwd=repo).rc == 0
+    assert gg.git("config", "--get", "x.included", cwd=repo).out.strip() == "1", "git must open it"
+    gg.trust(repo)
+    inc.write_text("[core]\n\tfsmonitor = /tmp/evil\n")

@@ -102,6 +102,41 @@ def real_git() -> str:
             return str(cand)
     raise Refuse("no git found: none in the PATH other than gitguard itself, no `git.real` "
                  "next to gitguard — set GITGUARD_REAL_GIT")
+
+
+PREFIX_MARK = "%(prefix)/"
+_PREFIX: list[str | None] = []      # git_prefix's answer, once per process
+
+
+def git_prefix() -> str:
+    """What git substitutes for a leading `%(prefix)/` in a pathname value
+    (interpolate_path → system_path): its installation prefix, compiled in
+    or found at runtime from the binary — not GIT_EXEC_PATH, which does not
+    move it. Asked of the real git, the one way to know it, and the only
+    thing gitguard ever runs git to learn: a constant of the binary, never
+    anything about a repository. From `/` (no repository discovered), the
+    environment stripped of every GIT_* variable, no system or user config
+    (GIT_CONFIG_NOSYSTEM, GIT_CONFIG_GLOBAL=/dev/null), no pager: `git
+    config --get` of a `-c` value reads nothing else, runs no hook, and a
+    builtin cannot be aliased. Called only on a value that starts with
+    `%(prefix)/`, cached. No absolute answer: Refuse (fail closed). [128]"""
+    if not _PREFIX:
+        import subprocess
+        git = os.path.abspath(real_git())
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+        try:
+            r = subprocess.run([git, "--no-pager", "-c", f"x.prefix={PREFIX_MARK}", "config",
+                                "--type=path", "x.prefix"], cwd="/", env=env,
+                               capture_output=True, text=True, errors="replace")
+            out = r.stdout.rstrip("\n") if r.returncode == 0 else ""
+        except OSError:
+            out = ""
+        _PREFIX.append((out.rstrip("/") or "/") if out.startswith("/") else None)
+    if _PREFIX[0] is None:
+        raise Refuse("the installation prefix of this git is unknown, a `%(prefix)/` in a "
+                     "config value cannot be resolved: spell the path out")
+    return _PREFIX[0]
 def state_dir() -> Path:
     """Where the trust states live: `GITGUARD_STATE`, else `$XDG_STATE_HOME/gitguard`,
     else `~/.local/state/gitguard`. XDG_STATE_HOME is the specified home for
@@ -222,6 +257,11 @@ def set_output(stream) -> None:
     OUT = stream
     STYLE.enabled = stream.isatty() and not os.environ.get("NO_COLOR")
 _CTRL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")   # everything but \n (handled separately)
+# A lone surrogate: a file name that is not UTF-8, decoded with
+# surrogateescape. Displayed as `?` whatever the terminal's encoding
+# (printing it under a strict UTF-8 stdout raises). Not a structural refusal
+# (_CTRL is): the name is hashed and shown, like any other. [131]
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 # Only the SGR codes Style emits (reset, bold, red/green/yellow/cyan). Any
 # other SGR is neutralized: conceal (8), fg = bg (30;40, 38;5;n;48;5;n)…
 # hid the rest of a config line in the diff shown before [y/N]. [43]
@@ -247,7 +287,7 @@ def san(s: object) -> str:
         out.append(m.group(0))
         pos = m.end()
     out.append(_CTRL.sub("?", text[pos:]))
-    return "".join(out)
+    return _SURROGATE.sub("?", "".join(out))
 
 
 def err(msg: str) -> None:
@@ -735,9 +775,11 @@ def find_root(cwd: Path) -> Path | None:
 
 
 def _env_bool(name: str) -> bool:
-    """git_env_bool: unset or empty is false; else git's boolean parsing."""
+    """git_env_bool: unset or empty is false; else git_config_bool — git's
+    boolean words, or an integer, non-zero true (`2` is true). A value git
+    dies on (`maybe`) is false here, the closed reading."""
     v = os.environ.get(name, "")
-    return v.strip().lower() in ("1", "true", "yes", "on") if v else False
+    return bool(_git_maybe_bool(v)) if v else False
 
 
 def _ceiling_offset(cwd: Path) -> int | None:
@@ -1773,11 +1815,17 @@ def global_config_files() -> list[Path]:
     """System and global config files git may read. Deliberately broad
     (GIT_CONFIG_GLOBAL *and* ~/.gitconfig *and* XDG): watching one file too
     many costs nothing, missing one is a bypass [16]."""
-    out = [Path(os.environ.get("GIT_CONFIG_SYSTEM") or "/etc/gitconfig")]
+    out: list[Path] = []
+    # Under GIT_CONFIG_NOSYSTEM git reads no system file at all, whatever
+    # GIT_CONFIG_SYSTEM names (git_config_system): a file git was told to
+    # skip is not "one too many", its values (a system `filter.lfs.required
+    # = true`) named tree files git never sees. [133]
+    if not _env_bool("GIT_CONFIG_NOSYSTEM"):
+        out.append(Path(os.environ.get("GIT_CONFIG_SYSTEM") or "/etc/gitconfig"))
     # A git built with another sysconfdir (Homebrew: /opt/homebrew/etc/gitconfig)
     # keeps its system config next to its prefix: <prefix>/bin/git → <prefix>/etc.
     # Derived from the path, never asked to git; one file too many costs nothing.
-    if not os.environ.get("GIT_CONFIG_SYSTEM"):
+    if out and not os.environ.get("GIT_CONFIG_SYSTEM"):
         try:
             g = Path(real_git())
             for p in {g, g.resolve()}:
@@ -1892,7 +1940,16 @@ class ConfigScan:
         """Record `p` (canonical; `literal` as the config spelt it) as a path
         git may execute or read, or refuse it."""
         repo, out = self.repo, self.out
-        if not (p.exists() or p.is_symlink()):
+        try:
+            present = p.exists() or p.is_symlink()
+        except OSError:
+            # A name no filesystem accepts (a token longer than NAME_MAX: a
+            # JWT in `http.<url>.extraHeader`) or a parent the user cannot
+            # enter: nothing git, the same user, can run from there. Before
+            # Python 3.14 exists() raised on it, and every command died with
+            # `internal error`, `trust` included. [130]
+            return
+        if not present:
             return
         try:
             mode = p.stat().st_mode
@@ -2003,7 +2060,7 @@ class ConfigScan:
             # git opens as written. [91]
             if value.startswith(OPTIONAL_PREFIX):
                 value = value[len(OPTIONAL_PREFIX):]
-            literal, p = _expand2(value, base)
+            literal, p = _expand2(value, base, pathname=True)
             if p == repo.root:
                 # A hooks directory at the root of the tree: every top-level
                 # file is a hook git runs, and add() drops the root (it is
@@ -2024,12 +2081,12 @@ class ConfigScan:
             # Relative to the including file; from the command line or the
             # environment git only accepts an absolute path ("relative config
             # includes must come from files").
-            if cfdir is None and not _expand2(value, Path("/"))[0].is_absolute():
+            if cfdir is None and not _expand2(value, Path("/"), pathname=True)[0].is_absolute():
                 return
             # Queued as git opens it, not canonical: an include inside it is
             # relative to that path's directory — a symlink's, not its
             # target's. [94]
-            literal, p = _expand2(value, cfdir or base)
+            literal, p = _expand2(value, cfdir or base, pathname=True)
             if is_file(p):
                 self.nxt.append((literal, base, remotes, glob))
             self.add(literal, p)
@@ -2059,12 +2116,13 @@ class ConfigScan:
                 self.add(common / "hooks", common / "hooks", allow_dir=True)
         elif _data_key(section, key):
             return                       # a file read as data, never run [56]
-        elif section == "core" and key == "fsmonitor" and _git_maybe_bool(value) is not None:
-            # lookup_fsmonitor_settings: a boolean is the built-in daemon
-            # (true: `git fsmonitor--daemon`, a child git) or nothing
-            # (false); only a non-boolean is a hook path. The pin gitguard
-            # sets (PINNED_CONFIG) reaches every child's environment: a
-            # file named `false` at the root must not become a watched path.
+        elif _value_key(section, key) and _git_maybe_bool(value) is not None:
+            # A boolean or a number on a key git reads as one: names
+            # nothing. core.fsmonitor among them (lookup_fsmonitor_settings:
+            # a boolean is the built-in daemon or nothing, only a
+            # non-boolean is a hook path): the pin gitguard sets
+            # (PINNED_CONFIG) reaches every child's environment, and a file
+            # named `false` at the root must not become a watched path. [129]
             return
         else:
             for tok in _glued_values(_value_tokens(value)):
@@ -2329,6 +2387,113 @@ def _data_key(section: str, key: str) -> bool:
     return (section, key) in DATA_KEYS or (head == "http" and (head, key) in DATA_KEYS)
 
 
+# Config keys git reads as a boolean or a number — never a path, never a
+# program: exactly the `[bool]` and `[int]` sections of tests/inventory/
+# (git's source: the keys compared before a git_config_bool / git_config_int
+# / *_config_get_bool…; test_claims.py holds the two to be equal). The
+# generic rule took every word of every value for a path to watch: `git
+# init` writes `core.bare = false`, `core.filemode = true`,
+# `core.repositoryformatversion = 0`, and a tree file named `false`, `true`
+# or `0` was watched and refused once it changed, no sandbox involved. On
+# one of these keys, a value git parses as a boolean or a number names
+# nothing (any other value: git dies on it, the generic rule stays, fail
+# closed). An exclusion list like DATA_KEYS, never an inclusion: a key of a
+# wildcard section compared on its last part, or of another program
+# (git-lfs's `filter.lfs.required`), is not here and keeps the rule — a
+# file too many watched. Strings (`user.name`, `init.defaultBranch`) have
+# no reader of their own in git's source (git_config_string serves
+# core.editor too): not provable, not listed (Known limitations). [129]
+VALUE_KEYS = frozenset({
+    "add.ignore-errors", "am.keepcr", "am.messageid", "am.threeway", "blame.blankboundary",
+    "blame.markignoredlines", "blame.markunblamablelines", "blame.showemail",
+    "blame.showroot", "checkout.guess", "checkout.thresholdforparallelism",
+    "checkout.workers", "clean.requireforce", "clone.filtersubmodules", "clone.rejectshallow",
+    "color.pager", "commit.gpgsign", "commit.status", "commit.verbose",
+    "commitgraph.changedpaths", "commitgraph.generationversion", "commitgraph.maxnewfilters",
+    "core.autocrlf", "core.bare", "core.compression", "core.configlocktimeout",
+    "core.deltabasecachelimit", "core.filemode", "core.filesreflocktimeout", "core.fsmonitor",
+    "core.fsmonitorhookversion", "core.fsyncobjectfiles", "core.hidedotfiles",
+    "core.ignorecase", "core.ignorestat", "core.lockfilepid", "core.logallrefupdates",
+    "core.loosecompression", "core.packedgitlimit", "core.packedgitwindowsize",
+    "core.packedrefstimeout", "core.precomposeunicode", "core.prefersymlinkrefs",
+    "core.preloadindex", "core.protecthfs", "core.protectntfs", "core.quotepath",
+    "core.repositoryformatversion", "core.safecrlf", "core.sparsecheckout",
+    "core.sparsecheckoutcone", "core.splitindex", "core.symlinks", "core.trustctime",
+    "core.usenanosec", "credential.interactive", "credentialcache.ignoresighup",
+    "credentialstore.locktimeoutms", "diff.autorefreshindex", "diff.context",
+    "diff.indentheuristic", "diff.interhunkcontext", "diff.mnemonicprefix", "diff.noprefix",
+    "diff.relative", "diff.renamelimit", "diff.statgraphwidth", "diff.statnamewidth",
+    "diff.suppress-blank-empty", "diff.trustexitcode", "difftool.trustexitcode",
+    "fastimport.unpacklimit", "feature.experimental", "fetch.all", "fetch.fsckobjects",
+    "fetch.parallel", "fetch.prune", "fetch.prunetags", "fetch.showforcedupdates",
+    "fetch.unpacklimit", "format.coverletter", "format.encodeemailheaders",
+    "format.filenamemaxlength", "format.forceinbodyfrom", "format.from", "format.mboxrd",
+    "format.noprefix", "format.notes", "format.numbered", "format.signoff",
+    "format.useautobase", "fsmonitor.allowremote", "gc.aggressivedepth",
+    "gc.aggressivewindow", "gc.auto", "gc.autodetach", "gc.autopacklimit",
+    "gc.bigpackthreshold", "gc.cruftpacks", "gc.launchctlplistlocktimeoutms",
+    "gc.maxcruftsize", "gc.packrefs", "grep.column", "grep.extendedregexp",
+    "grep.fallbacktonoindex", "grep.fullname", "grep.linenumber", "grep.threads",
+    "help.autocorrect", "http.emptyauth", "http.followredirects", "http.getanyfile",
+    "http.keepalivecount", "http.keepaliveidle", "http.keepaliveinterval",
+    "http.lowspeedlimit", "http.lowspeedtime", "http.maxrequestbuffer", "http.maxrequests",
+    "http.maxretries", "http.maxretrytime", "http.minsessions", "http.noepsv",
+    "http.postbuffer", "http.proxysslcertpasswordprotected", "http.retryafter",
+    "http.savecookies", "http.schannelcheckrevoke", "http.schannelusesslcainfo",
+    "http.sslcertpasswordprotected", "http.ssltry", "http.sslverify", "imap.port",
+    "imap.preformattedhtml", "imap.sslverify", "index.recordendofindexentries",
+    "index.recordoffsettable", "index.version", "init.defaultsubmodulepathconfig",
+    "interactive.singlekey", "log.abbrevcommit", "log.follow", "log.graphindent",
+    "log.mailmap", "log.showroot", "log.showsignature", "mailinfo.scissors",
+    "maintenance.auto", "maintenance.autodetach", "maintenance.commit-graph.auto",
+    "maintenance.geometric-repack.auto", "maintenance.geometric-repack.splitfactor",
+    "maintenance.incremental-repack.auto", "maintenance.loose-objects.auto",
+    "maintenance.loose-objects.batchsize", "maintenance.reflog-expire.auto",
+    "maintenance.rerere-gc.auto", "maintenance.worktree-prune.auto", "merge.autostash",
+    "merge.branchdesc", "merge.defaulttoupstream", "merge.ff", "merge.log",
+    "merge.renamelimit", "merge.renormalize", "merge.summary", "merge.verbosity",
+    "merge.verifysignatures", "midx.version", "notes.rewrite.", "options.allow-empty",
+    "options.allow-empty-message", "options.allow-ff", "options.allow-rerere-auto",
+    "options.drop-redundant-commits", "options.edit", "options.keep-redundant-commits",
+    "options.mainline", "options.no-commit", "options.record-origin", "options.signoff",
+    "pack.compression", "pack.deltacachelimit", "pack.deltacachesize", "pack.depth",
+    "pack.indexversion", "pack.packsizelimit", "pack.threads", "pack.usebitmaps",
+    "pack.window", "pack.windowmemory", "pack.writebitmaphashcache",
+    "pack.writebitmaplookuptable", "pack.writebitmaps", "pack.writereverseindex",
+    "pager.color", "patchid.stable", "patchid.verbatim", "promisor.advertise",
+    "promisor.quiet", "pull.autostash", "push.autosetupremote", "push.followtags",
+    "push.gpgsign", "push.negotiate", "push.usebitmaps", "push.useforceifincludes",
+    "rebase.abbreviatecommands", "rebase.autosquash", "rebase.autostash", "rebase.forkpoint",
+    "rebase.maxlabellength", "rebase.rebasemerges", "rebase.reschedulefailedexec",
+    "rebase.stat", "rebase.updaterefs", "receive.advertiseatomic",
+    "receive.advertisepushoptions", "receive.autogc", "receive.certnonceslop",
+    "receive.denydeletes", "receive.denynonfastforwards", "receive.fsckobjects",
+    "receive.keepalive", "receive.maxinputsize", "receive.shallowupdate",
+    "receive.updateserverinfo", "reftable.blocksize", "reftable.geometricfactor",
+    "reftable.indexobjects", "reftable.locktimeout", "reftable.restartinterval",
+    "repack.midxmustcontaincruft", "repack.midxnewlayerthreshold", "repack.midxsplitfactor",
+    "repack.packkeptobjects", "repack.updateserverinfo", "repack.usedeltabaseoffset",
+    "repack.usedeltaislands", "rerere.autoupdate", "rerere.enabled", "revert.reference",
+    "sparse.expectfilesoutsideofpatterns", "splitindex.maxpercentchange", "stash.index",
+    "stash.showincludeuntracked", "stash.showpatch", "stash.showstat", "status.aheadbehind",
+    "status.branch", "status.displaycommentprefix", "status.relativepaths",
+    "status.renamelimit", "status.short", "status.showstash", "status.submodulesummary",
+    "submodule.recurse", "submodule.stickyrecursiveclone", "tag.forcesignannotated",
+    "tag.gpgsign", "tar.umask", "transfer.advertiseobjectinfo", "transfer.advertisesid",
+    "transfer.bundleuri", "transfer.fsckobjects", "transfer.unpacklimit",
+    "uploadarchive.allowunreachable", "uploadpack.advertisebundleuris",
+    "uploadpack.allowanysha1inwant", "uploadpack.allowfilter",
+    "uploadpack.allowreachablesha1inwant", "uploadpack.allowrefinwant",
+    "uploadpack.allowsidebandall", "uploadpack.allowtipsha1inwant", "uploadpack.keepalive",
+    "user.useconfigonly", "worktree.guessremote", "worktree.userelativepaths"})
+
+
+def _value_key(section: str, key: str) -> bool:
+    head = section.split(".", 1)[0]
+    full = f"{section}.{key}"
+    return full in VALUE_KEYS or (head == "http" and f"{head}.{key}" in VALUE_KEYS)
+
+
 _SH_SPLIT = re.compile(r"[\s;&|()<>{}=`'\"]+")
 _SH_TOPLEVEL = re.compile(r"\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)"
                           r"|`\s*git\s+rev-parse\s+--show-toplevel\s*`")
@@ -2418,12 +2583,23 @@ def _glued_values(toks: set[str]) -> set[str]:
     return out
 
 
-def _expand2(value: str, base: Path) -> tuple[Path, Path]:
+def _expand2(value: str, base: Path, pathname: bool = False) -> tuple[Path, Path]:
     """(literal path, canonical path) — the literal detects symlinks, the
     canonical one is hashed. Like git's interpolate_path: `~/x` is $HOME/x,
     `~user/x` is that user's home (getpwnam) — only `~/` was expanded, so a
     `core.hooksPath = ~user/vol/hooks` was never watched. [50] An unknown user
-    stays literal (git dies on it)."""
+    stays literal (git dies on it). `pathname`: the value is one git reads
+    through git_config_pathname or as an include path, where a leading
+    `%(prefix)/` is git's installation prefix (git_prefix), before `~` and
+    only there — a program's argument is not interpolated. The rest, when
+    absolute, is taken as is (system_path: `%(prefix)//x` is `/x`); exactly
+    that prefix, once: `./%(prefix)/x`, `%(prefix)x`, `~/%(prefix)/x` and a
+    bare `%(prefix)` stay literal, as for git. A trusted `core.hooksPath =
+    %(prefix)/../<volume>/.githooks` was watched as the literal
+    `<root>/%(prefix)/…`, which does not exist. [128]"""
+    if pathname and value.startswith(PREFIX_MARK):
+        rest = value[len(PREFIX_MARK):]
+        value = rest if rest.startswith("/") else git_prefix() + "/" + rest
     p = Path(os.path.expanduser(value)) if value.startswith("~") else Path(value)
     literal = p if p.is_absolute() else base / p
     return literal, literal.resolve()
@@ -2506,7 +2682,9 @@ def _hard_link(p: Path, st: os.stat_result, link_zones: tuple[Path, ...]) -> Non
     made lie there. A program the global config names elsewhere may have
     other names — Homebrew ships hard-linked binaries, on the same volume
     as $HOME on macOS — and is left alone: nothing the sandbox writes shares
-    its inode. A symlink is judged by its target's path (`p` resolved). [88]"""
+    its inode. A symlink is judged by its target's path (`p` resolved). [88]
+    Outside the zones, a watched file whose other name is in the gitdir is
+    refused all the same (check_hard_links_into_gitdir, [127])."""
     if st.st_nlink > 1 and any(p == z or z in p.parents for z in link_zones):
         raise Refuse(f"hard link in a watched zone: {p} has {st.st_nlink} names, and git "
                      f"writes files of the gitdir by name (COMMIT_EDITMSG, a reflog…), which "
@@ -2662,12 +2840,71 @@ class Inspection:
         return self.scan.refs
 
 
+def check_hard_links_into_gitdir(repo: Repo, man: dict[tuple[str, str], Entry]) -> None:
+    """[88] carried to the pair of names. A watched file outside the tree
+    (`ext`: `core.hooksPath = ../shared-hooks`, local or global, in the
+    volume) is refused by _hard_link nowhere — Homebrew's binaries have
+    other names — so the sandbox linked such a hook to `.git/COMMIT_EDITMSG`
+    and `commit --amend` rewrote it. The rule here: an `ext` file with
+    another name **in the gitdir** (or the common dir) is refused, whatever
+    the zone. The kernel names no other name of an inode, so they are
+    looked for: every `ext` entry with `st_nlink > 1` on the device of a
+    gitdir (a hard link never crosses filesystems: Homebrew on another
+    volume is never even looked at) has its (device, inode) collected, and
+    only then — a rare state, nothing is walked otherwise — the gitdirs are
+    walked, volatile zones included, except `objects/` and `lfs/` of each
+    gitdir root (written through a temporary file and a rename, never in
+    place, and the only zones that cost). Not a list of the names git
+    writes in place: every name of the gitdir counts. [127]"""
+    bases = {repo.gitdir, repo.common}
+    devs: set[int] = set()
+    for base in bases:
+        try:
+            devs.add(os.stat(base).st_dev)
+        except OSError:
+            continue                       # unreadable: refused by the walk already
+    linked: dict[tuple[int, int], str] = {}
+    for scope, path in man:
+        if scope != "ext":
+            continue
+        try:
+            st = os.stat(path)             # a symlink's target: what git writes
+        except OSError:
+            continue                       # vanished: the next check sees it
+        if st.st_nlink > 1 and st.st_dev in devs:
+            linked[(st.st_dev, st.st_ino)] = path
+    if not linked:
+        return
+    for base in bases:
+        roots: dict[Path, Path] = {base: base}
+        for dirpath, dirnames, filenames in os.walk(base, onerror=_walk_error):
+            d = Path(dirpath)
+            root = roots[base] if d == base else _child_root(d, roots[d.parent])
+            roots[d] = root
+            if d == root:
+                dirnames[:] = [n for n in dirnames if n not in ("objects", "lfs")]
+            for name in filenames:
+                try:
+                    st = os.lstat(d / name)
+                except OSError:
+                    continue
+                other = linked.get((st.st_dev, st.st_ino))
+                if other is not None:
+                    raise Refuse(f"hard link into the gitdir: {other} is also {d / name}, and git "
+                                 f"writes files of the gitdir by name (COMMIT_EDITMSG, a reflog…), "
+                                 f"which would rewrite it. Replace it by a copy (copy it aside, move "
+                                 f"the copy over it), inspect it, then `gitguard trust`.")
+
+
 def inspect(repo: Repo) -> Inspection:
-    """config_refs → check_structure → manifest. Raises Refuse on a
-    structural problem; the fingerprint is not computed then."""
+    """config_refs → check_structure → manifest → the hard links of the
+    manifest's `ext` entries. Raises Refuse on a structural problem; the
+    fingerprint is not computed then."""
     scan = config_refs(repo)
     check_structure(repo, scan.refs)
-    return Inspection(repo, scan, manifest(repo, scan.refs))
+    man = manifest(repo, scan.refs)
+    check_hard_links_into_gitdir(repo, man)
+    return Inspection(repo, scan, man)
 
 
 # -------------------------------------------------------------------- state
@@ -2714,7 +2951,13 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]],
     """Record `man` as the reference. The caller passes the state it computed
     and showed (an Inspection's `refs` and `new`): we validate exactly what
     was seen, never a recomputed state the container could have altered in
-    the meantime. No default: the function cannot compute one."""
+    the meantime. No default: the function cannot compute one.
+    `ensure_ascii`: a name that is not UTF-8 (`hooks/pre-commit-\\xff`, a
+    Linux filesystem accepts it) reaches here as a surrogate-escaped str
+    (os.walk); written as UTF-8 it raised UnicodeEncodeError after the diff
+    was shown, and `trust` — the way out — died. Escaped, it is `\\udcff` in
+    the JSON, read back as the same str, and os.fsencode gives the byte
+    back: the manifest stays exact. [131]"""
     STATE.mkdir(parents=True, exist_ok=True)
     STATE.chmod(0o700)
     key = repo.key
@@ -2726,7 +2969,7 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]],
         # `restore` allows itself to delete (outside the gitdir).
         "refs": [[sc, str(p)] for sc, p in refs],
         "entries": [e.__dict__ for e in sorted(man.values(), key=lambda e: (e.scope, e.path))],
-    }, indent=1, ensure_ascii=False))
+    }, indent=1, ensure_ascii=True))
     # The backup is built alongside then swapped in: a crash midway leaves the
     # old state intact, never a manifest without its backup.
     import shutil
@@ -2820,7 +3063,7 @@ def update_pending(key: Path, fn) -> dict | None:
             p.unlink(missing_ok=True)
         else:
             tmp = Path(str(p) + ".tmp")
-            tmp.write_text(json.dumps(new, indent=1, ensure_ascii=False))
+            tmp.write_text(json.dumps(new, indent=1, ensure_ascii=True))
             os.replace(tmp, p)
         return new
     finally:
@@ -3885,6 +4128,14 @@ def _alias_parts(value: str) -> tuple[str | None, list[tuple[str, str | None]]]:
     return (words[i] or None) if i < len(words) else None, pairs
 
 
+# `git maintenance run` long options (git 2.47 and 2.50, `-h`; held to the
+# git under test in tests/test_claims.py): True when the option takes a
+# separate value. parse-options accepts any unique prefix (`--det`, `--d`)
+# and its `--no-` form: keep_attached must read them as git does. [132]
+MAINTENANCE_RUN_OPTIONS = {"--auto": False, "--detach": False, "--quiet": False,
+                           "--schedule": True, "--task": True}
+
+
 def keep_attached(args: list[str], orig: Path) -> list[str]:
     """A child git stays in the command's process tree. The marker lives as
     long as the process that set it is an ancestor; a git that daemonizes
@@ -3899,7 +4150,20 @@ def keep_attached(args: list[str], orig: Path) -> list[str]:
     rest = split_global_options(args, orig).rest
     i = len(args) - len(rest)
     if rest[:2] == ["maintenance", "run"]:
-        return [*args[:i], *("--no-detach" if a == "--detach" else a for a in rest)]
+        out, j = list(rest[:2]), 2
+        while j < len(rest):
+            a = rest[j]
+            if a == "--":
+                out += rest[j:]; break
+            name, eq, _ = a.partition("=") if a.startswith("--") else (a, "", "")
+            opt, neg = _long_option(name, MAINTENANCE_RUN_OPTIONS) if a.startswith("--") else (None, False)
+            if opt == "--detach" and not neg and not eq:
+                a = "--no-detach"
+            out.append(a)
+            if opt is not None and MAINTENANCE_RUN_OPTIONS[opt] and not eq and j + 1 < len(rest):
+                out.append(rest[j + 1]); j += 1      # the value of --task/--schedule, as given
+            j += 1
+        return [*args[:i], *out]
     if rest[:1] == ["gc"]:
         return ["-c", "gc.autoDetach=false", *args]
     return args

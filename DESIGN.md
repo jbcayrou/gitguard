@@ -110,8 +110,25 @@ gitguard itself. The former default `/usr/bin/git` ran Apple's git instead
 of Homebrew's, with another system config.
 
 That git's system config (`<prefix>/etc/gitconfig`, derived from the
-binary's path) is read along with `/etc/gitconfig`: changing the real git
-changes the fingerprint (one `trust`). Hooks, `rebase --exec` and every
+binary's path) is read along with `/etc/gitconfig`; under
+`GIT_CONFIG_NOSYSTEM` neither is, as for git, which honours it as a
+boolean whatever `GIT_CONFIG_SYSTEM` names ([133]: a system
+`filter.lfs.required = true` named a tree file git never saw). Changing
+the real git changes the fingerprint (one `trust`). **The one thing
+gitguard runs git to learn**
+is its installation prefix (`git_prefix`, [128]): what a leading
+`%(prefix)/` in a pathname value or an include path expands to
+(`interpolate_path` → `system_path`, before `~`; not the exec path, which
+`GIT_EXEC_PATH` moves and the prefix ignores), a constant of the binary
+that nothing but the binary knows. It is asked from `/` (no repository
+discovered), with every `GIT_*` variable dropped, `GIT_CONFIG_NOSYSTEM`
+and `GIT_CONFIG_GLOBAL=/dev/null` (no file of the user's read), no pager,
+as `git config --get` of a `-c` value: nothing of a repository, no hook,
+no alias (a builtin). Once per process, only when a value starts with
+`%(prefix)/`; no absolute answer is a refusal (the way out: spell the
+path). A trusted `core.hooksPath = %(prefix)/../<volume>/.githooks` was
+watched as the literal `<root>/%(prefix)/…`, which does not exist, and
+git ran `.githooks` unwatched; the same through `include.path`. Hooks, `rebase --exec` and every
 child of the real git call `<exec-path>/git`: gitguard too, once diverted
 there (DESIGN-exec-path.md; `real_git()` finds `git.real` next to that
 path as well, no recursion). `/usr/bin/git-receive-pack`,
@@ -329,6 +346,21 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
      a link it made lie there; a program the global config names elsewhere
      (Homebrew ships hard-linked binaries, on the same volume as `$HOME`
      on macOS) is left alone, nothing the sandbox writes shares its inode.
+     Outside those zones the rule is carried to the **pair of names**
+     (`check_hard_links_into_gitdir`, [127]): a hooks directory outside
+     the tree but in the volume (`core.hooksPath = ../shared-hooks`, scope
+     `ext`) had its `commit-msg` linked to `COMMIT_EDITMSG` all the same.
+     The kernel names no other name of an inode, so they are looked for:
+     every `ext` entry with `st_nlink > 1` on the device of a gitdir (a
+     hard link never crosses filesystems; Homebrew on another volume is
+     not even looked at) has its (device, inode) collected, and only then
+     the gitdirs are walked, volatile zones included, except `objects/`
+     and `lfs/` of each root (written through a temporary file and a
+     rename, never in place; the only zones that cost): an inode found
+     there is refused. Every name of the gitdir counts, no list of the
+     names git writes in place; nothing is walked when no such link
+     exists. Tree files are not at risk: git writes them by unlink and
+     create (`write_entry`), which breaks a shared inode.
    - every file of the repository git reads (config, gitfile, `commondir`,
      HEAD, index, todo files) goes through `read_file`: opened
      `O_NONBLOCK`, anything but a regular file refused at once (a FIFO, a
@@ -434,7 +466,20 @@ top-level file would be a hook, and the root is never fingerprinted as a
 whole ([59]: `$(git rev-parse --show-toplevel)` as hooksPath left
 `<root>/pre-commit` unwatched). git executes files, and a
 directory in any other value is a program argument (`safe.directory =
-~/projects`, `remote.origin.url = /local/repo`, `!make -C src`). **A file
+~/projects`, `remote.origin.url = /local/repo`, `!make -C src`). **A
+boolean or a number on a key git reads as one names nothing**
+(`VALUE_KEYS`, [129]: exactly the `[bool]` and `[int]` sections of the
+inventory, the keys compared before a `git_config_bool` /
+`git_config_int` in git's source, held equal by test_claims — never
+curated by hand). Without it `git init`'s own `core.bare = false`,
+`core.filemode = true`, `core.repositoryformatversion = 0` watched a tree
+file named `false`, `true` or `0` and refused every command once it
+changed, no sandbox involved. Any other value on such a key (git dies on
+it) keeps the generic rule. A string key (`user.name`,
+`init.defaultBranch`) has no reader of its own in git's source
+(`git_config_string` serves `core.editor` too): not provable, not listed
+— a tree file named after one is watched, `trust` names it (Known
+limitations). **A file
 is not retained for the keys whose value git reads as data** (`DATA_KEYS`,
 the mirror of `DIR_KEYS`: `user.signingKey`, `gpg.ssh.allowedSignersFile`,
 `core.excludesFile`, `core.attributesFile`, `commit.template`,
@@ -927,7 +972,10 @@ judged tree — otherwise it is judged on its own ([111] [115] [120]); a
 served repository covers its gitdir and common dir exactly, and nothing
 in a tree ([105] [121] [122]). A child git does not detach either
 (`keep_attached`): a daemonized `maintenance run --detach` left the
-command's process tree and found the marker dead ([117]). No route is
+command's process tree and found the marker dead ([117]); the option is
+read as parse-options reads it, any unique prefix (`--det`, [132]),
+against the option table of `maintenance run` held to `git maintenance
+run -h`. No route is
 guessed any more: whatever enters, enters through gitguard. `trust`,
 `retrust` and `list` warn when the exec path does not lead to gitguard or
 is stale (`check_wrap`); `gitguard exec-path` builds one where git's own
@@ -1005,7 +1053,7 @@ into the tree was not watched.
 
 ## Tests
 
-**`python3 -m pytest`** (~1300 tests, expected failures [44], [71], [74], [95], [123], [126] — accepted
+**`python3 -m pytest`** (~1300 tests, expected failures [44], [71], [74], [95], [123], [126], [129] — accepted
 limitations; ~280 s, ~60 s with `-n 8` on the command line),
 to run before any change:
 
@@ -1074,17 +1122,20 @@ to run before any change:
 - `tests/inventory.py` and `tests/inventory/git-<ver>.txt` — **git's
   universe, from its source**: the names git opens under a gitdir
   (`GIT_PATH_FUNC`, `repo_git_path`), the config keys it reads through
-  `git_config_pathname`, the hooks of `githooks.adoc`, the options of
-  `git.c`. The bypass catalogue grew one case at a time for fourteen
+  `git_config_pathname`, as a boolean (`git_config_bool`…, `[bool]`) or a
+  number (`git_config_int`…, `[int]`; the two are `VALUE_KEYS`, [129]),
+  the hooks of `githooks.adoc`, the options of `git.c`, the callers that
+  detach. The bypass catalogue grew one case at a time for fourteen
   passes ([19] [51] [55] [83] [88] each a gitdir name nobody had listed,
   [56] a pathname key, [97] a global option) because that universe was
-  never written down; five regular expressions over git's source
+  never written down; a handful of regular expressions over git's source
   enumerate it. The snapshot is committed, the suite does not need git's
   source. **On a git upgrade**: clone the release, `python3
   tests/inventory.py <src> > tests/inventory/git-<ver>.txt`, `diff` the
   two snapshots, classify every new line (volatile, reader, hashed,
-  DATA_KEYS, DIR_KEYS, a global option), then `pytest -m discovery` and
-  the full suite. `:(optional)` ([91]), `hook.<name>.command` ([92]) and
+  DATA_KEYS, DIR_KEYS, VALUE_KEYS — regenerate that one, it is the
+  inventory —, a global option, a detaching caller), then `pytest -m
+  discovery` and the full suite. `:(optional)` ([91]), `hook.<name>.command` ([92]) and
   the subsection alias ([90]) were release changes a review found; the
   diff shows them first.
 - `tests/conftest.py` — fixtures: `gg` (isolated environment: HOME, state,
@@ -1464,6 +1515,21 @@ the files, not the order.
   not hashed ([56]): a global change that names no file of the volume
   (`alias.x = !curl …`, `core.pager`) is not seen. Writing `~/.gitconfig`
   takes the same access as writing the state directory: out of the model.
+- **Accepted [129], strings**: a tree file named after a *string* value of
+  the config (`init.defaultBranch = main` and a build output `main`,
+  `user.name = t` and a file `t`) is watched and refused once it changes.
+  Booleans and numbers are excluded mechanically (`VALUE_KEYS`, from git's
+  source); a string key cannot be proved harmless the same way
+  (`git_config_string` reads `core.editor` too), and a hand-curated list
+  is not grown without a real case (the rule of [71] [74]). `trust` names
+  the file. xfail record: `test_tree_file_named_like_a_string_value_is_silent`.
+  Keys of another program (git-lfs's `filter.lfs.required = true`) and
+  of a wildcard section compared on its last part (`remote.<n>.prune`)
+  are not in the inventory either: the same cost.
+- A hard link the sandbox makes between a watched `ext` file and a file
+  *outside* the gitdir that git would write in place: none known (git
+  writes tree files by unlink and create); `check_hard_links_into_gitdir`
+  looks in the gitdirs only ([127]).
 - gitguard.py has no dependency outside the stdlib (diff via `difflib`); the
   tests need `pytest` and `git`.
 - A context without a terminal and without a desktop session (ssh, cron,

@@ -136,3 +136,28 @@ def attack_hardlink_commit_editmsg_to_tree_hook(gg: GG, repo: Path, tmp_path: Pa
     gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
     gg.trust(repo)
     hardlink_editmsg_to_hook(gg, repo, hook, str(payload(tmp_path)))
+
+
+def attack_hardlink_commit_editmsg_to_ext_hook(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[127] the same into a hook outside the tree but in the volume (local
+    core.hooksPath = ../shared-hooks, scope ext): the hard-link refusal of
+    [88] stops at the tree, the gitdir and the common dir, and the sandbox
+    can link() anything its mount holds (positive control: test_commands)"""
+    from tests.attacks._helpers import hardlink_editmsg_to_hook, payload
+    hook = tmp_path / "shared-hooks/commit-msg"
+    write_exec(hook, "#!/bin/sh\nexit 0\n")
+    assert gg.git("config", "core.hooksPath", "../shared-hooks", cwd=repo).rc == 0
+    gg.trust(repo)
+    hardlink_editmsg_to_hook(gg, repo, hook, str(payload(tmp_path)))
+
+
+def attack_hardlink_commit_editmsg_to_global_hook(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[127] the same with a global core.hooksPath naming a directory of the
+    volume (the layout of [16]): the prevention layer CLAUDE.md recommends
+    is no help when the directory is on the mount"""
+    from tests.attacks._helpers import hardlink_editmsg_to_hook, payload
+    hook = tmp_path / "vol-hooks/commit-msg"
+    write_exec(hook, "#!/bin/sh\nexit 0\n")
+    assert gg.git("config", "--global", "core.hooksPath", str(tmp_path / "vol-hooks")).rc == 0
+    gg.trust(repo)
+    hardlink_editmsg_to_hook(gg, repo, hook, str(payload(tmp_path)))
