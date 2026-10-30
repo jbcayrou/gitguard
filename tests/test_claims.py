@@ -205,23 +205,34 @@ def test_in_process_entry_needs_an_activation_gitguard_refuses(gg: GG, repo: Pat
 
 def test_pathspec_activation_grep_tree_enters_in_process(gg: GG, repo: Path,
                                                          tmp_path: Path) -> None:
-    """[126], the accepted limitation's record: with a `submodule.active`
-    pathspec already trusted (what `clone --recurse-submodules` writes), a
-    gitlink in a tree object is an active submodule with no config write,
-    and `grep --recurse-submodules <tree>` opens the planted gitdir
-    in-process — wrapped children change nothing, no child runs. Every
-    other in-process reader executes nothing of it. The grep line failing
-    means git closed the entry ([126] moves to fixed); another reader
-    executing means the limitation grew (a new catalogue entry)."""
+    """[126]: with a `submodule.active` pathspec already trusted (what `clone
+    --recurse-submodules` writes), a gitlink in a tree object is an active
+    submodule with no config write, and `grep --recurse-submodules <tree>`
+    opens the planted gitdir in-process — no child runs, the wrap judges
+    nothing. The real git runs its core.fsmonitor (positive control: the
+    entry exists); through gitguard it does not: PINNED_CONFIG puts
+    `core.fsmonitor=false` in GIT_CONFIG_PARAMETERS, which outranks the
+    planted repository's config; GITGUARD_KEEP_FSMONITOR lets it through
+    again. Every other in-process reader executes nothing of it. The
+    control failing means git closed the entry ([126] moves to fixed);
+    another reader executing means the pin's proof grew (a new entry)."""
     from tests.attacks._helpers import plant_active_gitlink
     mark = plant_active_gitlink(gg, repo, tmp_path, planting="tree")
-    assert gg.run("git", "grep", "--recurse-submodules", "s", "HEAD", cwd=repo).rc == 0
-    assert mark.exists(), "grep no longer enters in-process: [126] is closed, move it to fixed"
+    cmd = ["grep", "--recurse-submodules", "s", "HEAD"]
+    r = subprocess.run(["git", *cmd], cwd=repo, env=gg.raw_env, capture_output=True)
+    assert r.returncode == 0 and mark.exists(), "grep no longer enters in-process: [126] is closed, move it to fixed"
+    mark.unlink()
+    assert gg.run("git", *cmd, cwd=repo).rc == 0
+    assert not mark.exists(), "the planted core.fsmonitor ran through gitguard: the pin is gone"
+    gg.env["GITGUARD_KEEP_FSMONITOR"] = "1"
+    assert gg.run("git", *cmd, cwd=repo).rc == 0
+    assert mark.exists(), "GITGUARD_KEEP_FSMONITOR no longer lets the hook through: update its doc"
+    del gg.env["GITGUARD_KEEP_FSMONITOR"]
     for cmd in (["grep", "--recurse-submodules", "s"], ["ls-files", "--recurse-submodules"],
                 ["diff", "--cached", "--submodule=log"], ["rev-list", "--objects", "HEAD"],
                 ["status"]):
         mark.unlink(missing_ok=True)
-        gg.run("git", *cmd, cwd=repo)
+        subprocess.run(["git", *cmd], cwd=repo, env=gg.raw_env, capture_output=True)
         assert not mark.exists(), f"`git {' '.join(cmd)}` now executes the planted config: a new entry"
 
 

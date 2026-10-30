@@ -1273,3 +1273,20 @@ def test_alias_command_word_as_git(gg: GG, tmp_path: Path, form: str) -> None:
         assert word == (first or None), (exp.group(0), word)
     else:
         assert word is None, (res.stderr, word)
+
+# ===================== core.fsmonitor: a boolean is no hook path (PINNED_CONFIG)
+BOOL_VARIANTS = ["true", "TRUE", "yes", "On", "false", "no", "OFF", "", "0", "1", "2", "-1",
+                 "+3", "010", "0x1f", "0x0", "1k", "2M", "1g", " 7", "1 ", "08", "0x", "x",
+                 "./hook", "truth", "1kk", "k", "1.5"]
+
+
+@pytest.mark.parametrize("value", BOOL_VARIANTS)
+def test_git_maybe_bool_matches_git(gg: GG, repo: Path, value: str) -> None:
+    """_git_maybe_bool against git_parse_maybe_bool (`git config
+    --type=bool`, which dies on what is no boolean): a boolean
+    `core.fsmonitor` is the daemon or nothing, never a path the scan
+    should resolve — the pin's `false` reaches every child's scan."""
+    r = subprocess.run(["git", "-c", f"core.fsmonitor={value}", "config", "--type=bool", "core.fsmonitor"],
+                       cwd=repo, env=gg.raw_env, capture_output=True, text=True)
+    want = None if r.returncode != 0 else r.stdout.strip() == "true"
+    assert gg_mod._git_maybe_bool(value) is want, (value, r.stdout, r.stderr)

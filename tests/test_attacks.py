@@ -40,7 +40,8 @@ OPEN = {
     "attack_alias_script_in_subshell_after_cd": "[71] accepted limitation (DESIGN.md, Known limitations)",
     "attack_alias_script_glued_to_empty_variable": "[74] accepted limitation (DESIGN.md, Known limitations)",
     "attack_active_submodule_gitlink_in_head_runs_in_process":
-        "[126] accepted limitation (DESIGN.md, Known limitations)",
+        "[126] no refusal: the in-process entry is disarmed by the fsmonitor pin "
+        "(PINNED_CONFIG, test_claims.py), git runs",
 }
 
 

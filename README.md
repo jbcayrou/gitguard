@@ -385,6 +385,7 @@ works); refusals and diagnostics go to stderr.
 | `GITGUARD_NO_PROMPT=1` | Never ask on the terminal; refuse directly. |
 | `GITGUARD_WAIT` | Seconds a git without a terminal waits for `gitguard pending` (default 60, 0 = never). |
 | `GITGUARD_NO_NOTIFY=1` | No desktop notification. |
+| `GITGUARD_KEEP_FSMONITOR=1` | Do not pin `core.fsmonitor=false` on the git gitguard runs. By default gitguard appends it to `GIT_CONFIG_PARAMETERS`, which outranks every repository's own config: a repository planted in the work tree that git reads in-process (an active submodule, `git grep --recurse-submodules <rev>`) cannot run its fsmonitor hook. Set this to keep a fsmonitor hook or daemon of your own; `trust` then warns when a `submodule.active` pathspec makes that reading possible. |
 | `GITGUARD_DEBUG=1` | Full traceback on internal errors (otherwise a one-line message, exit 1, git not run). |
 | `NO_COLOR` | Disable colours. |
 

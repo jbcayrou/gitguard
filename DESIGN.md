@@ -138,7 +138,9 @@ variable is absolute, as the spec requires, else `~/.local/state/gitguard`),
 `GITGUARD_ALLOW_REBASE_EXEC`, `GITGUARD_NO_PROMPT` (never ask on the
 terminal, refuse directly), `GITGUARD_WAIT` (seconds a git without a
 controlling terminal waits for `gitguard pending`, default 60, 0 = never),
-`GITGUARD_NO_NOTIFY` (no desktop notification), `GITGUARD_DEBUG` (full
+`GITGUARD_NO_NOTIFY` (no desktop notification), `GITGUARD_KEEP_FSMONITOR`
+(do not pin `core.fsmonitor=false` on the git gitguard runs: "The command
+that writes what it then reads", in-process case), `GITGUARD_DEBUG` (full
 traceback of an internal error, otherwise a neutralized message and exit 1,
 git not run), `NO_COLOR`.
 
@@ -1235,7 +1237,46 @@ read by the `maintenance` child, which inherits the judgment ([95] [123])
 — it is an accepted limitation with a `trust`-time warning (every file the
 config names in the tree), and the prevention layer is the answer (a
 global `core.hooksPath` outside every tree, `safe.bareRepository=explicit`,
-a mount the sandbox cannot write `.git/` on).
+a mount the sandbox cannot write `.git/` on); if the reading is done
+**in-process in another repository** — an active submodule read by `grep`
+or `ls-files --recurse-submodules`, no child for the wrap to judge ([126])
+— the one thing such a reader executes, `core.fsmonitor` on the index
+refresh, is disarmed by a config gitguard pins on every git it runs
+(`PINNED_CONFIG`, below).
+
+**The pin.** `pin_config_env` appends `'core.fsmonitor'='false'` to
+`GIT_CONFIG_PARAMETERS` in the environment of the real git, right before
+it runs and never before the scan (the scan reads the user's environment,
+[48]). Command-line config is what git reads first for **every**
+repository the process opens, the one entered in-process included, and
+what it hands to its children: a global `core.fsmonitor = false` would not
+do, the planted repository's own config outranks it, and only the
+command's config outranks that. Measured on git 2.50 (replay of [126],
+2026-10-30): with the variable the planted hook does not run; without, it
+does. The list is closed and held to git like `branch_tracking_only`: the
+in-process table of `tests/test_claims.py` records, per reader, what it
+executes of the nested repository — only fsmonitor, only `grep` and
+`ls-files` — and a reader executing anything else is a new entry and a
+new line of the list, never a guess. `false` is git's boolean
+(lookup_fsmonitor_settings: a boolean is the built-in daemon or nothing,
+only a non-boolean is a hook path), so `ConfigScan` resolves no path from
+it: the children read the pin in their environment, and a file named
+`false` at the root must not become a watched path (`_git_maybe_bool`,
+parity-tested). Appended with a blank, after what the user's environment
+holds, in git's own format (`_sq_quote`); the user's `-c` comes after it
+in git's list and wins — their own input, as is the environment. What the
+user loses: a fsmonitor hook or daemon of their own, on every command
+gitguard runs, unless `GITGUARD_KEEP_FSMONITOR` is set — then `trust` and
+the auto-trust of a clone warn on a `submodule.active` pathspec, the
+activation the in-process entry needs, and name the way out. Ruled out:
+pinning the trusted value instead of `false` (a hook path would run in
+the planted repository, relative to it); refusing or rewriting the
+pathspec (every recursive clone writes it; gitguard never rewrites a
+config); a guard on the parent's arguments (the guessed routes again);
+`GIT_CONFIG_COUNT` (a second format to write, renumbered around the
+user's). This is the switch's shape — a config set from outside for every
+command — on the one key no route guess can reach, which is why it is a
+closed list with a proof and not a return of `SWITCH_EXEMPT`.
 
 Ruled out for that last case, after trying it ([124]): a covered child in
 the judged repository re-hashing the tree-side references and refusing a
@@ -1363,25 +1404,30 @@ the files, not the order.
   names in the tree. A re-check by the child was tried and reverted ([124],
   "The command that writes what it then reads"). xfail record:
   `test_merge_checks_out_a_tracked_include_then_reads_it`.
-- **Accepted limitation [126]** (decided 2026-10-28, xfail record:
+- **[126], disarmed by the fsmonitor pin** (accepted on 2026-10-28, the
+  pin added on 2026-10-30; xfail record kept, gitguard does not refuse:
   `attack_active_submodule_gitlink_in_head_runs_in_process`): a trusted
   `submodule.active` **pathspec** — the `.` that `clone
   --recurse-submodules` writes — makes any gitlink an active submodule
   with no config write; a gitlink in a tree object (objects and refs:
   volatile) then lets `git grep --recurse-submodules <tree>` open the
   planted repository's gitdir **in-process** (repo_submodule_init tries
-  `<path>/.git` in the work tree first) and run its `core.fsmonitor` — no
-  child process for the exec-path wrap to judge. The index readers meet
-  the structural refusal first (the index gitlink); every other in-process
-  reader observed executes nothing (the record:
-  `test_pathspec_activation_grep_tree_enters_in_process`). Why accepted:
-  the only closure gitguard owns is refusing pathspec activation, which
-  would alert on every recursive clone for ever — gitguard never rewrites
-  a config — and a guard on the parent's arguments would be the guessed
-  routes again. Mitigation: `trust` warns on a `submodule.active` pathspec
-  and names the way out (`git config --unset-all submodule.active`; the
+  `<path>/.git` in the work tree first) — no child process for the
+  exec-path wrap to judge. What that reading executes is its
+  `core.fsmonitor`, and only that: `PINNED_CONFIG` sets it to `false` on
+  every git gitguard runs ("The command that writes what it then reads"),
+  so the entry reads the planted index and objects and runs nothing. The
+  index readers meet the structural refusal first (the index gitlink);
+  every other in-process reader observed executes nothing (the record:
+  `test_pathspec_activation_grep_tree_enters_in_process`, with the real
+  git as positive control). What stays open: a user who sets
+  `GITGUARD_KEEP_FSMONITOR` to keep a fsmonitor of their own — `trust`
+  and the auto-trust of a clone then warn on the pathspec and name the
+  way out (`git config --unset-all submodule.active`; the
   `submodule.<name>.url` the same clone wrote keeps each real submodule
-  active, and by-name activation is a hashed write, refused).
+  active, and by-name activation is a hashed write, refused) — and a git
+  that executes something else of a repository read in-process, which the
+  claims table catches at the next release.
 - `git --work-tree=<other> …` changes the set of hooks git runs, so the
   fingerprint differs from the repository's own tree ([72]): the tree is
   blessed with `GIT_WORK_TREE=<other> gitguard trust` (same state key),

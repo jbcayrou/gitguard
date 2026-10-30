@@ -382,7 +382,7 @@ system-wide replay; keep the `git.real` layout.
 | git enters another repository through a child | [6] [7] [14] [24] [36] [60] [66] [77] [78] [86] [87] | covered twice: the parent's structural refusals, the child's refusal at entry |
 | the submodule content diff | [89] | **closed** (XPASS on the VM); the accepted-limitation text and the `trust` warning go |
 | a tracked include read by the `maintenance` child | [95] [123] | **stays**: same repository, same command (section 2). Joins [44] as an accepted limitation; `trust` names every file the config names in the tree. A re-check by the child was tried and reverted ([124]) |
-| an active submodule entered in-process (`submodule.active` pathspec, `grep --recurse-submodules <tree>`) | [126] | **accepted limitation**: by-name activation stays hashed and refused; `trust` warns on a pathspec, with the way out |
+| an active submodule entered in-process (`submodule.active` pathspec, `grep --recurse-submodules <tree>`) | [126] | **disarmed** (2026-10-30): `core.fsmonitor=false` pinned through `GIT_CONFIG_PARAMETERS` on every git gitguard runs (`PINNED_CONFIG`, DESIGN.md "The command that writes what it then reads"); by-name activation stays hashed and refused; `GITGUARD_KEEP_FSMONITOR` reopens it, with the `trust` warning |
 | tracked hooks, sh readings | [44] [71] [74] | unchanged |
 | everything else (fingerprint scope, parsers, discovery, options, remotes, FPs) | ~75 | unchanged, untouched |
 
@@ -412,9 +412,12 @@ documented the loss).
   structural refusal first. Neither bars a **pathspec** activation already
   trusted — `submodule.active = .`, what `clone --recurse-submodules`
   writes — met by a gitlink in a tree object: `grep --recurse-submodules
-  <tree>` then opens the planted gitdir in-process ([126], accepted
-  limitation; `trust` warns on the pathspec and names the way out). The
-  day `status` goes in-process,
+  <tree>` then opens the planted gitdir in-process ([126]). What it
+  executes there is the one key the pin disarms: `core.fsmonitor=false`
+  in `GIT_CONFIG_PARAMETERS`, which outranks the planted config and
+  reaches the in-process repository and every child alike (`PINNED_CONFIG`,
+  2026-10-30; measured: the hook runs with the raw git, not through
+  gitguard). The day `status` goes in-process,
   the barrier vanishes without a test going red — unless the test exists.
   Hence (section 7, implemented): a claims test "git enters a planted
   repository through a child process" with a positive control, and a table

@@ -2345,15 +2345,64 @@ def test_exec_path_shim_is_built_and_checked(gg: GG, repo: Path, tmp_path: Path)
 
 # --------------------------------------------------- [126] pathspec activation
 def test_trust_warns_on_a_pathspec_activation(gg: GG, tmp_path: Path) -> None:
-    """[126] `trust` names the hazard and the way out when the config holds a
-    `submodule.active` pathspec (what `clone --recurse-submodules` writes);
-    per-name activation, a hashed write, gets no warning."""
+    """[126] With the fsmonitor pin off (GITGUARD_KEEP_FSMONITOR), `trust`
+    names the hazard of a `submodule.active` pathspec (what `clone
+    --recurse-submodules` writes) and the way out; with the pin on, the
+    hazard is disarmed and nothing is said; per-name activation, a hashed
+    write, gets no warning either way."""
     r = tmp_path / "r"
     gg.git("init", "-q", str(r))
+    assert gg.git("config", "submodule.active", ".", cwd=r).rc == 0
+    assert "submodule.active" not in gg.trust(r).err
+    gg.env["GITGUARD_KEEP_FSMONITOR"] = "1"
+    assert gg.git("config", "--unset-all", "submodule.active", cwd=r).rc == 0
     assert gg.git("config", "submodule.sub.active", "true", cwd=r).rc == 0
     assert "submodule.active" not in gg.trust(r).err
     assert gg.git("config", "submodule.active", ".", cwd=r).rc == 0
     res = gg.run("trust", cwd=r)
     assert res.rc == 0, res.text
-    assert "submodule.active" in res.err and "[126]" in res.err, res.text
-    assert "unset-all" in res.err, res.text
+    assert "submodule.active = ." in res.err and "unset-all" in res.err, res.text
+
+
+def test_clone_autotrust_warns_on_the_pathspec_it_writes(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[126] `clone --recurse-submodules` is what writes `submodule.active = .`,
+    and its auto-trust is where the user is: the warning and the way out
+    are printed there, not only at a later `trust`. A plain clone of the
+    same source, which activates nothing, gets no warning."""
+    from tests.attacks._helpers import add_submodule
+    add_submodule(gg, repo, tmp_path)
+    r = gg.run("git", "clone", "-q", "--recurse-submodules", str(repo), "pinned", cwd=tmp_path)
+    assert r.rc == 0 and "new repository trusted" in r.err, r.text
+    assert "submodule.active" not in r.err, r.text          # disarmed by the pin
+    assert not gg.check(tmp_path / "pinned").blocked
+    gg.env["GITGUARD_KEEP_FSMONITOR"] = "1"
+    r = gg.run("git", "clone", "-q", "--recurse-submodules", str(repo), "rec", cwd=tmp_path)
+    assert r.rc == 0 and "new repository trusted" in r.err, r.text
+    assert "submodule.active = ." in r.err and "unset-all" in r.err, r.text
+    assert not gg.check(tmp_path / "rec").blocked
+    r = gg.run("git", "clone", "-q", str(repo), "plain", cwd=tmp_path)
+    assert r.rc == 0 and "new repository trusted" in r.err, r.text
+    assert "submodule.active" not in r.err, r.text
+
+
+# ------------------------------------------------- PINNED_CONFIG: the fsmonitor pin
+def test_pinned_config_reaches_git_after_the_users_parameters(gg: GG, repo: Path) -> None:
+    """The pin is appended to GIT_CONFIG_PARAMETERS in git's own format: git
+    reads both the user's words and gitguard's (an ill-formed list makes
+    every command die "bogus format"); the user's `-c` comes after it in
+    git's list and wins, their own input; GITGUARD_KEEP_FSMONITOR drops
+    the pin."""
+    gg.env["GIT_CONFIG_PARAMETERS"] = "'user.name'='x y' 'core.fsmonitor'='./it'"
+    r = gg.run("git", "config", "--get-all", "core.fsmonitor", cwd=repo)
+    assert r.rc == 0 and r.out.splitlines() == ["./it", "false"], r.text
+    r = gg.run("git", "config", "--get", "user.name", cwd=repo)
+    assert r.rc == 0 and r.out.strip() == "x y", r.text
+    r = gg.run("git", "-c", "core.fsmonitor=./mine", "config", "--get-all", "core.fsmonitor", cwd=repo)
+    assert r.rc == 0 and r.out.splitlines() == ["./it", "false", "./mine"], r.text
+    gg.env["GITGUARD_KEEP_FSMONITOR"] = "1"
+    r = gg.run("git", "config", "--get-all", "core.fsmonitor", cwd=repo)
+    assert r.rc == 0 and r.out.splitlines() == ["./it"], r.text
+    del gg.env["GIT_CONFIG_PARAMETERS"], gg.env["GITGUARD_KEEP_FSMONITOR"]
+    r = gg.run("git", "config", "--get-all", "core.fsmonitor", cwd=repo)
+    assert r.rc == 0 and r.out.splitlines() == ["false"], r.text
+    assert gg.run("git", "--version", cwd=repo).rc == 0          # the passthrough is pinned too

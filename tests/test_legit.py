@@ -954,3 +954,32 @@ def test_submodule_of_submodule_worked_in_directly(gg: GG, repo: Path, tmp_path:
     gg.trust(sub)
     r = gg.run("git", "status", "--short", cwd=sub)
     assert r.rc == 0 and "gitguard:" not in r.err, r.text
+
+
+# ------------------------------------------------- PINNED_CONFIG: no false positive
+def test_boolean_fsmonitor_names_no_path(gg: GG, repo: Path) -> None:
+    """The fsmonitor pin puts `core.fsmonitor=false` in every child's
+    GIT_CONFIG_PARAMETERS, which the child's scan reads like a `-c`: a file
+    named `false` (or `1`) at the root must not become a watched path the
+    parent, unpinned at its scan, does not have. A boolean core.fsmonitor
+    is the daemon or nothing (lookup_fsmonitor_settings); a hook path is
+    watched as before. On a config without git's own booleans (`core.bare
+    = false` already watches a root file named `false`: a broader, older
+    rule)."""
+    for n in ("false", "1", "true", "hook"):
+        (repo / n).write_text("x\n")
+    (repo / ".git/config").write_text("[core]\n\trepositoryformatversion = 0\n")
+    def watched(params: str) -> list[str]:
+        gg.env["GIT_CONFIG_PARAMETERS"] = params
+        r = gg.run("trust", cwd=repo)
+        assert r.rc == 0, r.text
+        lines = [l for l in r.text.splitlines() if "references outside the gitdir" in l]
+        return sorted({w[3:].split("/")[-1] for l in lines for w in l.split() if w.startswith("wt:")})
+    assert watched("") == []
+    for v in ("false", "true", "1", "0", "yes", ""):
+        assert watched(f"'core.fsmonitor'='{v}'") == [], v
+    assert watched("'core.fsmonitor'='./hook'") == ["hook"]
+    assert watched("'core.fsmonitor'='hook'") == ["hook"]
+    assert watched("") == []                    # a transient value leaves with its command [48]
+    del gg.env["GIT_CONFIG_PARAMETERS"]
+    assert not gg.run("git", "status", "--short", cwd=repo).blocked     # pinned, nothing seen

@@ -18,9 +18,12 @@ paid for by a bypass.
 - **A fingerprint, never a blocklist.** gitguard hashes everything in the
   gitdir and excludes only what git rewrites (`VOLATILE_*`). On a false
   positive, add to the exclusion list; never go back to an inclusion list,
-  never add a "known dangerous keys" list. The auto-accept list in
-  `branch_tracking_only` is the one closed allowlist: three keys, each with
-  a proof that git cannot execute it.
+  never add a "known dangerous keys" list. Two closed lists exist, each
+  entry with its proof held to git in the tests: the auto-accept list in
+  `branch_tracking_only` (three keys git cannot execute) and
+  `PINNED_CONFIG` (`core.fsmonitor=false`, the one key an in-process
+  reader executes from a repository nobody judged, [126]; the proof is the
+  in-process table of `tests/test_claims.py`).
 - **Never run git to learn about a repository.** Discovery, config, gitfile,
   index, todo files: all read by gitguard's own ports of git's readers
   (`find_root`, `parse_git_config`, `index_gitlinks`, `_read_path_file`…).
@@ -77,7 +80,8 @@ gitguard exec-path [<dir>]   (re)build an exec path whose git is gitguard (macOS
 ```
 
 Environment: `GITGUARD_STATE`, `GITGUARD_REAL_GIT`, `GITGUARD_ALLOW_REBASE_EXEC`,
-`GITGUARD_NO_PROMPT`, `GITGUARD_WAIT`, `GITGUARD_NO_NOTIFY`, `GITGUARD_DEBUG`,
+`GITGUARD_NO_PROMPT`, `GITGUARD_WAIT`, `GITGUARD_NO_NOTIFY`, `GITGUARD_KEEP_FSMONITOR`,
+`GITGUARD_DEBUG`,
 `GITGUARD_JUDGED` (set by gitguard for the git it runs, read by child gits),
 `NO_COLOR`; git's own `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`,
 `GIT_INDEX_FILE`, `GIT_CEILING_DIRECTORIES`, `GIT_CONFIG_*`, `GIT_TEMPLATE_DIR`
@@ -99,7 +103,7 @@ are honoured as git honours them.
 | passthroughs that read no repository | `TRANSPORT`, `main` | Which git runs |
 | child gits: the marker (pid + start + judged gitdir/common/root/label), coverage by `gitdir_roots` and `tree_named`, `new`, the served repository, no detach, the exec-path wrap, its check and its macOS shim | `Judged`, `_ancestors`, `_proc_lineage`, `read_judged`, `set_judged`, `NewRepo`, `_served_repository`, `keep_attached`, `check_wrap`, `cmd_exec_path`, `PATH_QUERIES`, `run_git` | Nested repositories; DESIGN-exec-path.md |
 | performance | PERF.md | Nested repositories (end) |
-| what git writes then reads in one command ([44] [66] [77] [86] [88] [95] [123] [124]) | `Judged.covers`, `_hard_link` | The command that writes what it then reads |
+| what git writes then reads in one command ([44] [66] [77] [86] [88] [95] [123] [124]); what it reads in-process ([126]) | `Judged.covers`, `_hard_link`, `PINNED_CONFIG`, `pin_config_env`, `_git_maybe_bool` | The command that writes what it then reads |
 | accepted limitations [44], [71], [74], [126], out-of-scope cases | — | Known limitations |
 
 ## Tests

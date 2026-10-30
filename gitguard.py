@@ -33,7 +33,8 @@ System:   /usr/bin/git → gitguard, the real git diverted to /usr/bin/git.real
 Env:      GITGUARD_STATE, GITGUARD_REAL_GIT, GITGUARD_ALLOW_REBASE_EXEC,
           GITGUARD_NO_PROMPT, GITGUARD_WAIT (seconds a terminal-less git waits
           for `gitguard pending`, 0 = never, default 60), GITGUARD_NO_NOTIFY,
-          GITGUARD_DEBUG, NO_COLOR
+          GITGUARD_KEEP_FSMONITOR (do not pin core.fsmonitor=false on the git
+          gitguard runs), GITGUARD_DEBUG, NO_COLOR
 
 Threat model, design choices and vulnerability history: see DESIGN.md.
 """
@@ -1718,6 +1719,56 @@ def env_config() -> list[tuple[str, str, str]]:
     return out
 
 
+def _sq_quote(v: str) -> str:
+    """sq_quote (quote.c): `'…'`, a `'` or `!` inside as `'\\''` / `'\\!'`."""
+    return "'" + v.replace("'", "'\\''").replace("!", "'\\!'") + "'"
+
+
+def _git_maybe_bool(value: str) -> bool | None:
+    """git_parse_maybe_bool: `true`/`yes`/`on` and `false`/`no`/`off` (any
+    case), the empty value (false), then git_parse_int — strtoimax base 0
+    (`0x1f`, `010`) with a `k`/`m`/`g` unit — non-zero true; anything else
+    is no boolean (None)."""
+    v = value.lower()
+    if v in ("true", "yes", "on"):
+        return True
+    if v in ("false", "no", "off", ""):
+        return False
+    m = re.fullmatch(r"\s*([+-]?)(0x[0-9a-f]+|0[0-7]*|[1-9][0-9]*)([kmg]?)", v)
+    if m is None:
+        return None
+    n = int(m.group(2), 16 if m.group(2).startswith("0x") else 8 if m.group(2).startswith("0") and len(m.group(2)) > 1 else 10)
+    return n != 0
+
+
+# Config gitguard pins on every git it runs, through GIT_CONFIG_PARAMETERS:
+# what git reads first for any repository the process opens — a submodule
+# entered in-process included — and hands to its children. A closed list,
+# each entry with its proof in tests/test_claims.py: `core.fsmonitor` is
+# the one key an in-process reader (`grep`/`ls-files --recurse-submodules`
+# on an index refresh) executes from a repository nobody judged, the
+# `submodule.active` pathspec of a recursive clone having activated it
+# with no config write ([126]); `false` is git's boolean, never a path. A
+# global `core.fsmonitor = false` would not do: the planted repository's
+# own config outranks it; only the command's config outranks that. The
+# user's `-c` comes after it in git's list and wins: their own input.
+PINNED_CONFIG = (("core.fsmonitor", "false"),)
+
+
+def pin_config_env() -> None:
+    """Append PINNED_CONFIG to GIT_CONFIG_PARAMETERS in gitguard's own
+    environment, right before the real git is run (never before the scan:
+    the scan reads the user's environment, [48]). git's format, appended
+    with a blank as git_config_push_parameter appends a `-c`. Skipped under
+    GITGUARD_KEEP_FSMONITOR: the user keeps a hook or daemon the pin would
+    disable, and the hazard the pin closes."""
+    if _env_bool("GITGUARD_KEEP_FSMONITOR"):
+        return
+    words = [f"{_sq_quote(k)}={_sq_quote(v)}" for k, v in PINNED_CONFIG]
+    have = os.environ.get("GIT_CONFIG_PARAMETERS", "")
+    os.environ["GIT_CONFIG_PARAMETERS"] = (have + " " if have else "") + " ".join(words)
+
+
 def global_config_files() -> list[Path]:
     """System and global config files git may read. Deliberately broad
     (GIT_CONFIG_GLOBAL *and* ~/.gitconfig *and* XDG): watching one file too
@@ -2008,6 +2059,13 @@ class ConfigScan:
                 self.add(common / "hooks", common / "hooks", allow_dir=True)
         elif _data_key(section, key):
             return                       # a file read as data, never run [56]
+        elif section == "core" and key == "fsmonitor" and _git_maybe_bool(value) is not None:
+            # lookup_fsmonitor_settings: a boolean is the built-in daemon
+            # (true: `git fsmonitor--daemon`, a child git) or nothing
+            # (false); only a non-boolean is a hook path. The pin gitguard
+            # sets (PINNED_CONFIG) reaches every child's environment: a
+            # file named `false` at the root must not become a watched path.
+            return
         else:
             for tok in _glued_values(_value_tokens(value)):
                 # Read again against a submodule or a remote, a token is a
@@ -3856,6 +3914,7 @@ def run_git(args: list[str], orig: Path, newrepo: NewRepo | None, git: str,
     are part of the judged repository, which the parent's next command, or
     the clone's own auto-trust, takes as a whole."""
     os.chdir(orig)
+    pin_config_env()
     if judged is not None:
         args = keep_attached(args, orig)
     if newrepo is None:
@@ -3883,6 +3942,7 @@ def run_git(args: list[str], orig: Path, newrepo: NewRepo | None, git: str,
                 if judged is None or not judged.covers(insp.repo):
                     save_trust(insp.repo, insp.refs, insp.new)
                     info(f"new repository trusted: {d}")
+                    warn_accepted_limitations(insp)
             except Refuse as e:
                 warn(f"cannot trust {d} automatically: {e}")
     return rc
@@ -4419,6 +4479,39 @@ def cmd_exec_path(args: list[str]) -> None:
     err("  after a git upgrade: gitguard exec-path again (trust says when)")
 
 
+def warn_accepted_limitations(insp: "Inspection") -> None:
+    """What the trusted state leaves open by design, said where a trust is
+    recorded: `trust`, and the auto-trust of a clone or init (run_git) —
+    `clone --recurse-submodules` is what writes the pathspec, and its
+    auto-trust was silent about it, so the user only learnt of it at a
+    `trust` the auto-trust spares them.
+
+    What the trusted config names in the tree, but the files that are the
+    tree's own structure (`.gitmodules`, gitfiles): a hooks directory
+    (DIR_KEYS), an include, a script an alias runs. A checkout of someone
+    else's commit replaces them after the check, and the same command — or
+    its child gits, which inherit the judgment — reads the new version.
+    [44] [95] And a `submodule.active` pathspec when the fsmonitor pin is
+    off (GITGUARD_KEEP_FSMONITOR): an in-process entry with no child to
+    judge it and nothing to disarm it. [126]"""
+    intree = tree_named(insp.scan)
+    if intree:
+        warn(f"files the trusted config names in the work tree "
+             f"({' '.join(str(p.relative_to(insp.repo.root)) for p in intree)}): if git tracks "
+             f"them, a checkout/merge/reset/pull of a commit someone else created replaces "
+             f"them after the check, and git uses the new version in the same command. "
+             f"Review incoming changes to these files.")
+    if insp.scan.active_pathspecs and _env_bool("GITGUARD_KEEP_FSMONITOR"):
+        vals = " ".join(sorted(insp.scan.active_pathspecs))
+        warn(f"submodule.active = {vals}: every submodule path found in a commit counts "
+             f"as active, with nothing written to the config. A repository planted in the "
+             f"work tree and named by a commit someone else wrote then runs its "
+             f"core.fsmonitor under `git grep --recurse-submodules <rev>`, which "
+             f"GITGUARD_KEEP_FSMONITOR lets through. Way out: unset it, or `git config "
+             f"--unset-all submodule.active` (real submodules stay active through their "
+             f"submodule.<name>.url).")
+
+
 def check_wrap() -> None:
     """Warn (without refusing) when git's exec path does not lead to
     gitguard: the children of every git then run unwrapped, and a
@@ -4507,6 +4600,7 @@ def main(argv: list[str]) -> int:
         direct = passthrough(name, argv)
         if direct is not None:
             git = real_git()
+            pin_config_env()
             os.execv(git, [git, *direct])
         newrepo = parse_new_repo(argv)
         orig = apply_global_options(argv)
@@ -4585,29 +4679,7 @@ def main(argv: list[str]) -> int:
         wt = [f"{s}:{p}" for s, p in refs]
         if wt:
             hint(f"the config references outside the gitdir: {' '.join(wt)} → watched too")
-        # What the trusted config names in the tree, but the files that are
-        # the tree's own structure (`.gitmodules`, gitfiles): a hooks
-        # directory (DIR_KEYS), an include, a script an alias runs. A
-        # checkout of someone else's commit replaces them after the check,
-        # and the same command — or its child gits, which inherit the
-        # judgment — reads the new version. [44] [95]
-        intree = tree_named(insp.scan)
-        if intree:
-            warn(f"files the trusted config names in the work tree "
-                 f"({' '.join(str(p.relative_to(repo.root)) for p in intree)}): if git tracks "
-                 f"them, a checkout/merge/reset/pull of a commit someone else created replaces "
-                 f"them after the check, and git uses the new version in the same command. "
-                 f"Review incoming changes to these files.")
-        if insp.scan.active_pathspecs:
-            vals = " ".join(sorted(insp.scan.active_pathspecs))
-            warn(f"submodule.active = {vals} activates submodules by pathspec (what "
-                 f"`clone --recurse-submodules` writes): a repository planted in the tree "
-                 f"and named by a gitlink in a commit someone else created is active with "
-                 f"no config write, and `git grep --recurse-submodules <tree>` reads its "
-                 f"gitdir in-process, no child git to judge it ([126], accepted "
-                 f"limitation). Way out: `git config --unset-all submodule.active` — the "
-                 f"submodule.<name>.url the same clone wrote keeps each real submodule "
-                 f"active.")
+        warn_accepted_limitations(insp)
         check_safe_bare()
         check_wrap()
         return 0

@@ -780,11 +780,22 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      the gitlink from the tree and runs the gitdir in-process. `log
      --submodule=diff`, by contrast, enters through a child the wrap judges.
      Found 2026-10-28 while reviewing DESIGN-exec-path.md section 6.
-     Accepted limitation (2026-10-28, DESIGN.md "Known limitations"):
-     by-name activation stays a hashed config write, refused; `trust` warns
-     on a `submodule.active` pathspec and names the way out (`git config
-     --unset-all submodule.active`; the per-name keys the same clone wrote
-     keep every real submodule active).
+     Accepted limitation on 2026-10-28 (by-name activation stays a hashed
+     config write, refused; `trust` warns on the pathspec and names the way
+     out, `git config --unset-all submodule.active`), then disarmed on
+     2026-10-30: the one thing the in-process reader executes is
+     core.fsmonitor, and command-line config outranks every repository's
+     own, the one entered in-process included — gitguard appends
+     `'core.fsmonitor'='false'` to GIT_CONFIG_PARAMETERS on every git it
+     runs (PINNED_CONFIG, pin_config_env; replayed on git 2.50: the hook
+     runs with the raw git, not through gitguard). A closed list held to
+     git by the in-process table of test_claims.py, not a key blocklist:
+     a reader executing anything else is a new entry. GITGUARD_KEEP_FSMONITOR
+     drops the pin for a user with a fsmonitor of their own; the warning
+     moves there. Still no refusal (the xfail record stays): git reads the
+     planted index and objects, and runs nothing. The warning was also
+     moved to the auto-trust of the clone that writes the pathspec, where
+     the user is (warn_accepted_limitations).
 """
 from __future__ import annotations
 
