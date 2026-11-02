@@ -811,7 +811,7 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      entry with several names on a gitdir's device has its inode looked
      for in the gitdirs, volatile zones included (objects/ and lfs/ apart,
      written by rename), and is refused when found there
-     (check_hard_links_into_gitdir); nothing is walked otherwise.
+     (check_links_into_gitdir); nothing is walked otherwise.
 [128] `%(prefix)/` in a pathname value. git's interpolate_path
      (path.c) replaces a leading `%(prefix)/` by its installation prefix
      (`/usr`, `/opt/homebrew/opt/git`) before it expands `~`, for every
@@ -894,6 +894,89 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      by the seventeenth adversarial pass, 2026-10-30. Fix: no system file
      under GIT_CONFIG_NOSYSTEM, read as git_env_bool reads it (`_env_bool`
      now a git boolean: `2` is true).
+[134] RCE: the pair-of-names rule of [127] collected `ext` entries
+     only. A hook of the tree that is a symlink to a script outside the
+     tree but in the volume (`.githooks/commit-msg → ../shared/commit-msg`,
+     a husky layout sharing hooks) is a `wt` entry whose file is `ext`:
+     _hard_link judged its resolved target, outside every zone, and the
+     [127] collection never looked at it. `.git/COMMIT_EDITMSG` linked to
+     the script: check silent, `commit --amend` ran HEAD's message. Found
+     by the eighteenth adversarial pass (second external audit),
+     2026-10-31. Fix: every watched entry outside the gitdir, whatever its
+     scope, is stat'ed through its link; the gitdir walk is the same.
+[135] RCE: both link rules were written in `st_nlink`, and a symlink adds
+     no name to its target. A hook outside the gitdir that *is* a volatile
+     gitdir file (`vol-hooks/commit-msg → .git/COMMIT_EDITMSG`, directly or
+     through a directory of the volume the sandbox reroutes, the hook's
+     own string and bytes unchanged) was hashed by its target's bytes and
+     accepted; `commit --amend` rewrote the volatile file, the hook, and
+     ran it. The display gave the user nothing to judge (`modified
+     ext:…/commit-msg`). Found by the eighteenth adversarial pass,
+     2026-10-31. Fix: a watched entry outside the gitdir whose real path
+     is under the gitdir or the common dir is refused at once, whatever
+     `st_nlink` says (one realpath per entry, no walk); a link into the
+     tree or to another ext file stays judged by its bytes.
+[136] RCE (contrived: the user's own global config must carry an
+     `include.path` in the `%(prefix)/` form): [128] taught `_expand2` the
+     prefix and passed `pathname=True` at ConfigScan's three call sites;
+     iter_global_config, the fourth, still expanded an include without
+     it, to a literal `<dir>/%(prefix)/…` that does not exist. The
+     included file's `init.templateDir` was invisible to
+     _template_dir_configured, the gate of auto-trust: a clone copied the
+     template's hooks and was trusted at once ([42] reopened);
+     safe_bare_explicit missed the same include. Found by the eighteenth
+     adversarial pass, 2026-10-31. Fix: one helper (include_path) resolves
+     an include for both readers.
+[137] DoS: [130] guarded the stat of ConfigScan.add; every other read of
+     a watched path raised out of the generic handler as `internal
+     error`, `trust` included: a watched file made unreadable
+     (`_hash_into`, mode 000 on a hook, `.git/description`, an ext file),
+     a volatile directory made unreadable (`check_structure`'s iterdir on
+     `.git/logs`, which `gitdir_paths` never walks — and `entries()`
+     caught Refuse only, so `list`, `prune` and `retrust` died for every
+     registered repository), a file vanished between the walk and the
+     read. Found by the eighteenth adversarial pass, 2026-10-31. Fix: a
+     vanished file is skipped like a vanished directory; an unreadable
+     file or directory is a Refuse naming it (git cannot run what nobody
+     can read; readable again, the state is clean); `entries()` reports
+     an OSError as that repository's status.
+[138] DoS: [131] made the manifest survive a non-UTF-8 name; the state
+     key (`key_for`, `str(root).encode()`, strict) and the `.root` sidecar
+     (write_text) did not: a repository whose *root* is not UTF-8
+     (`proj-\xff`, legal on Linux) crashed `trust`, `diff`, `restore`,
+     `git status` and `forget`, the command that would have cleared it.
+     Found by the eighteenth adversarial pass, 2026-10-31. Fix: the key
+     hashes `os.fsencode(root)`, the sidecar is written and read through
+     surrogateescape.
+[139] false positive: VALUE_KEYS holds `notes.rewrite.` (the inventory's
+     trailing-dot wildcard: notes-utils.c reads every `notes.rewrite.<cmd>`
+     as a boolean) and _value_key compared the full key for equality, the
+     `http` special case its only wildcard: `notes.rewrite.amend = false`
+     watched a tree file named `false`. test_value_keys_are_the_inventory
+     holds the set, not the lookup. Found by the eighteenth adversarial
+     pass, 2026-10-31. Fix: an entry ending in `.` is a prefix of the key.
+[140] false positive: `os.environ.get(var) or default` read an empty
+     GIT_CONFIG_SYSTEM / GIT_CONFIG_GLOBAL as unset; for git an empty one
+     names no file (`""` opens nothing), and a GIT_CONFIG_GLOBAL that
+     names a file replaces `~/.gitconfig` and the XDG file. gitguard
+     parsed files git never read ([133]'s class). Found by the eighteenth
+     adversarial pass, 2026-10-31. Fix: presence, not truthiness, and
+     exactly the files git picks.
+[141] false positive (glibc ≥ 2.38): git_parse_signed is strtoimax(…, 0),
+     which with C23's strtol reads a `0b` binary literal; `_git_maybe_bool`
+     did not, so `core.bare = 0b11` named a tree file `0b11`, and
+     GIT_CONFIG_NOSYSTEM=0b11 was not honoured. On a libc without it
+     (macOS) git dies on the value, so reading it as a number is safe
+     everywhere. Found by the eighteenth adversarial pass, 2026-10-31.
+     Fix: `0b`/`0B` in the number grammar.
+[142] keep_attached's `gc` branch prepended `-c gc.autoDetach=false` and
+     read no argument: a default an explicit `--detach` (any unique
+     prefix, 2.47+) overrides, so a child `git gc --detach` of a hook or
+     an alias still left the process tree ([117] [132] again); and the
+     `-c` came before the command's own, so a `-c gc.autoDetach=true`
+     won. Found by the eighteenth adversarial pass, 2026-10-31. Fix:
+     GC_OPTIONS held to `git gc -h`, `--det*` rewritten to `--no-detach`,
+     the `-c` placed after the command's global options.
 """
 from __future__ import annotations
 

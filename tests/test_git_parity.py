@@ -1328,3 +1328,36 @@ def test_git_maybe_bool_matches_git(gg: GG, repo: Path, value: str) -> None:
                        cwd=repo, env=gg.raw_env, capture_output=True, text=True)
     want = None if r.returncode != 0 else r.stdout.strip() == "true"
     assert gg_mod._git_maybe_bool(value) is want, (value, r.stdout, r.stderr)
+
+
+@pytest.mark.parametrize("var", ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"])
+def test_global_config_files_empty_variable_means_no_file(gg: GG, tmp_path: Path, monkeypatch,
+                                                         var: str) -> None:
+    """[140] git distinguishes an unset GIT_CONFIG_SYSTEM / GIT_CONFIG_GLOBAL
+    from an empty one: empty names no file at all (git_system_config,
+    git_global_config: the path is taken as given, `""` opens nothing).
+    global_config_files fell back to the defaults on `or`: it parsed
+    `~/.gitconfig` where git read none ([133]'s class, a tree file named
+    by a value git never saw). And a GIT_CONFIG_GLOBAL that names a file
+    replaces `~/.gitconfig` and the XDG file, it does not add to them."""
+    home = Path(gg.env["HOME"])
+    (home / ".config/git").mkdir(parents=True)
+    (home / ".config/git/config").write_text("[a]\n\tb = 1\n")
+    env = dict(gg.env)
+    env[var] = ""
+    if var == "GIT_CONFIG_SYSTEM":
+        env.pop("GIT_CONFIG_NOSYSTEM")
+    for k in ("XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    want = _git_origins(env, tmp_path)
+    got = {p.resolve() for p in global_config_files()}
+    assert want <= got, f"git reads {want - got}, which gitguard does not parse"
+    if var == "GIT_CONFIG_GLOBAL":
+        assert not any(home.resolve() in p.parents for p in got), got
+        monkeypatch.setenv(var, str(tmp_path / "g.cfg"))
+        got = {p.resolve() for p in global_config_files()}
+        assert not any(home.resolve() in p.parents for p in got), got
+    else:
+        assert not any(p.name == "gitconfig" for p in got), got

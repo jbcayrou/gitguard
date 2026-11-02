@@ -9,7 +9,7 @@ the host runs it. gitguard is detection; `safe.bareRepository=explicit` and
 a global `core.hooksPath` are the prevention layers it assumes.
 
 **`DESIGN.md` is the design record** (threat model, every check and why,
-ruled-out alternatives, the catalogue of 125 bypasses). Read the section named below
+ruled-out alternatives, the catalogue of 142 bypasses). Read the section named below
 before touching the matching code; it is long because every paragraph was
 paid for by a bypass.
 
@@ -110,7 +110,7 @@ are honoured as git honours them.
 | passthroughs that read no repository | `TRANSPORT`, `main` | Which git runs |
 | child gits: the marker (pid + start + judged gitdir/common/root/label), coverage by `gitdir_roots` and `tree_named`, `new`, the served repository, no detach, the exec-path wrap, its check and its macOS shim | `Judged`, `_ancestors`, `_proc_lineage`, `read_judged`, `set_judged`, `NewRepo`, `_served_repository`, `keep_attached`, `check_wrap`, `cmd_exec_path`, `PATH_QUERIES`, `run_git` | Nested repositories; DESIGN-exec-path.md |
 | performance | PERF.md | Nested repositories (end) |
-| what git writes then reads in one command ([44] [66] [77] [86] [88] [95] [123] [124]); what it reads in-process ([126]) | `Judged.covers`, `_hard_link`, `PINNED_CONFIG`, `pin_config_env`, `_git_maybe_bool` | The command that writes what it then reads |
+| what git writes then reads in one command ([44] [66] [77] [86] [88] [95] [123] [124]); what it reads in-process ([126]) | `Judged.covers`, `_hard_link`, `check_links_into_gitdir`, `PINNED_CONFIG`, `pin_config_env`, `_git_maybe_bool` | The command that writes what it then reads |
 | accepted limitations [44], [71], [74], [126], out-of-scope cases | — | Known limitations |
 
 ## Tests

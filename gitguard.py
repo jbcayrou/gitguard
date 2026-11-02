@@ -567,8 +567,11 @@ def config_last(path: Path, section: str, key: str) -> str | None:
 
 # ---------------------------------------------------------- repo / gitdir
 def key_for(root: Path) -> Path:
-    """State key of a repository: first 16 hex digits of the sha256 of its canonical root."""
-    return STATE / hashlib.sha256(str(root).encode()).hexdigest()[:16]
+    """State key of a repository: first 16 hex digits of the sha256 of its
+    canonical root — its bytes (fsencode), a root that is not UTF-8 being
+    legal on Linux ([138]: a strict encode crashed every command on it,
+    `forget` included)."""
+    return STATE / hashlib.sha256(os.fsencode(str(root))).hexdigest()[:16]
 
 
 class Repo:
@@ -1586,12 +1589,23 @@ def check_structure(repo: Repo, refs: list[tuple[str, Path]]) -> None:
         for p in walk_all(root, repo):
             if bad(str(p)):
                 raise Refuse(f"control character in a file name: {p}")
-    # Symlinks in the first two levels of the gitdir (refs → ~/.config…)
-    for p in repo.gitdir.iterdir():
+    # Symlinks in the first two levels of the gitdir (refs → ~/.config…).
+    # A volatile directory (`logs/`, never walked by the fingerprint) made
+    # unreadable raised here, out of every command, and out of `list` for
+    # every registered repository: refused by name, as _walk_error does; a
+    # directory that vanished meanwhile is empty. [137]
+    def listing(d: Path) -> list[Path]:
+        try:
+            return list(d.iterdir())
+        except FileNotFoundError:
+            return []
+        except OSError as e:
+            raise Refuse(f"unreadable directory, cannot check: {d} ({e.strerror})") from None
+    for p in listing(repo.gitdir):
         if p.is_symlink():
             raise Refuse(f"symlink in the gitdir: {p}")
         if p.is_dir():
-            for q in p.iterdir():
+            for q in listing(p):
                 if q.is_symlink():
                     raise Refuse(f"symlink in the gitdir: {q}")
     # Ownership / permissions of the key files
@@ -1769,18 +1783,21 @@ def _sq_quote(v: str) -> str:
 def _git_maybe_bool(value: str) -> bool | None:
     """git_parse_maybe_bool: `true`/`yes`/`on` and `false`/`no`/`off` (any
     case), the empty value (false), then git_parse_int — strtoimax base 0
-    (`0x1f`, `010`) with a `k`/`m`/`g` unit — non-zero true; anything else
+    (`0x1f`, `010`, and `0b11` where the libc has C23's strtol: glibc ≥
+    2.38 reads it, macOS dies on it; read here as a number, which is safe
+    on both, [141]) with a `k`/`m`/`g` unit — non-zero true; anything else
     is no boolean (None)."""
     v = value.lower()
     if v in ("true", "yes", "on"):
         return True
     if v in ("false", "no", "off", ""):
         return False
-    m = re.fullmatch(r"\s*([+-]?)(0x[0-9a-f]+|0[0-7]*|[1-9][0-9]*)([kmg]?)", v)
+    m = re.fullmatch(r"\s*([+-]?)(0x[0-9a-f]+|0b[01]+|0[0-7]*|[1-9][0-9]*)([kmg]?)", v)
     if m is None:
         return None
-    n = int(m.group(2), 16 if m.group(2).startswith("0x") else 8 if m.group(2).startswith("0") and len(m.group(2)) > 1 else 10)
-    return n != 0
+    d = m.group(2)
+    base = 16 if d.startswith("0x") else 2 if d.startswith("0b") else 8 if d.startswith("0") and len(d) > 1 else 10
+    return int(d, base) != 0
 
 
 # Config gitguard pins on every git it runs, through GIT_CONFIG_PARAMETERS:
@@ -1812,31 +1829,41 @@ def pin_config_env() -> None:
 
 
 def global_config_files() -> list[Path]:
-    """System and global config files git may read. Deliberately broad
-    (GIT_CONFIG_GLOBAL *and* ~/.gitconfig *and* XDG): watching one file too
-    many costs nothing, missing one is a bypass [16]."""
+    """System and global config files git reads (git_system_config,
+    git_global_config_paths). Exactly those: a file git was told to skip
+    is not "one too many", its values named tree files git never sees
+    ([133], [140]). The variables are read as git reads them — present
+    or not, not truthy: an empty GIT_CONFIG_SYSTEM / GIT_CONFIG_GLOBAL
+    names no file at all (`""` opens nothing), and a GIT_CONFIG_GLOBAL
+    that names a file *replaces* `~/.gitconfig` and the XDG file. Missing
+    one git reads is a bypass [16]: test_git_parity holds the list to
+    `git config --list --show-origin`."""
     out: list[Path] = []
     # Under GIT_CONFIG_NOSYSTEM git reads no system file at all, whatever
-    # GIT_CONFIG_SYSTEM names (git_config_system): a file git was told to
-    # skip is not "one too many", its values (a system `filter.lfs.required
-    # = true`) named tree files git never sees. [133]
+    # GIT_CONFIG_SYSTEM names (git_config_system). [133]
     if not _env_bool("GIT_CONFIG_NOSYSTEM"):
-        out.append(Path(os.environ.get("GIT_CONFIG_SYSTEM") or "/etc/gitconfig"))
-    # A git built with another sysconfdir (Homebrew: /opt/homebrew/etc/gitconfig)
-    # keeps its system config next to its prefix: <prefix>/bin/git → <prefix>/etc.
-    # Derived from the path, never asked to git; one file too many costs nothing.
-    if out and not os.environ.get("GIT_CONFIG_SYSTEM"):
-        try:
-            g = Path(real_git())
-            for p in {g, g.resolve()}:
-                if p.parent.name == "bin":
-                    out.append(p.parent.parent / "etc/gitconfig")
-        except Refuse:
-            pass
-    out.append(Path.home() / ".gitconfig")
-    if os.environ.get("GIT_CONFIG_GLOBAL"):
-        out.append(Path(os.environ["GIT_CONFIG_GLOBAL"]))
-    out.append(xdg_config_home() / "git/config")
+        system = os.environ.get("GIT_CONFIG_SYSTEM")
+        if system is None:
+            out.append(Path("/etc/gitconfig"))
+            # A git built with another sysconfdir (Homebrew:
+            # /opt/homebrew/etc/gitconfig) keeps its system config next to
+            # its prefix: <prefix>/bin/git → <prefix>/etc. Derived from the
+            # path, never asked to git; one file too many costs nothing here.
+            try:
+                g = Path(real_git())
+                for p in {g, g.resolve()}:
+                    if p.parent.name == "bin":
+                        out.append(p.parent.parent / "etc/gitconfig")
+            except Refuse:
+                pass
+        elif system:
+            out.append(Path(system))
+    glob = os.environ.get("GIT_CONFIG_GLOBAL")
+    if glob is None:
+        out.append(Path.home() / ".gitconfig")
+        out.append(xdg_config_home() / "git/config")
+    elif glob:
+        out.append(Path(glob))
     return out
 
 
@@ -1858,7 +1885,7 @@ def iter_global_config() -> Iterator[tuple[Path, str, str, str]]:
             for section, key, value in parse_git_config(f):
                 yield f, section, key, value
                 if section.startswith("include") and key == "path":
-                    nxt.append(_expand2(value, f.parent)[0])     # as opened [94]
+                    nxt.append(include_path(value, f.parent)[0])  # as opened [94] [136]
         queue = nxt
 
 
@@ -2081,12 +2108,12 @@ class ConfigScan:
             # Relative to the including file; from the command line or the
             # environment git only accepts an absolute path ("relative config
             # includes must come from files").
-            if cfdir is None and not _expand2(value, Path("/"), pathname=True)[0].is_absolute():
+            if cfdir is None and not include_path(value, Path("/"))[0].is_absolute():
                 return
             # Queued as git opens it, not canonical: an include inside it is
             # relative to that path's directory — a symlink's, not its
             # target's. [94]
-            literal, p = _expand2(value, cfdir or base, pathname=True)
+            literal, p = include_path(value, cfdir or base)
             if is_file(p):
                 self.nxt.append((literal, base, remotes, glob))
             self.add(literal, p)
@@ -2488,10 +2515,19 @@ VALUE_KEYS = frozenset({
     "user.useconfigonly", "worktree.guessremote", "worktree.userelativepaths"})
 
 
+# An inventory entry ending in `.` is a wildcard section (`notes.rewrite.`:
+# notes-utils.c compares `starts_with(k, "notes.rewrite.")` before
+# git_config_bool): a prefix of the full key, not a key. Compared for
+# equality, the entry was dead and `notes.rewrite.amend = false` watched a
+# tree file named `false`. [139]
+VALUE_WILDCARDS = tuple(k for k in VALUE_KEYS if k.endswith("."))
+
+
 def _value_key(section: str, key: str) -> bool:
     head = section.split(".", 1)[0]
     full = f"{section}.{key}"
-    return full in VALUE_KEYS or (head == "http" and f"{head}.{key}" in VALUE_KEYS)
+    return (full in VALUE_KEYS or full.startswith(VALUE_WILDCARDS)
+            or (head == "http" and f"{head}.{key}" in VALUE_KEYS))
 
 
 _SH_SPLIT = re.compile(r"[\s;&|()<>{}=`'\"]+")
@@ -2605,6 +2641,18 @@ def _expand2(value: str, base: Path, pathname: bool = False) -> tuple[Path, Path
     return literal, literal.resolve()
 
 
+def include_path(value: str, base: Path) -> tuple[Path, Path]:
+    """(literal, canonical) of an `include.path` / `includeIf.*.path`, as
+    handle_path_include resolves it: `%(prefix)/` and `~` expanded (a
+    pathname), relative to the including file's directory. The one
+    resolver for every reader of includes, ConfigScan and
+    iter_global_config: [128] fixed three call sites of four, and the
+    fourth, the reader of `init.templateDir` behind auto-trust, expanded
+    a prefix include to a literal `<dir>/%(prefix)/…` and never opened
+    the file. [136]"""
+    return _expand2(value, base, pathname=True)
+
+
 # -------------------------------------------------------------- fingerprint
 class Entry:
     """One watched file. Value semantics: equal when all five fields are,
@@ -2640,8 +2688,22 @@ def _hash_into(h: "hashlib._Hash", p: Path) -> None:
 
 def _hash_file(p: Path, link_zones: tuple[Path, ...] = ()) -> tuple[str, str, str] | None:
     """(kind, mode, sha) of a watched file or symlink; None otherwise
-    (FIFO, socket, directory…). A regular file (or a link's target) inside
-    one of `link_zones` with another name is refused (_hard_link)."""
+    (FIFO, socket, directory…, or a file gone between the walk and the
+    read: nothing git could run, as a vanished directory in _walk_error).
+    A regular file (or a link's target) inside one of `link_zones` with
+    another name is refused (_hard_link). A file nobody can read is
+    refused by name, never a traceback: git cannot run what it cannot
+    read, and `trust` must say which file ([137]: a hook at mode 000 was
+    an `internal error` on every command, `trust` included)."""
+    try:
+        return _hash_path(p, link_zones)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise Refuse(f"unreadable watched file, cannot check: {p} ({e.strerror})") from None
+
+
+def _hash_path(p: Path, link_zones: tuple[Path, ...]) -> tuple[str, str, str] | None:
     st = p.lstat()
     if stat.S_ISLNK(st.st_mode):
         # A link is fingerprinted by its target string AND by the content of
@@ -2684,7 +2746,7 @@ def _hard_link(p: Path, st: os.stat_result, link_zones: tuple[Path, ...]) -> Non
     as $HOME on macOS — and is left alone: nothing the sandbox writes shares
     its inode. A symlink is judged by its target's path (`p` resolved). [88]
     Outside the zones, a watched file whose other name is in the gitdir is
-    refused all the same (check_hard_links_into_gitdir, [127])."""
+    refused all the same (check_links_into_gitdir, [127] [134] [135])."""
     if st.st_nlink > 1 and any(p == z or z in p.parents for z in link_zones):
         raise Refuse(f"hard link in a watched zone: {p} has {st.st_nlink} names, and git "
                      f"writes files of the gitdir by name (COMMIT_EDITMSG, a reflog…), which "
@@ -2840,22 +2902,34 @@ class Inspection:
         return self.scan.refs
 
 
-def check_hard_links_into_gitdir(repo: Repo, man: dict[tuple[str, str], Entry]) -> None:
-    """[88] carried to the pair of names. A watched file outside the tree
-    (`ext`: `core.hooksPath = ../shared-hooks`, local or global, in the
-    volume) is refused by _hard_link nowhere — Homebrew's binaries have
-    other names — so the sandbox linked such a hook to `.git/COMMIT_EDITMSG`
-    and `commit --amend` rewrote it. The rule here: an `ext` file with
-    another name **in the gitdir** (or the common dir) is refused, whatever
-    the zone. The kernel names no other name of an inode, so they are
-    looked for: every `ext` entry with `st_nlink > 1` on the device of a
-    gitdir (a hard link never crosses filesystems: Homebrew on another
-    volume is never even looked at) has its (device, inode) collected, and
-    only then — a rare state, nothing is walked otherwise — the gitdirs are
-    walked, volatile zones included, except `objects/` and `lfs/` of each
-    gitdir root (written through a temporary file and a rename, never in
-    place, and the only zones that cost). Not a list of the names git
-    writes in place: every name of the gitdir counts. [127]"""
+def check_links_into_gitdir(repo: Repo, man: dict[tuple[str, str], Entry]) -> None:
+    """[88] carried to the names outside the gitdir. A watched file there
+    (`wt`, `ext`: a hook under core.hooksPath, an included file) must not
+    *be* a file of the gitdir: git writes many of those in place, by name
+    (COMMIT_EDITMSG, MERGE_MSG, a reflog), and a hook sharing the file is
+    rewritten with the sandbox's message, then run ([88] [127]). _hard_link
+    refuses a second name inside the zones only — Homebrew's binaries have
+    other names — so the sharing is judged here, through the link
+    (`os.stat`, `realpath`), for every scope: a tree hook that is a symlink
+    to a script of the volume is `wt` with an `ext` file, and collecting
+    `ext` entries only missed it ([134]).
+    - A **symlink** whose chain ends under the gitdir or the common dir
+      (`vol-hooks/commit-msg → .git/COMMIT_EDITMSG`, directly or through a
+      directory of the volume the sandbox reroutes, the hook's own string
+      and bytes unchanged) is refused at once: `st_nlink` says nothing
+      about a symlink, the real path says everything ([135]). A link into
+      the tree or to another ext file is judged by its bytes; a watched
+      path the config places *inside* the gitdir is hashed by the gitdir
+      walk, nothing to resolve.
+    - A **hard link**: the kernel names no other name of an inode, so they
+      are looked for: every entry with `st_nlink > 1` on the device of a
+      gitdir (a hard link never crosses filesystems: Homebrew on another
+      volume is never even looked at) has its (device, inode) collected,
+      and only then — a rare state, nothing is walked otherwise — the
+      gitdirs are walked, volatile zones included, except `objects/` and
+      `lfs/` of each gitdir root (written through a temporary file and a
+      rename, never in place, and the only zones that cost). Not a list of
+      the names git writes in place: every name of the gitdir counts. [127]"""
     bases = {repo.gitdir, repo.common}
     devs: set[int] = set()
     for base in bases:
@@ -2863,16 +2937,27 @@ def check_hard_links_into_gitdir(repo: Repo, man: dict[tuple[str, str], Entry]) 
             devs.add(os.stat(base).st_dev)
         except OSError:
             continue                       # unreadable: refused by the walk already
+
+    def under(p: Path) -> bool:
+        return any(p == b or b in p.parents for b in bases)
+
     linked: dict[tuple[int, int], str] = {}
     for scope, path in man:
-        if scope != "ext":
+        if scope not in ("wt", "ext"):
             continue
+        p = scope_base(repo, scope) / path
         try:
-            st = os.stat(path)             # a symlink's target: what git writes
+            st = os.stat(p)                # a symlink's target: what git writes
         except OSError:
             continue                       # vanished: the next check sees it
+        real = Path(os.path.realpath(p))
+        if under(real) and not under(Path(os.path.normpath(p))):
+            raise Refuse(f"link into the gitdir: {p} is {real}, and git writes files of the "
+                         f"gitdir by name (COMMIT_EDITMSG, a reflog…), which would rewrite it. "
+                         f"Replace it by a copy (copy it aside, move the copy over it), inspect "
+                         f"it, then `gitguard trust`.")
         if st.st_nlink > 1 and st.st_dev in devs:
-            linked[(st.st_dev, st.st_ino)] = path
+            linked[(st.st_dev, st.st_ino)] = str(p)
     if not linked:
         return
     for base in bases:
@@ -2897,13 +2982,13 @@ def check_hard_links_into_gitdir(repo: Repo, man: dict[tuple[str, str], Entry]) 
 
 
 def inspect(repo: Repo) -> Inspection:
-    """config_refs → check_structure → manifest → the hard links of the
-    manifest's `ext` entries. Raises Refuse on a structural problem; the
-    fingerprint is not computed then."""
+    """config_refs → check_structure → manifest → the links of the
+    manifest's entries outside the gitdir. Raises Refuse on a structural
+    problem; the fingerprint is not computed then."""
     scan = config_refs(repo)
     check_structure(repo, scan.refs)
     man = manifest(repo, scan.refs)
-    check_hard_links_into_gitdir(repo, man)
+    check_links_into_gitdir(repo, man)
     return Inspection(repo, scan, man)
 
 
@@ -2977,7 +3062,7 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]],
     new = Path(str(key) + ".d.tmp")
     shutil.rmtree(new, ignore_errors=True)
     new.mkdir()
-    (new / ".root").write_text(str(repo.label) + "\n")
+    (new / ".root").write_bytes(os.fsencode(str(repo.label)) + b"\n")     # its bytes [138]
     for (scope, rel), e in man.items():
         if scope == "ext":
             continue                     # hashed, never copied: see restore
@@ -3389,7 +3474,7 @@ def entries() -> Iterator[tuple[Path, Path | None, str]]:
         root_s = data.root if data else None
         if not root_s:
             rf = Path(str(key) + ".d") / ".root"
-            root_s = rf.read_text().strip() if rf.is_file() else None
+            root_s = os.fsdecode(rf.read_bytes()).strip() if rf.is_file() else None
         root = Path(root_s) if root_s else None
         if root is None:
             yield key, None, "unknown"
@@ -3402,6 +3487,12 @@ def entries() -> Iterator[tuple[Path, Path | None, str]]:
         except Refuse:
             yield key, root, "structure"
             continue
+        except OSError:
+            # One repository nobody can read must not blank the listing
+            # of the others ([137]: a `chmod 0300 .git/logs` took `list`,
+            # `prune` and `retrust` down for every repository).
+            yield key, root, "unreadable"
+            continue
         if data is None or not data.current:
             yield key, root, "legacy"
         elif insp.new != data.entries:
@@ -3413,7 +3504,7 @@ def entries() -> Iterator[tuple[Path, Path | None, str]]:
 
 
 def cmd_list() -> None:
-    colors = {"ok": STYLE.green, "modified": STYLE.red, "structure": STYLE.red,
+    colors = {"ok": STYLE.green, "modified": STYLE.red, "structure": STYLE.red, "unreadable": STYLE.red,
               "missing": STYLE.yellow, "legacy": STYLE.yellow, "unknown": STYLE.yellow}
     n = 0
     for key, root, st in sorted(entries(), key=lambda t: str(t[1])):
@@ -4134,6 +4225,34 @@ def _alias_parts(value: str) -> tuple[str | None, list[tuple[str, str | None]]]:
 # and its `--no-` form: keep_attached must read them as git does. [132]
 MAINTENANCE_RUN_OPTIONS = {"--auto": False, "--detach": False, "--quiet": False,
                            "--schedule": True, "--task": True}
+# `git gc` long options, the same way (`git gc -h`; `--expire-to` is 2.50's,
+# absent from 2.47's help). `--prune[=<date>]` takes no separate value. [142]
+GC_OPTIONS = {"--aggressive": False, "--auto": False, "--cruft": False, "--detach": False,
+              "--expire-to": True, "--force": False, "--keep-largest-pack": False,
+              "--max-cruft-size": True, "--prune": False, "--quiet": False}
+
+
+def _no_detach(rest: list[str], j: int, table: dict[str, bool]) -> list[str]:
+    """`rest` from `j` on, read as parse-options reads the command's long
+    options (`table`): `--detach` and any unique prefix of it rewritten to
+    `--no-detach`; a value of an option that takes one, a `--detach=x`
+    (git refuses it), a `--no-*` and anything after `--` left as given."""
+    out = list(rest[:j])
+    while j < len(rest):
+        a = rest[j]
+        if a == "--":
+            out += rest[j:]
+            break
+        name, eq, _ = a.partition("=") if a.startswith("--") else (a, "", "")
+        opt, neg = _long_option(name, table) if a.startswith("--") else (None, False)
+        if opt == "--detach" and not neg and not eq:
+            a = "--no-detach"
+        out.append(a)
+        if opt is not None and table[opt] and not eq and j + 1 < len(rest):
+            out.append(rest[j + 1])
+            j += 1
+        j += 1
+    return out
 
 
 def keep_attached(args: list[str], orig: Path) -> list[str]:
@@ -4150,22 +4269,15 @@ def keep_attached(args: list[str], orig: Path) -> list[str]:
     rest = split_global_options(args, orig).rest
     i = len(args) - len(rest)
     if rest[:2] == ["maintenance", "run"]:
-        out, j = list(rest[:2]), 2
-        while j < len(rest):
-            a = rest[j]
-            if a == "--":
-                out += rest[j:]; break
-            name, eq, _ = a.partition("=") if a.startswith("--") else (a, "", "")
-            opt, neg = _long_option(name, MAINTENANCE_RUN_OPTIONS) if a.startswith("--") else (None, False)
-            if opt == "--detach" and not neg and not eq:
-                a = "--no-detach"
-            out.append(a)
-            if opt is not None and MAINTENANCE_RUN_OPTIONS[opt] and not eq and j + 1 < len(rest):
-                out.append(rest[j + 1]); j += 1      # the value of --task/--schedule, as given
-            j += 1
-        return [*args[:i], *out]
+        return [*args[:i], *_no_detach(rest, 2, MAINTENANCE_RUN_OPTIONS)]
     if rest[:1] == ["gc"]:
-        return ["-c", "gc.autoDetach=false", *args]
+        # `gc.autoDetach = false` is the default `--auto` consults; an
+        # explicit `--detach` (2.47+, any unique prefix) overrides it and a
+        # later `-c` wins over an earlier one: the flag is rewritten as for
+        # `maintenance run`, and the `-c` comes after the command's own
+        # global options, so a hook's `-c gc.autoDetach=true` does not win
+        # over it either. [142]
+        return [*args[:i], "-c", "gc.autoDetach=false", *_no_detach(rest, 1, GC_OPTIONS)]
     return args
 
 

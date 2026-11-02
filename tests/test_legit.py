@@ -1088,3 +1088,17 @@ def test_config_token_longer_than_name_max_is_no_path(gg: GG, repo: Path, scope:
     assert r.rc == 0 and "internal error" not in r.text, r.text
     r = gg.run("git", "status", "--short", cwd=repo)
     assert not r.blocked and "gitguard:" not in r.err, r.text
+
+
+def test_tree_file_named_like_a_wildcard_boolean_value_is_silent(gg: GG, repo: Path) -> None:
+    """[139] `notes.rewrite.<command> = false`: git reads every key of that
+    wildcard section as a boolean (notes-utils.c, `starts_with(k,
+    "notes.rewrite.")`), the inventory lists it as `notes.rewrite.`, and
+    _value_key compared the full key for equality: a tree file named
+    `false` was watched. Not watched, and changing it refuses nothing."""
+    assert gg.git("config", "notes.rewrite.amend", "false", cwd=repo).rc == 0
+    (repo / "false").write_text("ELF\n")
+    assert _watched_at_trust(gg, repo) == []
+    (repo / "false").write_text("ELF, rebuilt\n")
+    r = gg.run("git", "status", "--short", cwd=repo)
+    assert not r.blocked and "gitguard:" not in r.err, r.text

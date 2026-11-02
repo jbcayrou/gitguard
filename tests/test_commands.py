@@ -2456,3 +2456,155 @@ def test_trust_survives_a_non_utf8_name_in_the_gitdir(gg: GG, repo: Path) -> Non
     (repo / ".git/hooks" / name).write_text("#!/bin/sh\ntouch RAN\n")
     r = gg.check(repo)
     assert r.blocked and "internal error" not in r.text, r.text
+
+
+# ------------------------------------------- [134] [135] links into the gitdir, all scopes
+def test_hardlink_through_tree_symlink_control_real_git_runs_it(gg: GG, repo: Path,
+                                                               tmp_path: Path) -> None:
+    """[134] the hook is a tree symlink to a script of the volume, the
+    script's inode has a second name in the gitdir: git writes
+    COMMIT_EDITMSG in place and runs the hook through the link."""
+    _links.attack_hardlink_commit_editmsg_to_target_of_tree_symlink_hook(gg, repo, tmp_path)
+    gg.git("commit", "-q", "--amend", "--no-edit", cwd=repo)
+    assert (tmp_path / "RAN").exists(), "git no longer writes COMMIT_EDITMSG in place: [134] may be moot"
+
+
+def test_symlink_chain_rerouted_control_real_git_runs_it(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[135] the hook's symlink chain ends in `.git/COMMIT_EDITMSG`: `commit
+    --amend` writes HEAD's message there, by name, and runs the hook."""
+    _links.attack_symlink_hook_chain_rerouted_to_commit_editmsg(gg, repo, tmp_path)
+    gg.git("commit", "-q", "--amend", "--no-edit", cwd=repo)
+    assert (tmp_path / "RAN").exists(), "git no longer writes COMMIT_EDITMSG in place: [135] may be moot"
+
+
+@pytest.mark.parametrize("scope", ["ext", "wt"])
+def test_symlink_hook_into_the_gitdir_is_refused_at_trust(gg: GG, repo: Path, tmp_path: Path,
+                                                         scope: str) -> None:
+    """[135] a watched file outside the gitdir that *is* a gitdir file (a
+    symlink to `.git/COMMIT_EDITMSG`, whatever its st_nlink) is refused at
+    the trust that would bless it, with the hard-link message, and `trust`
+    shows no way to accept it; the same link onto a tree file is nothing."""
+    hooks = repo / ".githooks" if scope == "wt" else tmp_path / "vol-hooks"
+    hooks.mkdir()
+    (hooks / "commit-msg").symlink_to(repo / ".git/COMMIT_EDITMSG")
+    (repo / ".git/COMMIT_EDITMSG").write_text("#!/bin/sh\nexit 0\n")
+    assert gg.git("config", "core.hooksPath", str(hooks), cwd=repo).rc == 0
+    r = gg.run("trust", cwd=repo)
+    assert r.rc != 0 and "into the gitdir" in r.err and "internal error" not in r.text, r.text
+    assert gg.check(repo).blocked
+    (hooks / "commit-msg").unlink()
+    (hooks / "commit-msg").symlink_to(repo / "f")                 # into the tree: hashed, accepted
+    assert gg.run("trust", cwd=repo).rc == 0
+    assert not gg.check(repo).blocked
+
+
+# ------------------------------------------- [136] a %(prefix)/ include in the global config
+def test_template_dir_behind_a_prefix_include_withholds_auto_trust(gg: GG, repo: Path,
+                                                                  tmp_path: Path) -> None:
+    """[136] `init.templateDir` set in a file the global config includes
+    with `include.path = %(prefix)/…`: git opens it (handle_path_include
+    expands the prefix) and copies the template's hooks into every clone.
+    iter_global_config, the reader of _template_dir_configured, expanded
+    the include without the prefix and never saw the template: the clone
+    was auto-trusted with the template's hooks. A plain include was
+    handled; the prefix spelling must be too."""
+    from tests.attacks import config_scope as _cs
+    tpl = tmp_path / "tpl"
+    write_exec(tpl / "hooks/post-checkout", f"#!/bin/sh\ntouch '{tmp_path}/RAN'\n")
+    inc = tmp_path / "inc.cfg"
+    inc.write_text(f"[init]\n\ttemplateDir = {tpl}\n")
+    assert gg.git("config", "--global", "include.path", _cs.prefix_relative(gg, inc)).rc == 0
+    assert gg.git("config", "--get", "init.templateDir", cwd=tmp_path).out.strip() == str(tpl), \
+        "git must read the template through the include"
+    r = gg.run("git", "clone", "-q", str(repo), str(tmp_path / "c"), cwd=tmp_path)
+    assert r.rc == 0 and (tmp_path / "c/.git/hooks/post-checkout").exists(), r.text
+    assert "new repository trusted" not in r.err and "no auto-trust" in r.err, r.text
+    (tmp_path / "RAN").unlink()          # the clone's own checkout ran it: git's, as for any template [42]
+    assert gg.run("git", "checkout", "-q", "-b", "x", cwd=tmp_path / "c").blocked
+    assert not (tmp_path / "RAN").exists()
+
+
+# ------------------------------------------- [137] unreadable: a refusal, never a crash
+needs_perms = pytest.mark.skipif(os.geteuid() == 0, reason="root reads everything")
+
+
+@needs_perms
+def test_unreadable_volatile_directory_is_a_refusal_and_list_survives(gg: GG, repo: Path,
+                                                                     tmp_path: Path) -> None:
+    """[137] `.git/logs` (a volatile directory, never walked by the
+    fingerprint) made unreadable: check_structure's iterdir raised out of
+    every command — `trust` too — and `gitguard list`, which inspects every
+    registered repository, died for all of them. Now: a clean refusal
+    naming the directory, and `list` reports that one repository and
+    shows the others."""
+    other = tmp_path / "other"
+    assert gg.git("init", "-q", str(other)).rc == 0
+    commit(gg, other)
+    gg.trust(other)
+    os.chmod(repo / ".git/logs", 0o300)
+    try:
+        assert gg.git("status", "--short", cwd=repo).rc == 0, "git itself is unaffected"
+        for cmd in (["trust"], ["diff"], []):
+            r = gg.run(*cmd, cwd=repo)
+            assert r.rc != 0 and "internal error" not in r.text, (cmd, r.text)
+            assert "unreadable directory" in r.err and "logs" in r.err, (cmd, r.text)
+        r = gg.run("list", cwd=tmp_path)
+        assert r.rc == 0 and "internal error" not in r.text, r.text
+        assert str(other) in r.out and str(repo) in r.out, r.text
+    finally:
+        os.chmod(repo / ".git/logs", 0o755)
+    assert not gg.check(repo).blocked
+
+
+@needs_perms
+@pytest.mark.parametrize("which", ["hooks/pre-commit", "description", "info/exclude", "ext"])
+def test_unreadable_watched_file_is_a_refusal(gg: GG, repo: Path, tmp_path: Path, which: str) -> None:
+    """[137] a watched file made unreadable (mode 000) after the trust:
+    _hash_into raised PermissionError out of check, diff, trust and
+    restore. A refusal naming the file instead; readable again, the state
+    is clean. The gitdir's own files, and a file of an ext hooks dir."""
+    if which == "ext":
+        hooks = tmp_path / "vol-hooks"
+        write_exec(hooks / "pre-commit", "#!/bin/sh\nexit 0\n")
+        assert gg.git("config", "core.hooksPath", str(hooks), cwd=repo).rc == 0
+        gg.trust(repo)
+        p = hooks / "pre-commit"
+    else:
+        p = repo / ".git" / which
+        if not p.exists():
+            write_exec(p, "#!/bin/sh\nexit 0\n")
+        gg.trust(repo)
+    assert not gg.check(repo).blocked
+    mode = p.stat().st_mode & 0o777
+    p.chmod(0)
+    try:
+        for cmd in ([], ["diff"], ["trust"], ["restore", "-y"]):
+            r = gg.run(*cmd, cwd=repo)
+            assert r.rc != 0 and "internal error" not in r.text, (cmd, r.text)
+            assert "unreadable" in r.err and p.name in r.err, (cmd, r.text)
+    finally:
+        p.chmod(mode)
+    assert not gg.check(repo).blocked
+
+
+# ------------------------------------------- [138] a repository root that is not UTF-8
+def test_non_utf8_repository_root_survives_every_command(gg: GG, tmp_path: Path) -> None:
+    """[138] [131] made the manifest survive a non-UTF-8 *file* name; the
+    state key (`str(root).encode()`, strict) and the `.root` sidecar still
+    assumed UTF-8: `trust`, `diff`, `restore`, `git status` and `forget`
+    died with UnicodeEncodeError on a root like `proj-\\xff`. Skipped where
+    the filesystem refuses the name (APFS)."""
+    root = tmp_path / os.fsdecode(b"proj-\xff")
+    try:
+        root.mkdir()
+    except OSError as e:
+        pytest.skip(f"the filesystem refuses a non-UTF-8 name: {e}")
+    assert gg.git("init", "-q", str(root)).rc == 0
+    commit(gg, root)
+    for cmd in (["trust"], ["diff"], ["git", "status", "--short"], ["list"], ["restore", "-y"]):
+        r = gg.run(*cmd, cwd=root)
+        assert r.rc == 0 and "internal error" not in r.text, (cmd, r.text)
+    assert not gg.check(root).blocked
+    r = gg.run("forget", str(root), cwd=tmp_path)
+    assert r.rc == 0 and "internal error" not in r.text, r.text
+    assert gg.check(root).blocked                                   # never trusted again

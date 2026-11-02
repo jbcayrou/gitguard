@@ -633,3 +633,66 @@ def test_program_key_naming_a_tree_script_is_watched(gg: GG, repo: Path, key: st
     assert not gg.check(repo).blocked
     (repo / "t.sh").write_text("#!/bin/sh\ntouch RAN\n")
     assert gg.check(repo).blocked, key
+
+
+def test_value_key_wildcards_match_their_section() -> None:
+    """[139] an inventory entry ending in `.` is a wildcard section
+    (`notes.rewrite.`: notes-utils.c compares `starts_with(k,
+    "notes.rewrite.")` before git_config_bool): every key under it is a
+    value key; the section's own string keys (`notes.rewriteMode`) are
+    not. test_value_keys_are_the_inventory holds the set of strings, this
+    holds the lookup."""
+    wild = {k for k in gg_mod.VALUE_KEYS if k.endswith(".")}
+    assert wild == {"notes.rewrite."}, wild
+    assert gg_mod._value_key("notes.rewrite", "amend") and gg_mod._value_key("notes.rewrite", "rebase")
+    assert not gg_mod._value_key("notes", "rewritemode") and not gg_mod._value_key("notes", "rewrite")
+
+
+@pytest.mark.parametrize("value", ["0b11", "0b0", "0B1", "-0b1k"])
+def test_maybe_bool_reads_binary_literals_as_git(gg: GG, repo: Path, value: str) -> None:
+    """[141] git_parse_signed is strtoimax(…, 0): a libc with C23's strtol
+    (glibc ≥ 2.38) reads `0b11` as 3, so `--type=bool` says true; another
+    (macOS) dies on it. _git_maybe_bool read no `0b` and called it a path
+    token (a tree file named `0b11` watched; GIT_CONFIG_NOSYSTEM=0b11 not
+    honoured). It reads it as a number: where git dies nothing runs, so
+    the answer is safe on every libc; where git reads it, they agree."""
+    r = gg.git("-c", f"x.y={value}", "config", "--type=bool", "--get", "x.y", cwd=repo)
+    got = gg_mod._git_maybe_bool(value)
+    assert got is not None, value
+    if r.rc == 0:
+        assert got is (r.out.strip() == "true"), (value, r.text)
+    else:
+        assert "bad boolean" in r.err, r.text
+
+
+def test_gc_options_match_git(gg: GG, repo: Path) -> None:
+    """[142] GC_OPTIONS is `git gc -h`: every long option and whether it
+    takes a separate value (`<...>` after a space; `--prune[=<date>]` takes
+    none). An option of a newer git (`--expire-to`, 2.50) may be in the
+    table and not in an older git's help, never the reverse."""
+    r = gg.git("gc", "-h", cwd=repo)
+    opts = {"--" + m.group(1): bool(m.group(2)) for m in re.finditer(
+        r"^\s+(?:-\w, )?--(?:\[no-\])?([\w-]+)((?: <[^>]+>)?)", r.text, re.M)}
+    assert "--detach" in opts, r.text
+    assert opts.items() <= gg_mod.GC_OPTIONS.items(), (opts, gg_mod.GC_OPTIONS)
+    assert set(gg_mod.GC_OPTIONS) - set(opts) <= {"--expire-to"}, set(gg_mod.GC_OPTIONS) - set(opts)
+
+
+@pytest.mark.parametrize("abbr", ["--detach", "--det", "--d"])
+def test_keep_attached_disarms_gc_detach(gg: GG, repo: Path, abbr: str) -> None:
+    """[142] `gc.autoDetach = false` is a default an explicit `--detach`
+    (any unique prefix) overrides: a child `git gc --detach` left the
+    process tree with the `-c` in place ([117] again). The flag is
+    rewritten as for `maintenance run` ([132]), the `-c` stays for `--auto`
+    and is placed after the command's own options, so a `-c
+    gc.autoDetach=true` of a hook does not win over it either."""
+    assert gg.git("gc", "--detx", cwd=repo).rc == 129
+    out = gg_mod.keep_attached(["gc", abbr], repo)
+    assert "--no-detach" in out and abbr not in out and "gc.autoDetach=false" in out, out
+    k = lambda *a: gg_mod.keep_attached(["gc", *a], repo)
+    assert k("--no-det")[-2:] == ["gc", "--no-det"]
+    assert k("--", abbr)[-3:] == ["gc", "--", abbr]
+    assert k("--expire-to", abbr)[-3:] == ["gc", "--expire-to", abbr]
+    assert k("--prune", abbr)[-3:] == ["gc", "--prune", "--no-detach"]
+    out = gg_mod.keep_attached(["-c", "gc.autoDetach=true", "gc", "--auto"], repo)
+    assert out.index("gc.autoDetach=false") > out.index("gc.autoDetach=true"), out

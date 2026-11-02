@@ -161,3 +161,54 @@ def attack_hardlink_commit_editmsg_to_global_hook(gg: GG, repo: Path, tmp_path: 
     assert gg.git("config", "--global", "core.hooksPath", str(tmp_path / "vol-hooks")).rc == 0
     gg.trust(repo)
     hardlink_editmsg_to_hook(gg, repo, hook, str(payload(tmp_path)))
+
+
+def attack_hardlink_commit_editmsg_to_target_of_tree_symlink_hook(gg: GG, repo: Path,
+                                                                  tmp_path: Path) -> None:
+    """[134] the hook of the tree is a symlink to a script outside the tree
+    but in the volume (`.githooks/commit-msg → ../shared/commit-msg`): the
+    entry is `wt`, its file is `ext`. `.git/COMMIT_EDITMSG` hard-linked to
+    that script: _hard_link judges the resolved target, outside every zone,
+    and the pair-of-names rule of [127] collected `ext` entries only
+    (positive control: test_commands)"""
+    from tests.attacks._helpers import hardlink_editmsg_to_hook, payload
+    target = tmp_path / "shared/commit-msg"
+    write_exec(target, "#!/bin/sh\nexit 0\n")
+    (repo / ".githooks").mkdir()
+    (repo / ".githooks/commit-msg").symlink_to(os.path.relpath(target, repo / ".githooks"))
+    assert gg.git("config", "core.hooksPath", ".githooks", cwd=repo).rc == 0
+    gg.trust(repo)
+    hardlink_editmsg_to_hook(gg, repo, target, str(payload(tmp_path)))
+
+
+def attack_symlink_hook_chain_rerouted_to_commit_editmsg(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[135] a hook outside the tree is a symlink through a directory of the
+    volume (`vol-hooks/commit-msg → ../shared/commit-msg`); the trusted
+    fingerprint is the link's string plus the bytes it designates. The
+    sandbox leaves the hook alone and reroutes `shared/commit-msg` to
+    `.git/COMMIT_EDITMSG`, which it fills with the blessed bytes: same
+    string, same bytes, st_nlink 1 everywhere — neither _hard_link nor
+    [127] looks. `commit --amend` writes HEAD's message into the volatile
+    file, the hook, and runs it (positive control: test_commands)"""
+    from tests.attacks._helpers import _git_input, payload
+    benign = "#!/bin/sh\nexit 0\n"
+    shared = tmp_path / "shared/commit-msg"
+    write_exec(shared, benign)
+    hooks = tmp_path / "vol-hooks"
+    hooks.mkdir()
+    (hooks / "commit-msg").symlink_to("../shared/commit-msg")
+    assert gg.git("config", "core.hooksPath", str(hooks), cwd=repo).rc == 0
+    gg.trust(repo)
+    # the sandbox: HEAD's message is a script (objects, refs: volatile)
+    (repo / "work.txt").write_text("the sandbox's work\n")
+    assert gg.git("add", "work.txt", cwd=repo).rc == 0
+    tree = gg.git("write-tree", cwd=repo).out.strip()
+    c = _git_input(gg, repo, f"subject\n\n{payload(tmp_path)}\n", "commit-tree", tree, "-p", "HEAD")
+    assert gg.git("update-ref", "HEAD", c, cwd=repo).rc == 0
+    # the chain now ends in the gitdir, on the bytes the user blessed
+    msg = repo / ".git/COMMIT_EDITMSG"
+    msg.unlink(missing_ok=True)
+    msg.write_text(benign)
+    msg.chmod(0o755)
+    shared.unlink()
+    shared.symlink_to(msg)

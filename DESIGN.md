@@ -113,11 +113,19 @@ That git's system config (`<prefix>/etc/gitconfig`, derived from the
 binary's path) is read along with `/etc/gitconfig`; under
 `GIT_CONFIG_NOSYSTEM` neither is, as for git, which honours it as a
 boolean whatever `GIT_CONFIG_SYSTEM` names ([133]: a system
-`filter.lfs.required = true` named a tree file git never saw). Changing
+`filter.lfs.required = true` named a tree file git never saw). The
+variables are read as git reads them, present or not: an empty
+`GIT_CONFIG_SYSTEM` / `GIT_CONFIG_GLOBAL` names no file, and a
+`GIT_CONFIG_GLOBAL` that names one replaces `~/.gitconfig` and the XDG
+file ([140]: `or default` read empty as unset). Changing
 the real git changes the fingerprint (one `trust`). **The one thing
 gitguard runs git to learn**
 is its installation prefix (`git_prefix`, [128]): what a leading
 `%(prefix)/` in a pathname value or an include path expands to
+(one resolver for an include, `include_path`, shared by `ConfigScan`
+and `iter_global_config` — [136]: the latter, the reader of
+`init.templateDir` that gates auto-trust, expanded a prefix include to
+a path that does not exist and never saw the template)
 (`interpolate_path` → `system_path`, before `~`; not the exec path, which
 `GIT_EXEC_PATH` moves and the prefix ignores), a constant of the binary
 that nothing but the binary knows. It is asked from `/` (no repository
@@ -346,21 +354,34 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
      a link it made lie there; a program the global config names elsewhere
      (Homebrew ships hard-linked binaries, on the same volume as `$HOME`
      on macOS) is left alone, nothing the sandbox writes shares its inode.
-     Outside those zones the rule is carried to the **pair of names**
-     (`check_hard_links_into_gitdir`, [127]): a hooks directory outside
-     the tree but in the volume (`core.hooksPath = ../shared-hooks`, scope
-     `ext`) had its `commit-msg` linked to `COMMIT_EDITMSG` all the same.
-     The kernel names no other name of an inode, so they are looked for:
-     every `ext` entry with `st_nlink > 1` on the device of a gitdir (a
-     hard link never crosses filesystems; Homebrew on another volume is
-     not even looked at) has its (device, inode) collected, and only then
-     the gitdirs are walked, volatile zones included, except `objects/`
-     and `lfs/` of each root (written through a temporary file and a
-     rename, never in place; the only zones that cost): an inode found
-     there is refused. Every name of the gitdir counts, no list of the
-     names git writes in place; nothing is walked when no such link
-     exists. Tree files are not at risk: git writes them by unlink and
-     create (`write_entry`), which breaks a shared inode.
+     Outside those zones the rule is carried to the **names of the
+     gitdir** (`check_links_into_gitdir`, [127] [134] [135]): a watched
+     file outside the gitdir (`wt`, `ext`) must not *be* a file of the
+     gitdir, and the sharing is judged through the link, for every scope.
+     A hooks directory outside the tree but in the volume
+     (`core.hooksPath = ../shared-hooks`, scope `ext`) had its
+     `commit-msg` linked to `COMMIT_EDITMSG` all the same ([127]); the
+     same hook reached through a tree symlink (`.githooks/commit-msg →
+     ../shared/commit-msg`, a `wt` entry whose file is `ext`) was not
+     collected when only `ext` entries were ([134]). Two ways to share
+     the file. A **symlink** whose chain ends under the gitdir or the
+     common dir (`vol-hooks/commit-msg → .git/COMMIT_EDITMSG`, directly or
+     through a directory of the volume the sandbox reroutes, the hook's
+     own string and bytes unchanged) is refused at once by its real path:
+     `st_nlink` says nothing about a symlink, and both link rules were
+     written in `st_nlink` ([135]); a link into the tree or to another
+     ext file stays judged by its bytes. A **hard link**: the kernel
+     names no other name of an inode, so they are looked for: every entry
+     with `st_nlink > 1` on the device of a gitdir (a hard link never
+     crosses filesystems; Homebrew on another volume is not even looked
+     at) has its (device, inode) collected, and only then the gitdirs are
+     walked, volatile zones included, except `objects/` and `lfs/` of
+     each root (written through a temporary file and a rename, never in
+     place; the only zones that cost): an inode found there is refused.
+     Every name of the gitdir counts, no list of the names git writes in
+     place; nothing is walked when no such link exists. Tree files are
+     not at risk: git writes them by unlink and create (`write_entry`),
+     which breaks a shared inode.
    - every file of the repository git reads (config, gitfile, `commondir`,
      HEAD, index, todo files) goes through `read_file`: opened
      `O_NONBLOCK`, anything but a regular file refused at once (a FIFO, a
@@ -369,7 +390,21 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
      denial of service that pushes the user toward the real git ([99]).
    - an unreadable directory makes gitguard **refuse** (`os.walk(onerror=…)`)
      instead of being seen as empty. A directory that **vanished** during the
-     walk (`FileNotFoundError`) is ignored: it holds nothing any more.
+     walk (`FileNotFoundError`) is ignored: it holds nothing any more. The
+     same two rules hold for every other read of a watched path, so that
+     fail-closed is a *refusal*, never a traceback ([137]: an `OSError`
+     reaching the generic handler was an `internal error` on every
+     command, `trust` included — a hook at mode 000 in `_hash_file`, a
+     volatile `.git/logs` at 0300 in `check_structure`'s listing of the
+     gitdir's first two levels, which the fingerprint never walks, and
+     through `gitguard list` that one repository blanked the listing of
+     all the others; a file gone between the walk and the read). A refusal
+     names the file; readable again, the state is clean. `list` reports an
+     unreadable repository as its own status. Names are bytes end to end:
+     the state key hashes `os.fsencode(root)` and the `.root` sidecar is
+     written and read through surrogateescape ([138]: a root that is not
+     UTF-8 crashed `trust`, `diff`, `restore` and `forget`, after [131]
+     had fixed the manifest only).
 4. **Fingerprint** (`manifest`) compared with the reference.
 
 ## What the fingerprint watches in the gitdir: everything but the volatile
@@ -471,7 +506,9 @@ boolean or a number on a key git reads as one names nothing**
 (`VALUE_KEYS`, [129]: exactly the `[bool]` and `[int]` sections of the
 inventory, the keys compared before a `git_config_bool` /
 `git_config_int` in git's source, held equal by test_claims — never
-curated by hand). Without it `git init`'s own `core.bare = false`,
+curated by hand; an entry ending in `.` is a wildcard section,
+`notes.rewrite.`, a prefix of the key — [139]: compared for equality it
+was dead). Without it `git init`'s own `core.bare = false`,
 `core.filemode = true`, `core.repositoryformatversion = 0` watched a tree
 file named `false`, `true` or `0` and refused every command once it
 changed, no sandbox involved. Any other value on such a key (git dies on
@@ -975,7 +1012,10 @@ in a tree ([105] [121] [122]). A child git does not detach either
 command's process tree and found the marker dead ([117]); the option is
 read as parse-options reads it, any unique prefix (`--det`, [132]),
 against the option table of `maintenance run` held to `git maintenance
-run -h`. No route is
+run -h` — and of `gc` held to `git gc -h` ([142]: `gc.autoDetach =
+false` is a default an explicit `--detach` overrides, and a prepended
+`-c` loses to the command's own; the flag is rewritten, the `-c` placed
+after the command's global options). No route is
 guessed any more: whatever enters, enters through gitguard. `trust`,
 `retrust` and `list` warn when the exec path does not lead to gitguard or
 is stale (`check_wrap`); `gitguard exec-path` builds one where git's own
@@ -1528,8 +1568,19 @@ the files, not the order.
   are not in the inventory either: the same cost.
 - A hard link the sandbox makes between a watched `ext` file and a file
   *outside* the gitdir that git would write in place: none known (git
-  writes tree files by unlink and create); `check_hard_links_into_gitdir`
-  looks in the gitdirs only ([127]).
+  writes tree files by unlink and create); `check_links_into_gitdir`
+  looks in the gitdirs only ([127]), and a symlink into *another*
+  repository's gitdir on the volume is not resolved as such ([135] judges
+  the judged repository's gitdir and common dir).
+- `VALUE_KEYS` is one inventory, the newest git's (2.56): a key an older
+  git reads as a boolean and the newest no longer does (`merge.stat` in
+  2.47) keeps the generic rule there, a tree file named `false` watched
+  (audit #2, L2-12; a union of inventories is the mechanical fix, not
+  decided).
+- `_git_maybe_bool` reads a `0b` literal as a number ([141]); git does so
+  only where its libc has C23's strtol (glibc ≥ 2.38) and dies on it
+  elsewhere (macOS): the parity test holds where git reads it, and the
+  answer is safe on both.
 - gitguard.py has no dependency outside the stdlib (diff via `difflib`); the
   tests need `pytest` and `git`.
 - A context without a terminal and without a desktop session (ssh, cron,

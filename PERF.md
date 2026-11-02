@@ -182,6 +182,18 @@ _core_worktree's docstrings) and lost the Levenshtein port; the check
 does the same stat calls as before, in the same order (`inspect` only
 names the pipeline). Not measured on the Debian VM (down that day).
 
+## 2026-11-02: eighteenth adversarial pass ([134]–[142])
+
+`check_links_into_gitdir` now judges every `wt` and `ext` entry of the
+manifest, not the `ext` ones only: one `os.stat` plus one `realpath` per
+entry (the hooks of a `core.hooksPath`, the included files), the gitdir
+walk still only when an entry has two names. Measured in isolation on
+macOS: 100 entries (50 files, 50 symlinks) cost 3.7 ms, i.e. ~37 µs per
+entry; a repository has a few to a few dozen such entries, under 1 ms.
+The rest of the pass adds `try/except` around reads that already
+happened and a presence test on two environment variables: nothing
+measurable. Not re-measured end to end.
+
 ## Where the time goes (2026-10-17 figures)
 
 | component                                             | cost            |

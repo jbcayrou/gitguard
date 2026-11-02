@@ -824,3 +824,14 @@ def test_glued_values(tok: str, want: set[str]) -> None:
     """[96] a short-option word yields its possible glued values, one after
     each letter of its leading run, never one per character."""
     assert gg_mod._glued_values({tok}) - {tok} == want
+
+
+def test_hash_file_of_a_vanished_path_is_none(tmp_path: Path) -> None:
+    """[137] a file listed by the walk and gone before it is read (a `gc`,
+    a rebase finishing) holds nothing git could run: skipped, as
+    _walk_error skips a vanished directory; it raised FileNotFoundError
+    out of `trust`."""
+    assert gg_mod._hash_file(tmp_path / "gone") is None
+    gone = tmp_path / "gone-link"
+    gone.symlink_to(tmp_path / "nowhere")
+    assert gg_mod._hash_file(gone) is not None            # a dangling link is still a link

@@ -131,7 +131,7 @@ class GG:
 
     def key_for(self, root: Path) -> Path:
         import hashlib
-        return self.state / hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+        return self.state / hashlib.sha256(os.fsencode(str(root.resolve()))).hexdigest()[:16]
 
 
 @pytest.fixture(scope="session")
