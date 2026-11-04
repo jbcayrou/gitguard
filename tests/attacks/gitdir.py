@@ -79,3 +79,12 @@ def attack_fake_root_marker_hides_subdir(gg: GG, repo: Path, tmp_path: Path) -> 
     (repo / ".git/hooks/HEAD").write_text("ref: refs/heads/main\n")
     (repo / ".git/hooks/refs").mkdir()
     write_exec(repo / ".git/hooks/refs/x")
+
+
+def attack_lock_suffixed_file_under_hooks(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[144] a regular file named *.lock under hooks/: the `.lock` exclusion
+    was a suffix at any depth, so `hooks/pre-commit.d/x.lock` never entered
+    the fingerprint — and a dispatcher hook that runs `"$0".d/*` ran it"""
+    d = repo / ".git/hooks/pre-commit.d"
+    d.mkdir()
+    write_exec(d / "20-evil.lock")

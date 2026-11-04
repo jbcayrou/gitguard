@@ -2406,12 +2406,21 @@ DATA_KEYS = {("user", "signingkey"), ("gpg.ssh", "allowedsignersfile"), ("gpg.ss
              ("http", "cookiefile"), ("http", "pinnedpubkey"),
              # git's own pathname keys (tests/inventory/, [pathname]): the
              # fsck skip lists are object ids, read, never run. [100]
-             ("fsck", "skiplist"), ("fetch.fsck", "skiplist"), ("receive.fsck", "skiplist")}
+             ("fsck", "skiplist"), ("fetch.fsck", "skiplist"), ("receive.fsck", "skiplist"),
+             # A refname, resolved through the ref store (branch.c, remote.c
+             # handle_config), never opened as a path. Read against a local
+             # remote's gitdir ([67]) or from a served child whose root is
+             # the gitdir (`GIT_DIR=.`), `refs/heads/main` named the loose
+             # ref file: watched, rewritten by every commit, and refused as
+             # a volatile-zone path by upload-pack's children. A section
+             # ending in `.` is a wildcard (`branch.<name>`). [143]
+             ("branch.", "merge")}
 
 
 def _data_key(section: str, key: str) -> bool:
     head = section.split(".", 1)[0]
-    return (section, key) in DATA_KEYS or (head == "http" and (head, key) in DATA_KEYS)
+    return ((section, key) in DATA_KEYS or (head == "http" and (head, key) in DATA_KEYS)
+            or ("." in section and (head + ".", key) in DATA_KEYS))
 
 
 # Config keys git reads as a boolean or a number — never a path, never a
@@ -2779,14 +2788,28 @@ def _volatile_dir(rel: str) -> bool:
     return rel in VOLATILE_DIRS or bool(OBJECT_FANOUT.match(rel))
 
 
+# Hashed files git rewrites through a lockfile (`<name>.lock` beside them,
+# taken by a concurrent git while a check runs): their lock is volatile.
+# Every other `.lock` is a file like any other — the exclusion used to be
+# the suffix at any depth, and `hooks/pre-commit.d/x.lock` escaped the
+# fingerprint. [144]
+LOCKED_FILES = {"config", "config.worktree", "objects/maintenance"}
+
+
 def _volatile_file(rel: str, is_symlink: bool) -> bool:
     """`rel` is relative to the closest gitdir root (not to the base): a
     submodule's `info/refs` is `modules/<x>/info/refs` seen from the base, and
-    `git gc` in that submodule used to alert. [26]"""
+    `git gc` in that submodule used to alert. [26] A `.lock` counts only
+    where the name without it is a file git locks at that position: a
+    volatile one (`index.lock`, `HEAD.lock`, `packed-refs.lock`) or one of
+    LOCKED_FILES; anchored, like every exclusion. [144]"""
     if is_symlink:
         return False                     # a symlink is always an entry, even *.lock
-    return (rel.endswith(".lock") or rel in VOLATILE_FILES
-            or (rel.startswith("BISECT_") and "/" not in rel))
+    if rel.endswith(".lock"):
+        rel = rel[:-5]
+        if rel in LOCKED_FILES:
+            return True
+    return rel in VOLATILE_FILES or (rel.startswith("BISECT_") and "/" not in rel)
 
 
 def gitdir_paths(base: Path) -> Iterator[tuple[str, Path]]:

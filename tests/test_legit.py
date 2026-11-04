@@ -1102,3 +1102,45 @@ def test_tree_file_named_like_a_wildcard_boolean_value_is_silent(gg: GG, repo: P
     (repo / "false").write_text("ELF, rebuilt\n")
     r = gg.run("git", "status", "--short", cwd=repo)
     assert not r.blocked and "gitguard:" not in r.err, r.text
+
+
+# ------------------------------- clones of clones (audit #4, 2026-11-04)
+def test_working_clone_as_remote_is_silent_and_serves(gg: GG, tmp_path: Path) -> None:
+    """[143] `git clone a b` where a is itself a clone: a's config holds
+    `branch.main.merge = refs/heads/main`, a refname. Read against a's
+    gitdir it named the loose ref file, watched as ext and rewritten by
+    every commit in a; and the served children (`pack-objects`,
+    `unpack-objects`, GIT_DIR=.) refused it as a volatile-zone path, so
+    pull, fetch, push into a and `clone file://` of a all failed."""
+    src = make_source(gg, tmp_path, "src")
+    a, b, c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+    assert gg.run("git", "clone", "-q", str(src), str(a), cwd=tmp_path).rc == 0
+    assert gg.run("git", "clone", "-q", str(a), str(b), cwd=tmp_path).rc == 0
+    assert not gg.check(b).blocked
+    commit(gg, a, "x", "1")
+    r = gg.check(b)
+    assert not r.blocked, r.text
+    r = gg.run("git", "pull", "-q", cwd=b)
+    assert r.rc == 0, r.text
+    commit(gg, a, "x", "2")
+    r = gg.run("git", "fetch", "-q", str(a), cwd=b)
+    assert r.rc == 0, r.text
+    r = gg.run("git", "clone", "-q", f"file://{a}", str(c), cwd=tmp_path)
+    assert r.rc == 0, r.text
+    commit(gg, b, "y", "1")
+    r = gg.run("git", "push", "-q", str(a), "HEAD:refs/heads/dev", cwd=b)
+    assert r.rc == 0, r.text
+    assert not gg.check(b).blocked and not gg.check(a).blocked
+
+
+@pytest.mark.parametrize("name", ["config.lock", "config.worktree.lock", "index.lock",
+                                  "HEAD.lock", "packed-refs.lock", "objects/maintenance.lock"])
+def test_lock_of_a_file_git_locks_is_silent(gg: GG, repo: Path, name: str) -> None:
+    """[144] the lock files git takes on the files it rewrites, met by a
+    check run while another git holds them: not an added file."""
+    gg.trust(repo)
+    p = repo / ".git" / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("")
+    r = gg.check(repo)
+    assert not r.blocked, r.text

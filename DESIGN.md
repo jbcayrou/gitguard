@@ -414,9 +414,15 @@ gitdir (files and symlinks, at any depth, including `modules/` and
 `worktrees/`) and excludes only what git rewrites in normal operation —
 directories `objects/??`, `pack`, `refs`, `reftable` ([64]), `logs`,
 `lfs`, `rr-cache`, `rebase-*`, `sequencer`, `commit-graphs`; files `index`,
-`*.lock`, `HEAD`,
+`HEAD`,
 `*_HEAD`, `MERGE_*`, `BISECT_*`, `COMMIT_EDITMSG`, `EDIT_DESCRIPTION`, `packed-refs`,
-`shallow`, `gc.*`, `info/refs`, `info/sparse-checkout` ([83]), `objects/info/packs`…
+`shallow`, `gc.*`, `info/refs`, `info/sparse-checkout` ([83]), `objects/info/packs`…,
+and the `.lock` of a file git locks at that position: of a volatile file
+(`index.lock`, `HEAD.lock`, `packed-refs.lock`) or of `LOCKED_FILES`
+(`config`, `config.worktree`, `objects/maintenance`), the hashed files git
+rewrites under a lock. The rule used to be the suffix `*.lock` at any
+depth, and `hooks/pre-commit.d/x.lock` escaped the fingerprint ([144]):
+every exclusion is anchored, this one too.
 An unknown file or directory is
 therefore watched. Accepted consequence: `remote add`, `worktree add`,
 `submodule add` require a `trust` (they change `config` or the structure) —
@@ -520,9 +526,15 @@ limitations). **A file
 is not retained for the keys whose value git reads as data** (`DATA_KEYS`,
 the mirror of `DIR_KEYS`: `user.signingKey`, `gpg.ssh.allowedSignersFile`,
 `core.excludesFile`, `core.attributesFile`, `commit.template`,
-`blame.ignoreRevsFile`, `mailmap.file`, `diff.orderFile`, `http.sslKey`…):
+`blame.ignoreRevsFile`, `mailmap.file`, `diff.orderFile`, `http.sslKey`…,
+and `branch.<name>.merge`, a refname git resolves through the ref store
+and never opens as a path — read against a local remote's gitdir or from
+a served child whose root is the gitdir, `refs/heads/main` named the loose
+ref file, watched and rewritten by every commit, and refused as a
+volatile-zone path by upload-pack's children: every transport into a
+working clone failed, [143]):
 a closed list, each key documented by git as a path to a file it, ssh-keygen
-or curl reads and never runs. The generic rule took `user.signingKey =
+or curl reads and never runs, or a name it resolves and never opens. The generic rule took `user.signingKey =
 ~/.ssh/id` (ssh signing) for a program: hashed on every command, copied into
 every `<key>.d/ext/`, each rotation refused every repository, and `restore`
 wrote the old key over the new one ([56]). Program keys (`gpg.program`,

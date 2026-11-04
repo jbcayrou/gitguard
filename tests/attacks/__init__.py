@@ -977,6 +977,36 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      won. Found by the eighteenth adversarial pass, 2026-10-31. Fix:
      GC_OPTIONS held to `git gc -h`, `--det*` rewritten to `--no-detach`,
      the `-c` placed after the command's global options.
+[143] False positive (blocking): `git clone a b` writes `branch.main.merge
+     = refs/heads/main` into b's config — and into a's, when a is itself a
+     clone. The generic token rule took that refname for a path. Read
+     against a's gitdir (the base of a local remote's config, [67]) it
+     named the loose ref file `a/.git/refs/heads/main`, watched as `ext`
+     and rewritten by every commit in a: `git status` in b prompted after
+     each. Worse, upload-pack and receive-pack run their children
+     (`pack-objects`, `unpack-objects`) with `GIT_DIR=.` in the served
+     gitdir: the child gitguard took the gitdir for its root, resolved the
+     same token inside it, and `add` refused it as a volatile-zone path —
+     `pull`, `fetch`, `push` into a working clone and `clone file://` of
+     one all failed where the raw git succeeds. test_legit's remotes were
+     all made by `git init`, which writes no tracking. Found by the fourth
+     agentic audit (ordinary usage), 2026-11-03. Fix: `branch.<name>.merge`
+     is a refname, read by git through the ref store and never opened as a
+     path (remote.c `handle_config`, branch.c): excluded like a data key
+     (DATA_KEYS, the `branch.` wildcard), held to git in test_claims.py.
+[144] `_volatile_file` excluded any name ending in `.lock`, at any depth
+     of the gitdir: a suffix, where every other exclusion is a position
+     (CLAUDE.md: "exclusions are anchored"). `.git/hooks/pre-commit.d/
+     20-evil.lock` was never hashed, `diff` said "no changes", and a
+     dispatcher hook of the user's that runs `"$0".d/*` ran it on
+     `commit`. The symlink form was the latent
+     attack_lock_suffixed_symlink_deep. Found by the fourth agentic audit,
+     2026-11-03. Fix: a `.lock` is volatile only where the name without
+     it is a file git writes through a lockfile at that position: a
+     volatile file (`index.lock`, `HEAD.lock`, `packed-refs.lock`…) or one
+     of LOCKED_FILES (`config`, `config.worktree`, `objects/maintenance`),
+     the hashed files git rewrites under a lock. Anywhere else a `.lock`
+     is a file like any other.
 """
 from __future__ import annotations
 

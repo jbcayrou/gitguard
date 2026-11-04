@@ -405,11 +405,14 @@ def test_walk_gitdir_excludes_volatile(tmp_path: Path) -> None:
         (g / d).mkdir(parents=True)
     for f in ["HEAD", "index", "config", "description", "objects/ab/cd", "objects/info/packs",
               "objects/info/alternates", "refs/heads/main", "logs/HEAD", "hooks/pre-commit",
-              "rebase-merge/x", "BISECT_LOG", "foo.lock", "myhooks"]:
+              "rebase-merge/x", "BISECT_LOG", "foo.lock", "config.lock", "index.lock",
+              "hooks/pre-commit.lock", "myhooks"]:
         (g / f).write_text("x")
     paths = sorted(e.path for e in gg_mod.walk_gitdir(g, "local"))
-    assert paths == ["config", "description", "hooks/pre-commit", "myhooks",
-                     "objects/info/alternates"]
+    # A `.lock` is volatile only beside a file git locks there ([144]):
+    # `config.lock`, `index.lock` vanish, `foo.lock` and a hook's do not.
+    assert paths == ["config", "description", "foo.lock", "hooks/pre-commit",
+                     "hooks/pre-commit.lock", "myhooks", "objects/info/alternates"]
 
 
 def test_walk_gitdir_anchors_roots_under_modules_only(tmp_path: Path) -> None:

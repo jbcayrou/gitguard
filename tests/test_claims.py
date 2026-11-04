@@ -696,3 +696,23 @@ def test_keep_attached_disarms_gc_detach(gg: GG, repo: Path, abbr: str) -> None:
     assert k("--prune", abbr)[-3:] == ["gc", "--prune", "--no-detach"]
     out = gg_mod.keep_attached(["-c", "gc.autoDetach=true", "gc", "--auto"], repo)
     assert out.index("gc.autoDetach=false") > out.index("gc.autoDetach=true"), out
+
+
+# ============================================ refnames in the config ([143])
+REF_KEYS = {"branch.main.merge": "a refname git resolves through the ref store (branch.c), never a path"}
+
+
+@pytest.mark.parametrize("key", sorted(REF_KEYS))
+def test_ref_key_naming_a_tree_script_runs_nothing(gg: GG, repo: Path, key: str) -> None:
+    """A key excluded as a refname must never make git open its value as a
+    path: with the value naming a tree script, pull, fetch, push, merge and
+    status run nothing (the inverse of test_program_key_naming_a_tree_script_is_watched)."""
+    from tests.conftest import write_exec
+    write_exec(repo / "t.sh", "#!/bin/sh\ntouch RAN\n")
+    section, _, k = key.rpartition(".")
+    assert gg_mod._data_key(section, k), key
+    assert gg.git("config", key, "./t.sh", cwd=repo).rc == 0
+    assert gg.git("config", "branch.main.remote", ".", cwd=repo).rc == 0
+    for cmd in (["status"], ["fetch"], ["pull"], ["merge"], ["push"], ["branch", "-vv"]):
+        gg.git(*cmd, cwd=repo)
+    assert not (repo / "RAN").exists(), key
