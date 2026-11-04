@@ -391,7 +391,8 @@ GITDIR_HASHED = {
     "next-index-%": "temporary index of a partial commit, renamed or unlinked by the command",
     "shallow_XXXXXX": "temporary, renamed over `shallow` (volatile) or unlinked",
     "sharedindex_XXXXXX": "temporary of the split index",
-    "sharedindex.%s": "split index: refused (check_split_index) [31]",
+    "sharedindex.%s": "split index entries: volatile at a root (SHARED_INDEX, [148]); git reads "
+                      "one only through the index's `link`, refused [31]",
     "fsmonitor--daemon.ipc": "the builtin fsmonitor's socket: not a regular file, _hash_file "
                              "skips it; a regular file put there is watched, git runs nothing from it",
 }
@@ -716,3 +717,129 @@ def test_ref_key_naming_a_tree_script_runs_nothing(gg: GG, repo: Path, key: str)
     for cmd in (["status"], ["fetch"], ["pull"], ["merge"], ["push"], ["branch", "-vv"]):
         gg.git(*cmd, cwd=repo)
     assert not (repo / "RAN").exists(), key
+
+
+# ================================= network URLs auto-accepted ([145])
+# `_network_url` must say "network" only where git itself uses a transport of
+# its own: for every URL it rejects, git either opens a path or runs a helper.
+URL_CLASS = {
+    "https://example.invalid/o/r.git": True,
+    "git://example.invalid/r": True,
+    "ssh://git@example.invalid/o/r": True,
+    "git@example.invalid:o/r.git": True,
+    "ext::sh -c id": False,                 # a command (remote-ext)
+    "foo::bar": False,                      # git-remote-foo
+    "foo://example.invalid/r": False,       # git-remote-foo as well
+    "file:///nonexistent/r": False,         # a path
+    "/nonexistent/r": False,
+    "../r": False,
+    "r": False,                             # a path too (no colon)
+}
+
+
+@pytest.mark.parametrize("url", sorted(URL_CLASS))
+def test_network_url_classification_as_git(gg: GG, repo: Path, url: str) -> None:
+    assert gg_mod._network_url(url) == URL_CLASS[url], url
+    r = gg.git("-c", "core.sshCommand=false", "ls-remote", url, cwd=repo)
+    assert r.rc != 0
+    helper_or_path = ("remote helper" in r.err or "does not appear to be a git repository" in r.err
+                      or "No such file" in r.err or "not a git repository" in r.err
+                      or "Could not read from remote" in r.err and "::" not in url and "://" not in url)
+    if URL_CLASS[url]:
+        assert "remote helper 'git-remote-" not in r.err or "git-remote-https" in r.err, r.err
+    else:
+        assert helper_or_path or "::" in url, r.err
+
+
+# ========================== commands that never resume a sequence ([147])
+NEVER_RESUMES_ARGS = {
+    "status": [], "log": ["-1"], "diff": [], "show": ["--stat"], "branch": [], "tag": [],
+    "add": ["-A"], "rm": ["-q", "--cached", "--ignore-unmatch", "nothing"], "mv": ["-k", "no", "ne"],
+    "restore": ["--staged", "."], "reset": ["-q"], "commit": ["--allow-empty", "-qm", "x"],
+    "checkout": ["-q", "HEAD", "--", "."], "switch": ["-q", "--detach", "HEAD"],
+    "stash": ["list"], "blame": ["r"], "grep": ["-q", "x"], "ls-files": [], "ls-tree": ["HEAD"],
+    "rev-parse": ["HEAD"], "rev-list": ["-1", "HEAD"], "config": ["--list"], "reflog": ["-1"],
+    "fetch": ["."], "push": [".", "HEAD:refs/heads/pushed"], "remote": [], "describe": ["--always"],
+    "shortlog": ["-1", "HEAD"], "cat-file": ["-t", "HEAD"], "show-ref": [], "for-each-ref": [],
+    "symbolic-ref": ["-q", "HEAD"], "merge-base": ["HEAD", "HEAD"], "name-rev": ["HEAD"],
+    "diff-index": ["HEAD"], "diff-files": [], "diff-tree": ["HEAD"], "worktree": ["list"],
+    "notes": ["list"], "count-objects": [], "var": ["GIT_EDITOR"], "help": ["-a"], "version": [],
+}
+SEQUENCE_END_ARGS = [("rebase", "--abort"), ("rebase", "--quit"), ("rebase", "--edit-todo"),
+                     ("rebase", "--show-current-patch")]
+
+
+def _rebase_stopped_with_exec(gg: GG, repo: Path, proof: Path) -> None:
+    for i in range(3):
+        (repo / "r").write_text(f"{i}\n")
+        gg.git("add", "r", cwd=repo)
+        gg.git("commit", "-qm", f"r{i}", cwd=repo)
+    r = gg.git("rebase", "-x", f"touch {proof}; false", "HEAD~2", cwd=repo)
+    assert r.rc != 0 and proof.exists(), r.text
+    proof.unlink()
+
+
+def test_never_resumes_is_classified() -> None:
+    assert set(NEVER_RESUMES_ARGS) == set(gg_mod.NEVER_RESUMES)
+    assert {(c, o) for c, opts in gg_mod.SEQUENCE_ENDS.items() for o in opts} >= set(SEQUENCE_END_ARGS)
+
+
+@pytest.mark.parametrize("cmd", sorted(NEVER_RESUMES_ARGS) + [" ".join(a) for a in SEQUENCE_END_ARGS])
+def test_never_resumes_runs_no_todo_line(gg: GG, repo: Path, tmp_path: Path, cmd: str) -> None:
+    """Each command gitguard lets through a stopped sequence unread runs no
+    line of the todo when the raw git runs it: the claim behind
+    NEVER_RESUMES and SEQUENCE_ENDS."""
+    proof = tmp_path / "RAN"
+    _rebase_stopped_with_exec(gg, repo, proof)
+    argv = cmd.split() if " " in cmd else [cmd, *NEVER_RESUMES_ARGS[cmd]]
+    env = {**gg.raw_env, "GIT_EDITOR": "true", "GIT_PAGER": "cat"}
+    subprocess.run(["git", *argv], cwd=repo, env=env, capture_output=True, text=True, timeout=60)
+    assert not proof.exists(), f"`git {' '.join(argv)}` ran a todo line"
+    r = gg.git("rebase", "--continue", cwd=repo)            # the positive control
+    assert proof.exists() or "no rebase in progress" in r.err.lower(), (argv, r.text)
+
+
+# ================================ the way out of a split index ([148])
+@pytest.mark.parametrize("argv", [["update-index", "--no-split-index"],
+                                  ["config", "--unset", "core.splitIndex"]], ids=["update-index", "config"])
+def test_split_index_repair_enters_no_nested_repository(gg: GG, repo: Path, tmp_path: Path, argv) -> None:
+    """The two commands gitguard lets through a split index (`link`, whose
+    gitlinks it cannot read) must not open a nested repository: a planted
+    one, named by a gitlink of the split index, with a config that runs
+    something, runs nothing under them. Positive control: `status` runs it."""
+    from tests.test_nested import plant_nested
+    mark = tmp_path / "EXEC"
+    plant_nested(gg, repo, mark)
+    assert gg.git("add", "-A", cwd=repo).rc == 0
+    assert gg.git("config", "core.splitIndex", "true", cwd=repo).rc == 0
+    assert gg.git("update-index", "--split-index", cwd=repo).rc == 0
+    assert list((repo / ".git").glob("sharedindex.*")) and not mark.exists()
+    gg.git(*argv, cwd=repo)
+    assert not mark.exists(), f"`git {' '.join(argv)}` opened the nested repository"
+    gg.git("status", "--short", cwd=repo)
+    assert mark.exists(), "invalid control: git no longer opens the nested repository"
+
+
+# =============================== absorbgitdirs under the pin ([149])
+def test_absorbgitdirs_runs_only_the_pinned_fsmonitor(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """gitguard lets `submodule absorbgitdirs` through a nested repository
+    because, the fsmonitor pinned off, it runs nothing of it: a planted
+    nested repository with an fsmonitor and every hook, absorbed by the raw
+    git with the pin, leaves no trace. Positive control: without the pin,
+    the same command runs the nested fsmonitor."""
+    from tests.test_nested import plant_nested
+    for pin, expect in ((True, False), (False, True)):
+        r = repo if pin else tmp_path / "ctl"
+        if not pin:
+            assert gg.git("init", "-q", str(r)).rc == 0
+            (r / "f").write_text("a\n")
+            gg.git("add", "f", cwd=r)
+            assert gg.git("commit", "-qm", "i", cwd=r).rc == 0
+        mark = tmp_path / f"EXEC-{pin}"
+        plant_nested(gg, r, mark)
+        assert gg.git("add", "-A", cwd=r).rc == 0
+        (r / ".gitmodules").write_text('[submodule "vendor"]\n\tpath = vendor\n\turl = ./vendor\n')
+        pre = ["-c", "core.fsmonitor=false"] if pin else []
+        assert gg.git(*pre, "submodule", "absorbgitdirs", cwd=r).rc == 0
+        assert (r / "vendor/.git").is_file()
+        assert mark.exists() == expect, ("pin" if pin else "control", mark.exists())

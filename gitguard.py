@@ -207,6 +207,12 @@ VOLATILE_FILES = {"index", "HEAD", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "MER
                   "info/refs", "objects/info/packs", "objects/info/commit-graph",
                   "objects/info/multi-pack-index", "info/sparse-checkout"}
 OBJECT_FANOUT = re.compile(r"^objects/[0-9a-f]{2}$")
+# `sharedindex.<oid>` at a gitdir root: the entries of a split index, read by
+# git only through the `link` extension of `index` — which is refused
+# (_check_index_extensions). Left behind once split-index mode is off (git
+# deletes stale ones only while writing a split index): an orphan nobody
+# reads, volatile; the presence test refused the repository for ever. [148]
+SHARED_INDEX = re.compile(r"^sharedindex\.[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 # Volatile files git reads back as instructions cannot be hashed (rewritten
 # at every step) and cannot be ignored: each has a reader that refuses what
 # would run — VOLATILE_READERS, after the readers. [19] [51]
@@ -1355,7 +1361,7 @@ def _parse_index_gitlinks(data: bytes, p: Path, oid_size: int = 20) -> tuple[lis
 # uses %.4s extension, which we do not understand"), because they change
 # what the entries mean. The same rule here, so that a future one is a
 # refusal, not a blind spot: `sdir` (sparse directories, read above) and
-# `link` (split index: the entries live in a sharedindex file, check_split_index).
+# `link` (split index: the entries live in a sharedindex file, refused below [31] [148]).
 KNOWN_REQUIRED_EXTENSIONS = {b"sdir"}
 
 
@@ -1367,8 +1373,13 @@ def _check_index_extensions(data: bytes, off: int, p: Path, oid_size: int) -> No
         sig, size = data[off:off + 4], int.from_bytes(data[off + 4:off + 8], "big")
         if not b"A"[0] <= sig[0] <= b"Z"[0] and sig not in KNOWN_REQUIRED_EXTENSIONS:
             if sig == b"link":
+                if _repairs_split_index(_COMMAND):
+                    off += 8 + size          # the way out itself: enters no nested repository [148]
+                    continue
                 raise Refuse(f"core.splitIndex not supported ({p} is a split index): run "
-                             f"`git update-index --no-split-index` and retry")
+                             f"`git update-index --no-split-index` then `git config --unset "
+                             f"core.splitIndex` (gitguard lets exactly these two through; git "
+                             f"warns at the first, the second makes it stick)")
             raise Refuse(f"{p}: index extension {sig!r} gitguard does not know; git "
                          f"requires it to read the entries (a newer git?), so their "
                          f"gitlinks cannot be checked")
@@ -1385,24 +1396,46 @@ def _decode_varint(data: bytes, off: int) -> tuple[int, int]:
     return val, off
 
 
-def check_split_index(repo: Repo) -> None:
-    """core.splitIndex: the entries (hence the gitlinks) live in a
-    `sharedindex.<sha>` file that index_gitlinks does not read, and that git
-    rewrites (it would alert permanently). Explicit refusal rather than
-    accidentally closed. [31]"""
-    if any(repo.gitdir.glob("sharedindex.*")):
-        raise Refuse(f"core.splitIndex not supported (sharedindex.* in {repo.gitdir}): "
-                     f"run `git update-index --no-split-index` and retry")
+def _repairs_split_index(rest: list[str] | None) -> bool:
+    """The two commands that leave split-index mode, exactly as the refusal
+    names them: `config --unset core.splitIndex` (or `config unset`) and
+    `update-index --no-split-index`. Neither enters a nested repository —
+    the reason a split index is refused ([31]: its gitlinks are not read) —
+    held to git in test_claims.py; every other check still applies to
+    them (the hooks `update-index` runs are fingerprinted). Without them
+    the refusal named a command it refused itself. [148]"""
+    if not rest:
+        return False
+    if rest == ["update-index", "--no-split-index"]:
+        return True
+    return (rest[0] == "config" and len(rest) == 3 and rest[1] in ("--unset", "unset")
+            and rest[2].lower() == "core.splitindex")
 
 
 def nested_repo_hint(n: Path) -> str:
-    d = n.parent
+    """The way out of a nested repository, the paths as the user types them
+    (relative to the cwd: `git rm --cached` takes a pathspec, and the
+    basename named another path for `vendor/a`, [149])."""
+    d = os.path.relpath(n.parent)
     return (f"nested repository: {n} — a gitlink for this directory exists in the index "
             f"(a plain `git add -A` creates one), git will execute its config. If it is "
             f"your own vendored repository: inspect {n}/config and {n}/hooks, declare it "
-            f"in .gitmodules and run `git submodule absorbgitdirs` (its gitdir moves under "
-            f".git/modules/), then `gitguard trust`. Otherwise delete {n} first, then "
-            f"`git rm --cached {d.name}`.")
+            f"in .gitmodules, run `git submodule absorbgitdirs -- {d}` (gitguard lets it "
+            f"through, with core.fsmonitor pinned off: the raw git runs the nested "
+            f"repository's fsmonitor), then `gitguard trust`. Otherwise delete {d}/.git "
+            f"first, then `git rm --cached {d}`.")
+
+
+def _absorbs_nested(rest: list[str] | None) -> bool:
+    """`git submodule absorbgitdirs [-q] [--] [<path>…]`, the way out named
+    by the nested-repository refusal: it moves the nested gitdir under
+    `.git/modules/` and runs nothing of it but the in-process fsmonitor,
+    which the pin disarms (PINNED_CONFIG; held to git in test_claims.py).
+    Not when the pin is off (GITGUARD_KEEP_FSMONITOR). The refusal named
+    this command and refused it. [149]"""
+    if not rest or rest[:2] != ["submodule", "absorbgitdirs"] or _env_bool("GITGUARD_KEEP_FSMONITOR"):
+        return False
+    return all(a in ("-q", "--quiet", "--") or not a.startswith("-") for a in rest[2:])
 
 
 def gitdir_roots(base: Path) -> Iterator[Path]:
@@ -1430,15 +1463,21 @@ def gitdir_roots(base: Path) -> Iterator[Path]:
 def _read_todo(p: Path) -> None:
     """Rebase/cherry-pick todo lists accept `exec <cmd>` lines that git runs
     verbatim. The container can inject some during an in-progress rebase:
-    refuse their presence, unless the user runs `--exec` rebases themselves."""
+    refuse their presence, unless the user runs `--exec` rebases themselves.
+    The lines are shown: the user recognises the `exec make test` of their
+    own `rebase -x`. [147]"""
+    lines = []
     for line in read_file(p).decode(errors="surrogateescape").splitlines():
         # git accepts any blank after the command word (`exec<TAB>cmd`). [35]
         word = (line.split(None, 1) or [""])[0]
         if word in ("exec", "x"):
-            raise Refuse(
-                f"`exec` line in {p}: git would run it on the next "
-                f"`rebase --continue`. Check this file; if this rebase is really "
-                f"yours, retry with GITGUARD_ALLOW_REBASE_EXEC=1.")
+            lines.append(line)
+    if lines:
+        shown = "\n".join(f"    {l}" for l in lines[:10]) + ("\n    …" if len(lines) > 10 else "")
+        raise Refuse(
+            f"`exec` line in {p}: git would run it on the next "
+            f"`--continue` / `--skip`:\n{shown}\n  If this rebase is really "
+            f"yours, retry with GITGUARD_ALLOW_REBASE_EXEC=1.")
 
 
 def _read_strategy_file(p: Path) -> None:
@@ -1480,13 +1519,63 @@ VOLATILE_READERS = {
 }
 
 
+# Builtins that never resume an interrupted sequence, hence never run a line
+# of a todo, a strategy or the sequencer's options (held to git by
+# test_claims.py, an `exec` line in the todo and each command run). A
+# closed list of git's own commands: an alias cannot shadow a builtin
+# (git.c runs the builtin first), so a name outside the list — an alias
+# `cont = rebase --continue` included — keeps the readers. [147]
+NEVER_RESUMES = frozenset({
+    "status", "log", "diff", "show", "branch", "tag", "add", "rm", "mv", "restore",
+    "reset", "commit", "checkout", "switch", "stash", "blame", "grep", "ls-files",
+    "ls-tree", "rev-parse", "rev-list", "config", "reflog", "fetch", "push", "remote",
+    "describe", "shortlog", "cat-file", "show-ref", "for-each-ref", "symbolic-ref",
+    "merge-base", "name-rev", "diff-index", "diff-files", "diff-tree", "worktree",
+    "notes", "count-objects", "var", "help", "version",
+})
+# The options of the sequence commands that end or inspect the sequence
+# without resuming it; exact spellings only (an abbreviation keeps the
+# readers: fail closed).
+SEQUENCE_ENDS = {"rebase": {"--abort", "--quit", "--edit-todo", "--show-current-patch"},
+                 "cherry-pick": {"--abort", "--quit"}, "revert": {"--abort", "--quit"}}
+# The command of exec mode (`rest` after the global options), None in the
+# management commands and the plain check, which keep every reader on every
+# root: they report.
+_COMMAND: list[str] | None = None
+
+
+def _resumes_sequence(rest: list[str]) -> bool:
+    """Could this command run a line of a todo? False for NEVER_RESUMES and
+    for a sequence command that only ends or shows the sequence."""
+    if not rest:
+        return False                     # `git` alone prints its usage
+    cmd = rest[0]
+    if cmd in NEVER_RESUMES:
+        return False
+    if cmd in SEQUENCE_ENDS and any(a in SEQUENCE_ENDS[cmd] for a in rest[1:]):
+        return False
+    return True
+
+
 def check_volatile_readers(repo: Repo) -> None:
     """Each file of VOLATILE_READERS present under any gitdir root, read by
     its reader; GITGUARD_ALLOW_REBASE_EXEC skips them all (the user's own
-    `--exec` rebase or custom strategy)."""
+    `--exec` rebase or custom strategy). In exec mode, only for a command
+    that can resume a sequence, and not another linked worktree's files: a
+    stopped `rebase -x 'make test'` refused `status`, `log`, `rebase
+    --abort` and every command of every linked worktree, where only a
+    `--continue` / `--skip` runs the line. Another worktree's sequence is
+    resumed by a git started in that worktree, judged there; a submodule's
+    by a child git, which a covered child judges too (main): its gitdir
+    stays among the roots read here. [147]"""
     if os.environ.get("GITGUARD_ALLOW_REBASE_EXEC"):
         return
     roots = dict.fromkeys([*gitdir_roots(repo.gitdir), *gitdir_roots(repo.common)])
+    if _COMMAND is not None:
+        if not _resumes_sequence(_COMMAND):
+            return
+        others = repo.common / "worktrees"
+        roots = {r: None for r in roots if r == repo.gitdir or others not in r.parents}
     for r in roots:
         for rel, read in VOLATILE_READERS.items():
             p = r / rel
@@ -1559,14 +1648,29 @@ def check_nested_git(n: Path, common: Path, roots: set[Path]) -> None:
         # a real submodule (that one has a .git file pointing under
         # .git/modules), and git reads its config as soon as a gitlink
         # references it in the index.
+        if _absorbs_nested(_COMMAND):
+            return                       # the way out itself, pin on [149]
         raise Refuse(nested_repo_hint(n))
     target = read_gitfile(n)
-    if target not in roots or common not in target.parents:
-        raise Refuse(f"{n} points to no gitdir under {common}/modules or {common}/worktrees: {target}")
+    if target in roots and common in target.parents:
+        return
+    # A gitfile whose target sits under `modules/` but is no repository yet
+    # (no HEAD, no commondir): what a failed `switch --recurse-submodules`
+    # leaves behind for a submodule never initialised (git wrote
+    # `modules/<x>/config` and died; every other command of the raw git
+    # still works, and the embryo is removed by hand before `submodule
+    # update --init`). Not a structure to refuse: that directory is no
+    # gitdir root, so the walk hashes its files as plain entries of the
+    # superproject — a `config` planted there is an added file, shown and
+    # judged like any other — and git opens no repository there before
+    # `submodule update` makes one, judged at the next command. [146]
+    if (common / "modules" in target.parents and target.is_dir() and not target.is_symlink()
+            and not (target / "HEAD").exists() and not (target / "commondir").exists()):
+        return
+    raise Refuse(f"{n} points to no gitdir under {common}/modules or {common}/worktrees: {target}")
 
 
 def check_structure(repo: Repo, refs: list[tuple[str, Path]]) -> None:
-    check_split_index(repo)
     check_indexes(repo)
     roots = set(gitdir_roots(repo.common))
     for n in repo.gitfiles:
@@ -1954,6 +2058,9 @@ class ConfigScan:
         # matching one is an active submodule with no per-name config
         # write — named by the warning at trust. [126]
         self.active_pathspecs: set[str] = set()
+        # `core.splitIndex = true` in some source: the next index git writes
+        # is split, and refused ([31]); said at trust. [148]
+        self.split_index = False
         # Values of global origin and of the environment / `-c` (an alias's
         # `-c` included): resolved again against each local remote and
         # submodule. [68] [92]
@@ -2054,6 +2161,8 @@ class ConfigScan:
         repo = self.repo
         if section == "submodule" and key == "active":
             self.active_pathspecs.add(value)
+        if (section, key) == ("core", "splitindex") and _git_maybe_bool(value):
+            self.split_index = True              # warned at trust [148]
         # `git push <name>` resolves <name> through the repository's config
         # (local, global, environment: those whose base is the root), not a
         # submodule's: there, `<name>` is a path.
@@ -2809,7 +2918,8 @@ def _volatile_file(rel: str, is_symlink: bool) -> bool:
         rel = rel[:-5]
         if rel in LOCKED_FILES:
             return True
-    return rel in VOLATILE_FILES or (rel.startswith("BISECT_") and "/" not in rel)
+    return (rel in VOLATILE_FILES or (rel.startswith("BISECT_") and "/" not in rel)
+            or bool(SHARED_INDEX.match(rel)))
 
 
 def gitdir_paths(base: Path) -> Iterator[tuple[str, Path]]:
@@ -4350,6 +4460,33 @@ def run_git(args: list[str], orig: Path, newrepo: NewRepo | None, git: str,
 # ------------------------------------------------- auto-accept and prompt
 _BRANCH_KEYS = {"remote", "merge", "vscode-merge-base"}
 _REF_OK = re.compile(r"^refs/heads/[^\s]+$")
+# `remote.<n>.url` / `remote.<n>.fetch`: what `git remote add <n> <url>`
+# writes. Accepted when the URL reaches a network transport git drives
+# itself: `http(s)://`, `ftp(s)://` (remote-curl, git's own helper),
+# `git://`, `ssh://` and the scp form `[user@]host:path` (the ssh program
+# named by core.sshCommand / GIT_SSH, watched as a program key already).
+# Rejected, the fingerprint keeps the rule: a local path or `file://` (git
+# runs that repository's hooks: it must enter the watch, [45] [61]),
+# `<helper>::<address>` (git execs `git-remote-<helper>`, `ext::` runs a
+# command), any other scheme (a helper too), a host starting with `-`. The
+# fetch refspec runs nothing. pre-commit installs a hook repository with
+# `init --template=`, `remote add`, `fetch`: the fetch, a child with no
+# terminal, met the config `remote add` wrote and was refused. [145]
+_REMOTE_KEYS = {"url", "fetch"}
+_NETWORK_SCHEME = re.compile(r"^(?:https?|ftps?|git|ssh|git\+ssh|ssh\+git)://[^/\s@-][^/\s]*(?:/.*)?$")
+_SCP_LIKE = re.compile(r"^(?:[^\s@/:]+@)?[^\s@/:-][^\s/:]*:[^\s]*$")
+_REFSPEC_OK = re.compile(r"^\^?\+?[^\s]+$")
+
+
+def _network_url(url: str) -> bool:
+    """A remote URL git drives over the network with its own transports,
+    never through a path of the volume or a program the URL names
+    (transport.c transport_get, connect.c url_is_local_not_ssh)."""
+    if _CTRL.search(url) or "::" in url.split("://", 1)[0]:
+        return False
+    if "://" in url:
+        return bool(_NETWORK_SCHEME.match(url))
+    return bool(_SCP_LIKE.match(url))
 # `branch.<x>.vscode-merge-base = origin/main`: written by VS Code's git
 # extension when a repository is opened (seen with code-server on the VM:
 # every repository turned "modified" on first open). git ignores the key;
@@ -4362,15 +4499,17 @@ def branch_tracking_only(old_items: list[tuple[str, str, str]],
                          new_items: list[tuple[str, str, str]]) -> list[str]:
     """If the only semantic difference between two configs is the addition or
     removal of `branch.<x>.remote` / `branch.<x>.merge` (what `push -u`,
-    `branch -u` and `checkout -b` with autoSetupMerge write) or of
+    `branch -u` and `checkout -b` with autoSetupMerge write), of
     `branch.<x>.vscode-merge-base` (what VS Code's git extension writes on
-    opening a repository), return the branches concerned; otherwise []. None
-    of these keys can make anything run. `remote` must name a remote already
-    present in the trusted config (or `.`), `merge` a `refs/heads/…`,
-    `vscode-merge-base` a ref name. Closed list, not to be extended without
-    proof: this is not a blocklist of dangerous keys but an allowlist of
-    three harmless ones — the fingerprint remains the rule for everything
-    else."""
+    opening a repository) or of `remote.<n>.url` / `remote.<n>.fetch` with a
+    network URL (what `remote add` writes, [145]), return the branches
+    concerned and `remote <n>` for each remote; otherwise []. None of these
+    keys can make anything run. `remote` must name a remote already present
+    in the trusted config (or `.`), `merge` a `refs/heads/…`,
+    `vscode-merge-base` a ref name, `url` pass _network_url. Closed list,
+    not to be extended without proof: this is not a blocklist of dangerous
+    keys but an allowlist of harmless ones — the fingerprint remains the rule
+    for everything else."""
     from collections import Counter
     old_c, new_c = Counter(old_items), Counter(new_items)
     delta = list((old_c - new_c).elements()) + list((new_c - old_c).elements())
@@ -4378,7 +4517,18 @@ def branch_tracking_only(old_items: list[tuple[str, str, str]],
         return []                       # nothing semantic (a comment…): not for us
     remotes = {sec[len("remote."):] for sec, _, _ in old_items if sec.startswith("remote.")}
     branches: set[str] = set()
+    added: set[str] = set()
     for section, key, value in delta:
+        if section.startswith("remote.") and key in _REMOTE_KEYS:
+            name = section[len("remote."):]
+            if not name or _CTRL.search(name) or "\n" in name:
+                return []
+            if key == "url" and not _network_url(value):
+                return []
+            if key == "fetch" and not _REFSPEC_OK.match(value):
+                return []
+            added.add(f"remote {name}")
+            continue
         if not section.startswith("branch.") or key not in _BRANCH_KEYS:
             return []
         name = section[len("branch."):]
@@ -4391,7 +4541,7 @@ def branch_tracking_only(old_items: list[tuple[str, str, str]],
         if key == "vscode-merge-base" and not _REFNAME_OK.match(value):
             return []
         branches.add(name)
-    return sorted(branches)
+    return sorted(branches) + sorted(added)
 
 
 def auto_accept(repo: Repo, key: Path, old: Manifest, new: dict) -> list[str]:
@@ -4484,11 +4634,14 @@ def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
             clear_pending(key)           # the state came back on its own
         return
     if interactive:
-        branches = auto_accept(repo, key, old, new)
-        if branches:
+        accepted = auto_accept(repo, key, old, new)
+        if accepted:
             save_trust(repo, refs, new)
-            info(f"config: branch tracking for {', '.join(san(b) for b in branches)} "
-                 f"→ reference updated")
+            branches = [b for b in accepted if not b.startswith("remote ")]
+            remotes = [r for r in accepted if r.startswith("remote ")]
+            what = ([f"branch tracking for {', '.join(san(b) for b in branches)}"] if branches else []) \
+                + [f"{san(r)} (network URL)" for r in remotes]
+            info(f"config: {'; '.join(what)} → reference updated")
             return
     rule()
     warn(STYLE.bold(f"{repo.label}/.git has changed since the last trust"))
@@ -4900,6 +5053,10 @@ def warn_accepted_limitations(insp: "Inspection") -> None:
              f"them, a checkout/merge/reset/pull of a commit someone else created replaces "
              f"them after the check, and git uses the new version in the same command. "
              f"Review incoming changes to these files.")
+    if insp.scan.split_index:
+        warn("core.splitIndex = true: the next index git writes is a split index, whose "
+             "gitlinks gitguard cannot read — every command will be refused until "
+             "`git update-index --no-split-index` then `git config --unset core.splitIndex`.")
     if insp.scan.active_pathspecs and _env_bool("GITGUARD_KEEP_FSMONITOR"):
         vals = " ".join(sorted(insp.scan.active_pathspecs))
         warn(f"submodule.active = {vals}: every submodule path found in a commit counts "
@@ -4948,6 +5105,7 @@ def check_wrap() -> None:
 
 
 def main(argv: list[str]) -> int:
+    global _COMMAND
     mode, yes = "check", False
     name = Path(argv[0]).name
     if name == "git" or name in TRANSPORT:
@@ -5024,6 +5182,8 @@ def main(argv: list[str]) -> int:
             return 0
         repo = open_repo(root)
         label, key = repo.label, repo.key
+        if mode == "exec":
+            _COMMAND = split_global_options(argv, orig).rest       # [147]
         if judged is not None:
             rest = split_global_options(argv, orig).rest
             covered = judged.covers(repo)
@@ -5041,6 +5201,12 @@ def main(argv: list[str]) -> int:
                 if rest[:1] in (["push"], ["archive"]):
                     insp = inspect(repo)
                     check_remote_destination(repo, rest, insp.scan.remote_names, insp.refs)
+                # Nor its sequence: the parent read the todos only if its
+                # own command could resume one ([147]); a child that can (a
+                # hook's or a `submodule foreach`'s `rebase --continue`, [36])
+                # reads them here.
+                if _resumes_sequence(rest):
+                    check_volatile_readers(repo)
                 return run_git(argv, orig, newrepo, git, judged)
         insp = inspect(repo)
         refs, new = insp.refs, insp.new

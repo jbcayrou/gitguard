@@ -26,6 +26,23 @@ ATTACKS = attacks.collect()
 
 # Attacks not visible before the gitlink (no walk of the tree): what the
 # user does next, and from where gitguard must then refuse.
+# Traps in a sequence's files (todo, strategy, sequencer opts): read only by
+# a command that can resume the sequence ([147]). The plain check still
+# refuses; the resuming command must be refused, an ordinary one may run.
+RESUME = {
+    "attack_rebase_todo_exec": ["rebase", "--continue"],
+    "attack_rebase_todo_exec_tab": ["rebase", "--continue"],
+    "attack_rebase_strategy_binary": ["rebase", "--continue"],
+    "attack_rebase_strategy_trailing_blank": ["rebase", "--continue"],
+    "attack_rebase_strategy_trailing_cr": ["rebase", "--continue"],
+    "attack_rebase_strategy_empty": ["rebase", "--continue"],
+    "attack_rebase_strategy_tree_path": ["rebase", "--continue"],
+    "attack_sequencer_opts_strategy": ["cherry-pick", "--continue"],
+    "attack_sequencer_opts_strategy_lone_cr": ["cherry-pick", "--continue"],
+    "attack_rebase_todo_exec_in_submodule": ["submodule", "foreach", "-q", "git rebase --continue"],
+    "attack_rebase_todo_exec_resumed_by_a_child": ["commit", "--allow-empty", "-qm", "x"],
+}
+
 DEFERRED = {
     "attack_nested_git_undeclared": ("add", None),
     "attack_bare_gitdir_planted_in_subdir": ("cd", "src"),
@@ -61,6 +78,13 @@ def assert_blocked_now(gg: GG, cwd: Path, needle: str | None = None) -> None:
 def test_attack_is_blocked(gg: GG, repo: Path, tmp_path: Path, fn) -> None:
     assert not gg.check(repo).blocked, "the starting repository must be clean"
     fn(gg, repo, tmp_path)
+    resume = RESUME.get(fn.__name__)
+    if resume is not None:
+        r = gg.check(repo)
+        assert r.blocked and "gitguard:" in r.err, f"attack accepted!\n{r.text}"
+        r2 = gg.run("git", *resume, cwd=repo)
+        assert r2.blocked and "gitguard:" in r2.err, f"the resuming command ran\n{r2.text}"
+        return
     deferred = DEFERRED.get(fn.__name__)
     if deferred is None:
         assert_blocked_now(gg, repo)
@@ -77,6 +101,7 @@ def test_attack_is_blocked(gg: GG, repo: Path, tmp_path: Path, fn) -> None:
 def test_deferred_list_matches_corpus() -> None:
     names = {a[1].__name__ for a in ATTACKS}
     assert set(DEFERRED) <= names, set(DEFERRED) - names
+    assert set(RESUME) <= names, set(RESUME) - names
     assert set(OPEN) <= names, set(OPEN) - names
 
 

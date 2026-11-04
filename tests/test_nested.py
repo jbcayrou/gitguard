@@ -70,12 +70,17 @@ def test_nested_repo_repair(gg: GG, repo: Path, tmp_path: Path) -> None:
 
 def test_vendored_repo_becomes_a_submodule(gg: GG, repo: Path, tmp_path: Path) -> None:
     """The legitimate way out named by the refusal: declare the directory in
-    .gitmodules, `git submodule absorbgitdirs`, then trust."""
+    .gitmodules, `git submodule absorbgitdirs` — through gitguard since
+    [149], the `.gitmodules` just written trusted first — then trust."""
     plant_nested(gg, repo, tmp_path / "EXEC", evil=False)
     assert gg.run("git", "add", "-A", cwd=repo).rc == 0
     assert gg.check(repo).blocked
     (repo / ".gitmodules").write_text('[submodule "vendor"]\n\tpath = vendor\n\turl = ./vendor\n')
-    assert gg.git("submodule", "absorbgitdirs", cwd=repo).rc == 0
+    r = gg.run("git", "submodule", "absorbgitdirs", cwd=repo)
+    assert r.blocked and "has changed" in r.err and "nested repository" not in r.err, r.text
+    from tests.test_prompt import run_with_tty
+    rc, _, tty = run_with_tty(gg, ["git", "submodule", "absorbgitdirs"], repo, "y")
+    assert rc == 0, tty
     assert (repo / "vendor/.git").is_file()
     r = gg.run("trust", cwd=repo)
     assert r.rc == 0, r.text

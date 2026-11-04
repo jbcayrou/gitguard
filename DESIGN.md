@@ -255,9 +255,19 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    / `strip()` made gitguard check a repository git never opens ([53],
    `test_gitfile_read_like_git`, `test_commondir_read_like_git`).
 3. **`check_structure`** (refuses before anything else):
-   - `core.splitIndex` (`sharedindex.*` present, or the index's `link`
-     extension): explicit refusal, the gitlinks live in a file
-     `index_gitlinks` does not read ([31]). The parser applies git's own
+   - `core.splitIndex` (the index's `link` extension): explicit refusal,
+     the gitlinks live in a file `index_gitlinks` does not read ([31]).
+     The refusal is decided on the index alone: a `sharedindex.<oid>` at
+     a gitdir root is volatile (`SHARED_INDEX`), git reads one only through
+     `link` — the presence test kept the orphan git leaves behind refused
+     for ever ([148]). The way out goes through gitguard: exactly `git
+     update-index --no-split-index` and `git config --unset
+     core.splitIndex` pass the `link` refusal (they enter no nested
+     repository, held to git in `tests/test_claims.py`), every other check
+     still applies; telling the user to run the raw git instead would have
+     run a planted `post-index-change` hook, the structure being refused
+     before the fingerprint is compared. `trust` warns when a config sets
+     `core.splitIndex = true`. The parser applies git's own
      rule to the index extensions: a signature starting with a lowercase
      letter is required, git dies on one it does not know, because it
      changes what the entries mean — so does gitguard
@@ -292,14 +302,28 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
      deliberately vendored repository, inspect its `config` and `hooks`,
      declare it in `.gitmodules`, `git submodule absorbgitdirs` (gitfile under
      `.git/modules/`), `trust`; otherwise delete `<dir>/.git` **before** `git
-     rm --cached <dir>`. **The same rule inside every submodule**
+     rm --cached <dir>` (paths relative to the cwd, as the user types them).
+     `absorbgitdirs` goes **through gitguard** ([149]): exactly that command
+     passes the nested-repository refusal, every other check applied and
+     the fsmonitor pinned off — the raw git runs the nested repository's
+     `core.fsmonitor` while absorbing it (checked on git 2.50), and the
+     structural refusal comes before the superproject's fingerprint is
+     compared, so sending the user to the raw git ran whatever the sandbox
+     had planted. Not under `GITGUARD_KEEP_FSMONITOR`. **The same rule inside every submodule**
      (`check_indexes`, `check_nested_git`): the gitlinks of
      `modules/<x>/index` and the `.gitmodules` of the submodule's tree
      (from its `core.worktree`) name nested repositories that must have a
      gitfile under `modules/<x>/modules/` — `git status` of the
      superproject recurses into the submodule, then into what its index
      names, and runs that repository's config ([60]). Not for a linked
-     worktree's index: nothing recurses into another worktree.
+     worktree's index: nothing recurses into another worktree. One
+     gitfile target is accepted without being a gitdir root: a directory
+     under `modules/` that is **no repository yet** (no HEAD, no
+     commondir), what a failed `switch --recurse-submodules` leaves for a
+     submodule never initialised ([146]). The walk sees no root there and
+     hashes its files as entries of the superproject, so a planted `config`
+     is an added file, judged like any other; refusing it as structure
+     stopped every command, `trust` and `restore` included.
    - **Index entry names** (`forged_entry`, `verify_path`, run by the index
      parser on every index of the repository: its own, `modules/<x>/index`,
      `worktrees/<x>/index` — `check_indexes`): git validates a name when it
@@ -332,7 +356,23 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
      script of the work tree ([51]). The value is compared as git reads it:
      one trailing newline trimmed, read as bytes, no `strip()` (`ort<TAB>` and
      `ort<CR>` are other names). `GITGUARD_ALLOW_REBASE_EXEC=1` for people who
-     run `rebase --exec` or a custom strategy.
+     run `rebase --exec` or a custom strategy. **Only a command that can
+     resume the sequence** runs these readers in exec mode ([147]): a
+     stopped `rebase -x 'make test'` — the test fails, the normal outcome —
+     refused `status`, `log`, `rebase --abort` and every command of every
+     linked worktree, where only `--continue` / `--skip` runs a line. The
+     commands that never resume are a closed list of git's builtins
+     (`NEVER_RESUMES`, held to git in `tests/test_claims.py`: each run on a
+     stopped rebase whose todo holds an `exec`, none runs it), plus the
+     options that end or show the sequence (`SEQUENCE_ENDS`, exact
+     spellings); an alias is not a builtin and keeps the readers (git.c
+     runs a builtin before any alias). Another linked worktree's files are
+     not read (its sequence is resumed by a git started there, judged
+     there); a covered child git that resumes a sequence — a hook's `git
+     rebase --continue`, `submodule foreach` — reads them itself, since
+     its parent may not have. The refusal shows the `exec` lines: the user
+     recognises their own. The plain check and the management commands
+     keep every reader on every root.
    - no control character in a watched name; no symlink in the first two
      levels of the gitdir; `config` and `hooks/` (of the gitdir and of the
      commondir) belong to the user and are not world-writable; no path named
@@ -702,7 +742,7 @@ refusal message.
 `_validate_headref` / `is_bare_gitdir` / `find_root` (discovery, git's
 order); `Repo` (root/gitdir/common/anchor, `nested` and `gitfiles` cached) →
 `open_repo` (gitfile, commondir, `core.worktree`);
-`check_structure` (refuses; `check_split_index`, `check_volatile_readers`);
+`check_structure` (refuses; `check_indexes`, `check_volatile_readers`);
 `ConfigScan` (one pass over every config source: `refs`, what the config
 makes git read outside the gitdir; `remote_names`; `cmd`, the aliases;
 `add` records a path, `consider` reads one entry, `run` orders the
@@ -827,8 +867,17 @@ before refusing (`check_or_die`, `interactive=True` only in exec mode;
    `branch.<x>.vscode-merge-base` (value a ref name: no leading `-`, no
    blank), which VS Code's git extension writes on opening a repository —
    every repository turned "modified" on first open in code-server; git
-   ignores the key, VS Code passes the value to `git merge-base`. A closed
-   list of three harmless keys, **not** a blocklist: do not extend it
+   ignores the key, VS Code passes the value to `git merge-base`. Same for
+   `remote.<n>.url` with a **network** URL and `remote.<n>.fetch`, what
+   `remote add` writes ([145]): pre-commit installs its hook repositories
+   with `init --template=`, `remote add`, `fetch` from a hook with no
+   terminal, and the fetch was refused on the config the `remote add` had
+   just written. `_network_url` accepts only a URL git drives itself
+   (`http(s)://`, `ftp(s)://`, `git://`, `ssh://`, the scp form); a local
+   path or `file://` makes git run that repository's hooks and must enter
+   the watch ([45] [61]), `<helper>::` and any other scheme run a
+   `git-remote-<helper>`: those keep the fingerprint rule. A closed
+   list of harmless keys, **not** a blocklist: do not extend it
    without a demonstration that the key cannot execute anything
    (`branch.x.rebase`, `remote.*.url`, a lone comment: refused → prompt). A `config` that differs only by comments
    is not accepted either (empty delta = not for us).
@@ -1430,7 +1479,8 @@ the files, not the order.
   "Nested repositories" for what runs in the window between the user's
   `add` and the next wrapped command (a `!` alias chaining git commands, a
   `post-index-change` hook, an unwrapped client) — all outside the wrapper.
-- `core.splitIndex`: refused (gitlinks in `sharedindex.*`, not read).
+- `core.splitIndex`: refused (gitlinks in `sharedindex.*`, not read); the way out
+  (`update-index --no-split-index`, `config --unset core.splitIndex`) passes ([148]).
 - Parity gaps with git are tracked in `tests/test_git_parity.py` as
   `xfail(strict=True)`; none is open at the moment (the former ones, [46]
   to [50], and the sh expansions of [58] are fixed). Deliberate divergences,

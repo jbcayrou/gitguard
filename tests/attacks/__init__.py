@@ -1007,6 +1007,81 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      of LOCKED_FILES (`config`, `config.worktree`, `objects/maintenance`),
      the hashed files git rewrites under a lock. Anywhere else a `.lock`
      is a file like any other.
+[145] False positive (blocking): pre-commit could never install a hook
+     repository. It builds its cache with `init --template=` (auto-trusted
+     since [116]), `remote add origin https://…`, then `fetch` and
+     `checkout FETCH_HEAD`: sibling gits of a tool with no terminal. The
+     `remote add` wrote the config, the `fetch` met it as a change, could
+     not ask, and was refused; pre-commit deleted the cache and started
+     over elsewhere, so no pending decision ever applied. The same prompt
+     met GitHub's first-push sequence (`init`, `remote add origin`, `push
+     -u`). Found by the fourth agentic audit, 2026-11-03. Fix: the closed
+     auto-accept list (branch_tracking_only) takes the addition or removal
+     of `remote.<n>.url` with a network URL and of `remote.<n>.fetch`: a
+     URL git drives itself (`http(s)`, `ftp(s)`, `git`, `ssh`, the scp
+     form) runs nothing of the volume; a local path or `file://` (hooks
+     of that repository, [45] [61]), `<helper>::`, `ext::`, any other
+     scheme or another `remote.*` key keeps the fingerprint rule.
+     _network_url is held to git in test_claims.py.
+[146] False positive (blocking): `switch --recurse-submodules` (or with
+     `submodule.recurse`) to a branch that adds a submodule never
+     initialised fails in git itself and leaves `libs/c/.git` pointing at
+     `.git/modules/libs/c`, a directory holding only `config`. Not a
+     gitdir root (no HEAD, no commondir): check_nested_git refused it as a
+     structure, and a structural refusal stops every command, `status`,
+     `log`, `trust` and `restore` included, with a message naming no way
+     out. (The raw git cannot use the submodule either — `submodule
+     update` dies on it — but every other command works; its repair is to
+     remove the embryo by hand.) Found by the fourth agentic audit,
+     2026-11-03. Fix: a gitfile to
+     a directory under `modules/` that is no repository yet is accepted as
+     structure — its files are hashed as plain entries of the
+     superproject (the walk sees no root there), so a `config` planted in
+     it is an added file, shown and judged, never a structure to refuse.
+[147] False positive (blocking): a stopped `rebase -x 'make test'` (the
+     test fails: the normal outcome) left `exec` lines in the todo, and
+     the reader of [19] refused every command — `status`, `log`, `rebase
+     --abort` — in this worktree and in every linked one. Only a command
+     that resumes the sequence runs a line. Found by the fourth agentic
+     audit, 2026-11-03. Fix: in exec mode the readers of the sequence
+     files (todo, rebase strategy, sequencer opts) run only for a command
+     outside NEVER_RESUMES (git's builtins that never resume a sequence,
+     held to git in test_claims.py; an alias keeps the readers, a builtin
+     cannot be shadowed) and outside SEQUENCE_ENDS (`--abort`, `--quit`,
+     `--edit-todo`, `--show-current-patch`, exact spellings), and not on
+     another linked worktree's files; a covered child that resumes a
+     sequence (a hook's `git rebase --continue`, `submodule foreach`)
+     reads them itself. The refusal shows the lines. The plain check and
+     the management commands keep every reader on every root.
+[148] False positive (blocking): `core.splitIndex = true`, trusted without
+     a word, made the next `status` write a split index and every command
+     after it refused ([31]). The refusal named `git update-index
+     --no-split-index`, which it refused itself (and `config --unset`,
+     and `trust`); after a repair with the raw git, the orphan
+     `sharedindex.<oid>` — git deletes stale ones only while writing a
+     split index — kept the repository refused for ever. Found by the
+     fourth agentic audit, 2026-11-03. Fix: the refusal is decided on the
+     index's `link` extension alone and `sharedindex.<oid>` at a gitdir
+     root is volatile; exactly `update-index --no-split-index` and
+     `config --unset core.splitIndex` pass the `link` refusal (they enter
+     no nested repository, held to git in test_claims.py) with every
+     other check applied — the raw git would have run a planted
+     `post-index-change` hook; `trust` warns on `core.splitIndex = true`.
+[149] False positive (blocking), and a way out that ran the sandbox's
+     code: the nested-repository refusal ([5] [6]) named `git submodule
+     absorbgitdirs` then `gitguard trust` to keep a vendored repository,
+     and refused both itself; its other way out said `git rm --cached
+     <basename>`, another path for `vendor/a`. The user left with the raw
+     git ran the nested repository's core.fsmonitor: `absorbgitdirs`
+     opens it in-process (checked on git 2.50), and the structural
+     refusal comes before the superproject's own fingerprint is compared.
+     Found by the fourth agentic audit, 2026-11-03 (the fsmonitor run by
+     the replay). Fix: exactly `submodule absorbgitdirs [-q] [--] [<path>…]`
+     passes the nested-repository refusal, every other check applied and
+     the fsmonitor pinned off (PINNED_CONFIG) — not under
+     GITGUARD_KEEP_FSMONITOR; held to git in test_claims.py (absorbed with
+     the pin, a planted nested repository runs nothing; without, its
+     fsmonitor runs). The message gives the paths relative to the cwd.
 """
 from __future__ import annotations
 

@@ -296,3 +296,37 @@ def test_no_prompt_for_structural_refusal(gg: GG, repo: Path) -> None:
     gg.git("config", "core.hooksPath", ".git/hooks", cwd=repo)
     rc, out, tty = run_with_tty(gg, ["git", "status"], repo, "y")
     assert rc != 0 and "[y/N]" not in tty and "On branch" not in out
+
+
+# --------------------- adopting a nested repository through gitguard ([149])
+def test_absorbgitdirs_through_gitguard_runs_nothing(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[149] the refusal's way out — declare the nested repository, `git
+    submodule absorbgitdirs`, trust — was refused by the same check, and the
+    raw git it left runs the nested repository's fsmonitor. Through
+    gitguard, with the pin: the `.gitmodules` the user wrote is asked
+    about, nothing of the nested repository runs, its gitdir moves."""
+    from tests.test_nested import plant_nested
+    mark = tmp_path / "EXEC"
+    plant_nested(gg, repo, mark)
+    assert gg.run("git", "add", "-A", cwd=repo).rc == 0
+    r = gg.check(repo)
+    assert r.blocked and "absorbgitdirs -- vendor" in r.err and "rm --cached vendor" in r.err, r.text
+    (repo / ".gitmodules").write_text('[submodule "vendor"]\n\tpath = vendor\n\turl = ./vendor\n')
+    rc, _, tty = run_with_tty(gg, ["git", "submodule", "absorbgitdirs", "--", "vendor"], repo, "y")
+    assert rc == 0, tty
+    assert not mark.exists(), "the nested repository's config ran"
+    assert (repo / "vendor/.git").is_file() and (repo / ".git/modules/vendor/HEAD").exists()
+    r = gg.run("trust", cwd=repo)
+    assert r.rc == 0, r.text
+    assert not gg.check(repo).blocked
+
+
+def test_absorbgitdirs_refused_without_the_pin(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[149] GITGUARD_KEEP_FSMONITOR leaves the fsmonitor armed: no way through."""
+    from tests.test_nested import plant_nested
+    plant_nested(gg, repo, tmp_path / "EXEC")
+    assert gg.run("git", "add", "-A", cwd=repo).rc == 0
+    (repo / ".gitmodules").write_text('[submodule "vendor"]\n\tpath = vendor\n\turl = ./vendor\n')
+    rc, _, tty = run_with_tty(gg, ["git", "submodule", "absorbgitdirs"], repo, "y",
+                              env={"GITGUARD_KEEP_FSMONITOR": "1"})
+    assert rc != 0 and "nested repository" in tty and not (tmp_path / "EXEC").exists(), tty

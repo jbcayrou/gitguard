@@ -1144,3 +1144,162 @@ def test_lock_of_a_file_git_locks_is_silent(gg: GG, repo: Path, name: str) -> No
     p.write_text("")
     r = gg.check(repo)
     assert not r.blocked, r.text
+
+
+# --------------------------- a network remote added by a tool ([145], 2026-11-04)
+def test_remote_add_network_url_is_accepted_without_terminal(gg: GG, tmp_path: Path) -> None:
+    """[145] pre-commit installs a hook repository with `init --template=`,
+    `remote add origin https://…`, `fetch`: three sibling gits of a tool with
+    no terminal. The fetch met the config `remote add` wrote and was
+    refused. A network URL runs nothing: accepted like branch tracking."""
+    d = tmp_path / "cache" / "repoA"
+    assert gg.run("git", "init", "-q", "--template=", str(d), cwd=tmp_path).rc == 0
+    assert gg.run("git", "remote", "add", "origin", "https://example.invalid/hooks.git", cwd=d).rc == 0
+    r = gg.run("git", "fetch", "-q", "origin", "--depth=1", "v1", cwd=d)
+    assert "has changed" not in r.err and "remote origin" in r.err, r.text   # git fails on the network only
+    assert not gg.check(d).blocked
+    # GitHub's first-push sequence in a repository of the user's own.
+    repo = tmp_path / "proj"
+    assert gg.run("git", "init", "-q", str(repo), cwd=tmp_path).rc == 0
+    commit(gg, repo, "a", "1")
+    assert gg.run("git", "remote", "add", "origin", "git@github.com:user/proj.git", cwd=repo).rc == 0
+    r = gg.run("git", "status", cwd=repo)
+    assert r.rc == 0 and "remote origin" in r.err and "has changed" not in r.err, r.text
+    assert not gg.check(repo).blocked
+
+
+def test_remote_add_local_path_still_prompts(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[145] the counterpart: a local remote enters the watch ([45] [61]),
+    so its addition is shown, not accepted."""
+    hub = make_source(gg, tmp_path, "hub")
+    gg.trust(repo)
+    assert gg.run("git", "remote", "add", "hub", str(hub), cwd=repo).rc == 0
+    r = gg.run("git", "status", cwd=repo)
+    assert r.rc == 1 and "has changed" in r.err, r.text
+
+
+# ---------------- a recursive switch that fails half-way ([146], 2026-11-04)
+def test_failed_recursive_switch_can_be_repaired(gg: GG, tmp_path: Path) -> None:
+    """[146] `checkout --recurse-submodules` to a branch that adds a submodule
+    never initialised fails in git itself and leaves `libs/c/.git` pointing
+    at a `modules/libs/c` holding only `config`. That was refused as a
+    structure: `status`, `log`, `trust`, `restore`, everything, with a
+    message naming no way out. It is an added file, shown and judged; the
+    repository stays usable while the user repairs it git's way."""
+    P = tmp_path
+    G = lambda *a, cwd=P: gg.git("-c", "protocol.file.allow=always", *a, cwd=cwd)
+    c = make_source(gg, P, "c")
+    assert G("init", "-q", "--bare", str(P / "c.git")).rc == 0
+    assert G("push", "-q", str(P / "c.git"), "HEAD:refs/heads/main", cwd=c).rc == 0
+    up = make_source(gg, P, "up")
+    assert G("init", "-q", "--bare", str(P / "super.git")).rc == 0
+    assert G("remote", "add", "origin", str(P / "super.git"), cwd=up).rc == 0
+    assert G("push", "-q", "origin", "HEAD:refs/heads/main", cwd=up).rc == 0
+    assert G("checkout", "-qb", "feat", cwd=up).rc == 0
+    assert G("submodule", "add", "-q", "../c.git", "libs/c", cwd=up).rc == 0
+    assert G("commit", "-qm", "add c", cwd=up).rc == 0
+    assert G("push", "-q", "origin", "feat", cwd=up).rc == 0
+    w = P / "work"
+    r = gg.run("git", "-c", "protocol.file.allow=always", "clone", "-q", "--recurse-submodules",
+               f"file://{P}/super.git", str(w), cwd=P)
+    assert r.rc == 0, r.text
+    r = gg.run("git", "-c", "protocol.file.allow=always", "checkout", "--recurse-submodules", "feat", cwd=w)
+    embryo = w / ".git/modules/libs/c"
+    assert r.rc != 0 and (w / "libs/c/.git").is_file() and (embryo / "config").is_file() \
+        and not (embryo / "HEAD").exists(), ("scenario void: git did not fail as expected", r.text)
+    r = gg.run("git", "status", "--short", cwd=w)
+    assert "points to no gitdir" not in r.err, r.text           # judged, not refused as structure
+    assert "added     modules/libs/c/config" in r.err, r.text   # the embryo shown, file by file
+    gg.trust(w)
+    r = gg.run("git", "log", "--oneline", "-1", cwd=w)
+    assert r.rc == 0, r.text                                     # the repository is usable meanwhile
+    # git's own way out (the raw git needs it too: `submodule update` dies
+    # on the embryo, "could not get a repository handle"): remove the
+    # half-written `.gitmodules`, switch again, remove the embryo, then
+    # initialise. Each step through gitguard, trusted as the user would.
+    gg.trust(w)
+    (w / ".gitmodules").unlink()
+    gg.trust(w)                                                  # a watched file removed: one prompt
+    r = gg.run("git", "checkout", "-q", "feat", cwd=w)
+    assert r.rc == 0, r.text
+    import shutil
+    shutil.rmtree(embryo)
+    (w / "libs/c/.git").unlink()
+    gg.trust(w)
+    r = gg.run("git", "-c", "protocol.file.allow=always", "submodule", "update", "--init", cwd=w)
+    assert r.rc == 0, r.text
+    assert (embryo / "HEAD").exists()
+    r = gg.run("git", "status", "--short", cwd=w)
+    assert "points to no gitdir" not in r.text, r.text
+
+
+# ------------------------------------- a stopped `rebase -x` ([147], 2026-11-04)
+def _stopped_rebase_x(gg: GG, wt: Path, proof: Path) -> None:
+    for i in range(3):
+        commit(gg, wt, "r", str(i))
+    r = gg.git("rebase", "-x", f"touch {proof}; false", "HEAD~2", cwd=wt)
+    assert r.rc != 0 and proof.exists(), ("the exec did not stop the rebase", r.text)
+    proof.unlink()
+
+
+def test_stopped_rebase_exec_leaves_ordinary_commands_alone(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[147] `rebase -x 'make test'` that stops on a failing test (its normal
+    outcome) refused every command — `status`, `log`, `rebase --abort` —
+    and every linked worktree's. Only `--continue` / `--skip` run the line:
+    they alone are refused, the line shown, the documented way through
+    honoured."""
+    proof = tmp_path / "RAN"
+    other = tmp_path / "wt2"
+    assert gg.git("worktree", "add", "-q", "-b", "other", str(other), cwd=repo).rc == 0
+    gg.trust(repo)
+    gg.trust(other)
+    _stopped_rebase_x(gg, repo, proof)
+    for cmd in (["status"], ["log", "--oneline", "-1"], ["diff", "--stat"], ["rebase", "--show-current-patch"]):
+        r = gg.run("git", *cmd, cwd=repo)
+        # `--show-current-patch` exits 1 after an `exec` stop (no patch): git's.
+        assert "gitguard" not in r.err and (r.rc == 0 or cmd[0] == "rebase"), (cmd, r.text)
+    r = gg.run("git", "status", cwd=other)
+    assert r.rc == 0 and "gitguard" not in r.err, r.text           # another worktree: untouched
+    r = gg.run("git", "rebase", "--continue", cwd=repo)
+    assert r.rc != 0 and "exec touch" in r.err and not proof.exists(), r.text
+    r = gg.run("git", "rebase", "--abort", cwd=repo)
+    assert r.rc == 0, r.text
+    assert not gg.check(repo).blocked
+
+
+def test_stopped_rebase_exec_continues_with_the_variable(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[147] the way through named by the refusal: the user's own `-x`."""
+    proof = tmp_path / "RAN"
+    gg.trust(repo)
+    _stopped_rebase_x(gg, repo, proof)
+    env = {**gg.env, "GITGUARD_ALLOW_REBASE_EXEC": "1"}
+    import subprocess
+    from tests.conftest import GITGUARD
+    r = subprocess.run([sys.executable, str(GITGUARD), "git", "rebase", "--continue"], cwd=repo,
+                       env=env, capture_output=True, text=True)
+    assert proof.exists(), r.stderr                                # git ran the user's line
+
+
+# ------------------------------------------ the way out of a split index ([148])
+def test_split_index_way_out_through_gitguard(gg: GG, repo: Path) -> None:
+    """[148] `core.splitIndex = true` trusted, then the first `status` writes a
+    split index and every command is refused ([31]). The refusal named
+    `update-index --no-split-index`, which it refused itself, and the
+    orphan `sharedindex.*` git leaves behind kept the repository refused
+    for ever. Now: a warning at trust, the two commands of the way out go
+    through, the orphan is volatile."""
+    assert gg.git("config", "core.splitIndex", "true", cwd=repo).rc == 0
+    r = gg.trust(repo)
+    assert "core.splitIndex = true" in r.err, r.text
+    assert gg.run("git", "status", cwd=repo).rc == 0          # writes the split index
+    r = gg.run("git", "status", cwd=repo)
+    assert r.blocked and "update-index --no-split-index" in r.err, r.text
+    r = gg.run("git", "update-index", "--no-split-index", cwd=repo)
+    assert r.rc == 0, r.text
+    r = gg.run("git", "config", "--unset", "core.splitIndex", cwd=repo)
+    assert r.rc == 0, r.text
+    assert list((repo / ".git").glob("sharedindex.*")), "git removed the orphan: scenario void"
+    gg.trust(repo)                                             # the config changed: the user's own
+    r = gg.run("git", "status", cwd=repo)
+    assert r.rc == 0 and "gitguard" not in r.err, r.text
+    assert not gg.check(repo).blocked

@@ -18,12 +18,15 @@ paid for by a bypass.
 - **A fingerprint, never a blocklist.** gitguard hashes everything in the
   gitdir and excludes only what git rewrites (`VOLATILE_*`). On a false
   positive, add to the exclusion list; never go back to an inclusion list,
-  never add a "known dangerous keys" list. Two closed lists exist, each
-  entry with its proof held to git in the tests: the auto-accept list in
-  `branch_tracking_only` (three keys git cannot execute) and
+  never add a "known dangerous keys" list. The closed lists, each entry
+  with its proof held to git in `tests/test_claims.py`: the auto-accept
+  list in `branch_tracking_only` (branch tracking, VS Code's merge base,
+  a remote with a network URL [145]: keys git cannot execute),
   `PINNED_CONFIG` (`core.fsmonitor=false`, the one key an in-process
   reader executes from a repository nobody judged, [126]; the proof is the
-  in-process table of `tests/test_claims.py`). The exclusion lists
+  in-process table), `NEVER_RESUMES`/`SEQUENCE_ENDS` (commands that never
+  run a todo line, [147]) and the two ways out let through a structural
+  refusal (`_repairs_split_index` [148], `_absorbs_nested` [149]). The exclusion lists
   (`DATA_KEYS`, `VALUE_KEYS`) are mechanical where they can be:
   `VALUE_KEYS` is the `[bool]`/`[int]` sections of the inventory, taken
   from git's source, never curated ([129]); a string key stays under the

@@ -255,3 +255,16 @@ def attack_active_submodule_gitlink_in_head_runs_in_process(gg: GG, repo: Path,
     so the exec-path wrap never judges it. gitguard does not refuse the
     repository; the payload runs."""
     plant_active_gitlink(gg, repo, tmp_path, planting="tree", gitfile=False)
+
+
+def attack_embryonic_submodule_gitdir_config_planted(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[146] a gitfile to `modules/<x>` that is no repository yet (no HEAD:
+    what a failed recursive switch leaves) with a `config` planted there,
+    which `submodule update --init` would keep: an added file, refused by
+    the fingerprint, never accepted as structure"""
+    d = repo / ".git/modules/libs/c"
+    d.mkdir(parents=True)
+    (d / "config").write_text("[core]\n\trepositoryformatversion = 0\n\thooksPath = /tmp/evil\n")
+    (repo / "libs/c").mkdir(parents=True)
+    (repo / "libs/c/.git").write_text("gitdir: ../../.git/modules/libs/c\n")
+    (repo / ".gitmodules").write_text('[submodule "libs/c"]\n\tpath = libs/c\n\turl = ../c.git\n')

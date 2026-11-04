@@ -166,3 +166,14 @@ def attack_rebase_todo_exec_in_submodule(gg: GG, repo: Path, tmp_path: Path) -> 
     todo = _interrupted_rebase(gg, sub, tmp_path)
     gg.trust(repo)
     todo.write_text("exec /tmp/evil\n" + todo.read_text())
+
+
+def attack_rebase_todo_exec_resumed_by_a_child(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[147] the todo is read only by a command that can resume the
+    sequence: `commit` does not, but a trusted hook of the user's runs `git
+    rebase --continue` as a child, covered by the parent's marker — the
+    child must read the todo itself"""
+    todo = _interrupted_rebase(gg, repo, tmp_path)
+    write_exec(repo / ".git/hooks/pre-commit", "#!/bin/sh\ngit rebase --continue\n")
+    gg.trust(repo)
+    todo.write_text("exec /tmp/evil\n" + todo.read_text())

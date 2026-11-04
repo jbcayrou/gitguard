@@ -574,6 +574,8 @@ def test_index_gitlinks_cache(tmp_path: Path) -> None:
 BASE = [("core", "bare", "false"), ("remote.origin", "url", "/x"),
         ("remote.origin", "fetch", "+refs/heads/*:refs/remotes/origin/*")]
 TRACK = [("branch.feat", "remote", "origin"), ("branch.feat", "merge", "refs/heads/feat")]
+HTTPS = [("remote.up", "url", "https://example.invalid/o/r.git"),
+         ("remote.up", "fetch", "+refs/heads/*:refs/remotes/up/*")]
 
 
 @pytest.mark.parametrize("old, new, expected", [
@@ -598,6 +600,24 @@ TRACK = [("branch.feat", "remote", "origin"), ("branch.feat", "merge", "refs/hea
     (BASE, BASE + [("branch.a\x1b[2Jb", "remote", "origin")], []),   # control char in the name
     (BASE + TRACK, BASE + [("branch.feat", "remote", "origin"), ("branch.feat", "merge", "refs/heads/other")],
      ["feat"]),                                                      # merge changed
+    # [145] `remote add <n> <network url>`: url + fetch refspec, added or removed
+    (BASE, BASE + HTTPS, ["remote up"]),
+    (BASE + HTTPS, BASE, ["remote up"]),
+    (BASE, BASE + [("remote.up", "url", "git@github.com:o/r.git"),
+                   ("remote.up", "fetch", "+refs/heads/*:refs/remotes/up/*")], ["remote up"]),
+    (BASE, BASE + [("remote.up", "url", "ssh://git@host:2222/o/r")], ["remote up"]),
+    (BASE, BASE + [("remote.up", "url", "git://host/r")], ["remote up"]),
+    (BASE, BASE + HTTPS + TRACK, ["feat", "remote up"]),
+    (BASE, BASE + [("remote.up", "url", "../hub")], []),             # a local path: hooks run there
+    (BASE, BASE + [("remote.up", "url", "/srv/hub.git")], []),
+    (BASE, BASE + [("remote.up", "url", "file:///srv/hub.git")], []),
+    (BASE, BASE + [("remote.up", "url", "ext::sh -c id")], []),      # a command
+    (BASE, BASE + [("remote.up", "url", "foo::bar")], []),           # git-remote-foo
+    (BASE, BASE + [("remote.up", "url", "foo://host/r")], []),       # a helper too
+    (BASE, BASE + [("remote.up", "url", "-oProxyCommand=id:r")], []),  # an ssh option as host
+    (BASE, BASE + [("remote.up", "url", "https://h/r"), ("remote.up", "vcs", "x")], []),  # another key
+    (BASE, BASE + [("remote.up", "url", "https://h/r"), ("remote.up", "fetch", "a b")], []),
+    (BASE, BASE + [("remote.up", "url", "https://h/r\x1b[2J")], []),
 ])
 def test_branch_tracking_only(old, new, expected) -> None:
     assert gg_mod.branch_tracking_only(old, new) == expected
