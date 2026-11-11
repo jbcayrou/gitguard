@@ -1303,3 +1303,34 @@ def test_split_index_way_out_through_gitguard(gg: GG, repo: Path) -> None:
     r = gg.run("git", "status", cwd=repo)
     assert r.rc == 0 and "gitguard" not in r.err, r.text
     assert not gg.check(repo).blocked
+
+
+def test_insteadof_between_network_urls_is_silent(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[151] the everyday `insteadOf` rules, one network URL for another
+    (`https://github.com/` → ssh, a `gh:` shorthand): nothing local to
+    watch, no alert, and `remote add` keeps its auto-accept ([145])."""
+    gg.git("config", "--global", "url.git@github.com:.insteadOf", "https://github.com/")
+    gg.git("config", "--global", "url.ssh://git@github.com/.pushInsteadOf", "gh:")
+    gg.git("remote", "add", "origin", "https://github.com/x/y.git", cwd=repo)
+    gg.git("remote", "add", "short", "gh:x/y", cwd=repo)
+    r = gg.trust(repo)
+    assert "watched too" not in r.text, r.text
+    assert not gg.check(repo).blocked
+    assert gg.git("remote", "add", "up", "https://github.com/x/z.git", cwd=repo).rc == 0
+    r = gg.run("git", "status", "--short", cwd=repo)
+    assert r.rc == 0 and "reference updated" in r.err, r.text
+
+
+def test_mirror_behind_insteadof_is_watched_and_usable(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[151] a local mirror behind `insteadOf`, trusted: push and fetch
+    work, and the mirror's own commits do not alert (its config and hooks
+    are watched, not its objects)."""
+    hub = tmp_path / "mirrors/hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    gg.git("config", "--global", f"url.{tmp_path}/mirrors/.insteadOf", "https://example.invalid/")
+    gg.git("remote", "add", "origin", "https://example.invalid/hub.git", cwd=repo)
+    r = gg.trust(repo)
+    assert str(hub / "config") in r.text, r.text
+    for cmd in (["push", "-q", "origin", "main"], ["fetch", "-q", "origin"], ["status", "--short"]):
+        r = gg.run("git", *cmd, cwd=repo)
+        assert r.rc == 0, (cmd, r.text)

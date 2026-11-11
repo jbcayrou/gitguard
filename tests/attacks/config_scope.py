@@ -752,3 +752,35 @@ def attack_include_prefix(gg: GG, repo: Path, tmp_path: Path) -> None:
     assert gg.git("config", "--get", "x.included", cwd=repo).out.strip() == "1", "git must open it"
     gg.trust(repo)
     inc.write_text("[core]\n\tfsmonitor = /tmp/evil\n")
+
+
+# [151] `url.<base>.insteadOf`: a remote written as a network URL that git
+# rewrites into a local path. The rule is the user's own, trusted (a mirror
+# directory); the hub it reaches was never watched.
+def _mirror_behind_insteadof(gg: GG, repo: Path, tmp_path: Path, key: str, scope: list[str]) -> None:
+    hub = tmp_path / "vol-mirrors/x/hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    assert gg.git("config", *scope, f"url.{tmp_path}/vol-mirrors/.{key}",
+                  "https://example.invalid/", cwd=repo).rc == 0
+    gg.git("remote", "add", "origin", "https://example.invalid/x/hub.git", cwd=repo)
+    how = ["--push"] if key == "pushInsteadOf" else []
+    assert gg.git("remote", "get-url", *how, "origin", cwd=repo).out.strip() == str(hub), \
+        "git must push to the hub"
+    gg.trust(repo)
+    write_exec(hub / "hooks/pre-receive", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_insteadof_global_reaches_local_hub(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[151] a global `url.<dir>.insteadOf = https://…`: `git push origin`
+    runs the hooks of `<dir>/…`, which the scan read as a network URL"""
+    _mirror_behind_insteadof(gg, repo, tmp_path, "insteadOf", ["--global"])
+
+
+def attack_insteadof_local_reaches_local_hub(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[151] the same rule in the repository's own trusted config"""
+    _mirror_behind_insteadof(gg, repo, tmp_path, "insteadOf", [])
+
+
+def attack_pushinsteadof_reaches_local_hub(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[151] `url.<dir>.pushInsteadOf`: the push URL alone is rewritten"""
+    _mirror_behind_insteadof(gg, repo, tmp_path, "pushInsteadOf", ["--global"])

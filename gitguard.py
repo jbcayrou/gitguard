@@ -1844,18 +1844,21 @@ def _split_config_key(k: str) -> tuple[str, str] | None:
     return head.lower() + (dot + sub if dot else ""), key.lower()
 
 
-def env_config() -> list[tuple[str, str, str]]:
+def env_config(cli: list[str] | None = None,
+               cli_env: list[str] | None = None) -> list[tuple[str, str, str]]:
     """Config git takes from its environment and command line, in git's order
     (git_config_from_parameters): GIT_CONFIG_PARAMETERS — which a parent git
     feeds from its own `-c` — and this command's `-c` / `--config-env` (git
     appends them to it), then GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/VALUE_n. The
     sandbox cannot write any of it, but a value may name a path in the
-    volume (`core.hooksPath`, `include.path`): git honours it. [48]"""
+    volume (`core.hooksPath`, `include.path`): git honours it. [48] `cli`,
+    `cli_env`: the command's `-c` and `--config-env` when the caller reads
+    them before apply_global_options has stored them (parse_new_repo)."""
     pairs = _parse_config_env_list(os.environ.get("GIT_CONFIG_PARAMETERS", ""))
-    for c in CLI_CONFIG:
+    for c in CLI_CONFIG if cli is None else cli:
         k, eq, v = c.partition("=")
         pairs.append((k, v if eq else None))
-    for spec in CLI_CONFIG_ENV:
+    for spec in CLI_CONFIG_ENV if cli_env is None else cli_env:
         k, eq, var = spec.rpartition("=")
         if not eq or var not in os.environ:
             raise Refuse(f"--config-env {spec!r}: missing '=' or environment variable (git refuses it too)")
@@ -1979,7 +1982,13 @@ def iter_global_config() -> Iterator[tuple[Path, str, str, str]]:
     config_refs). For a reader of one global setting; config_refs keeps its
     own walk, which carries a base and a scope per file and watches the
     include targets. [85]"""
-    queue, seen = list(global_config_files()), set()
+    return _iter_config_files(global_config_files())
+
+
+def _iter_config_files(files: list[Path]) -> Iterator[tuple[Path, str, str, str]]:
+    """The walk of iter_global_config and iter_command_config: `files` and
+    what they include."""
+    queue, seen = list(files), set()
     for _ in range(INCLUDE_DEPTH + 1):
         nxt = []
         for f in queue:
@@ -1991,6 +2000,25 @@ def iter_global_config() -> Iterator[tuple[Path, str, str, str]]:
                 if section.startswith("include") and key == "path":
                     nxt.append(include_path(value, f.parent)[0])  # as opened [94] [136]
         queue = nxt
+
+
+def iter_command_config(cli: list[str] | None = None, cli_env: list[str] | None = None
+                        ) -> Iterator[tuple[Path | None, str, str, str]]:
+    """(file or None, section, key, value) of the config git takes from its
+    environment and command line (env_config) and of the files an
+    `include.path` / `includeIf.*.path` among it names, as
+    iter_global_config follows them. From there git opens an absolute path
+    only ("relative config includes must come from files", and dies). The
+    gate of auto-trust read the keys of the command line and opened
+    nothing: `-c include.path=<file>` hid the file's `init.templateDir`. [150]"""
+    files = []
+    for section, key, value in env_config(cli, cli_env):
+        yield None, section, key, value
+        if section.startswith("include") and key == "path":
+            literal = include_path(value, Path("."))[0]
+            if literal.is_absolute():
+                files.append(literal)
+    yield from _iter_config_files(files)
 
 
 SAFE_BARE_HINT = ("`git config --global safe.bareRepository explicit`: git then refuses "
@@ -2067,6 +2095,11 @@ class ConfigScan:
         self.global_vals: list[tuple[str, str, str]] = []
         self.env_vals: list[tuple[str, str, str]] = []
         self.remote_bases: set[Path] = set()
+        # `url.<base>.insteadOf` / `pushInsteadOf` as (prefix, base), and
+        # the values read as a remote's URL with the directory they resolve
+        # against: rewritten once every source is read (run). [151]
+        self.rewrites: list[tuple[str, str]] = []
+        self.urls: list[tuple[str, Path]] = []
         self.nxt: list[tuple[Path, Path, bool, bool]] = []    # config files found while reading
         self.tokens_seen: set[tuple[str, Path]] = set()
 
@@ -2163,6 +2196,8 @@ class ConfigScan:
             self.active_pathspecs.add(value)
         if (section, key) == ("core", "splitindex") and _git_maybe_bool(value):
             self.split_index = True              # warned at trust [148]
+        if remotes and section.startswith("url.") and key in ("insteadof", "pushinsteadof"):
+            self.rewrites.append((value, section[len("url."):]))
         # `git push <name>` resolves <name> through the repository's config
         # (local, global, environment: those whose base is the root), not a
         # submodule's: there, `<name>` is a path.
@@ -2240,16 +2275,8 @@ class ConfigScan:
             # taken as a URL: `git push` with no argument went there,
             # unwatched. A defined name is also tried as a path (a superset:
             # `<root>/origin` is rarely a repository). [73]
-            r = _local_remote(value, base)
-            if r is not None:
-                gd, common, rbase, files = r
-                self.remote_bases.add(rbase)
-                for f in files:
-                    self.add(f, f)
-                for f in (common / "config", gd / "config.worktree"):
-                    self.add(f, f)
-                    self.nxt.append((f, rbase, False, False))
-                self.add(common / "hooks", common / "hooks", allow_dir=True)
+            self.urls.append((value, base))
+            self.local_remote(value, base)
         elif _data_key(section, key):
             return                       # a file read as data, never run [56]
         elif _value_key(section, key) and _git_maybe_bool(value) is not None:
@@ -2276,6 +2303,20 @@ class ConfigScan:
                         and (tok, base) not in self.tokens_seen):
                     self.tokens_seen.add((tok, base))
                     self.add(*_expand2(tok, base))
+
+    def local_remote(self, url: str, base: Path) -> None:
+        """Watch what a push to `url` runs when it is a local repository:
+        its config, its hooks/, the files that redirect it. [45] [61]"""
+        r = _local_remote(url, base)
+        if r is not None:
+            gd, common, rbase, files = r
+            self.remote_bases.add(rbase)
+            for f in files:
+                self.add(f, f)
+            for f in (common / "config", gd / "config.worktree"):
+                self.add(f, f)
+                self.nxt.append((f, rbase, False, False))
+            self.add(common / "hooks", common / "hooks", allow_dir=True)
 
     def run(self) -> "ConfigScan":
         """Read every source in git's order and fill `refs`, `remote_names`
@@ -2348,15 +2389,30 @@ class ConfigScan:
         # +1: the first round consumes the base files; git then follows
         # INCLUDE_DEPTH levels of includes. With range(INCLUDE_DEPTH) the 10th
         # level was hashed but never parsed. [17]
-        for _ in range(INCLUDE_DEPTH + 1):
-            for cf, base, remotes, glob in queue:
-                if (cf.resolve(), base, glob) in seen or not is_file(cf):
-                    continue
-                seen.add((cf.resolve(), base, glob))
-                for section, key, value in parse_git_config(cf):
-                    self.consider(section, key, value, base, cf.parent, remotes, glob,
-                                  relocated=glob and self.foreign)
-            queue, self.nxt = self.nxt, []
+        def read(queue: list[tuple[Path, Path, bool, bool]]) -> None:
+            for _ in range(INCLUDE_DEPTH + 1):
+                for cf, base, remotes, glob in queue:
+                    if (cf.resolve(), base, glob) in seen or not is_file(cf):
+                        continue
+                    seen.add((cf.resolve(), base, glob))
+                    for section, key, value in parse_git_config(cf):
+                        self.consider(section, key, value, base, cf.parent, remotes, glob,
+                                      relocated=glob and self.foreign)
+                queue, self.nxt = self.nxt, []
+        read(queue)
+        # `url.<base>.insteadOf = <prefix>`: git rewrites a remote's URL
+        # before using it (remote.c alias_url), so `https://host/x.git`
+        # under a rule of the user's own names `<base>x.git`, a local
+        # repository whose hooks a push runs — read as written, a network
+        # URL, nothing was watched. Once every rule is known (an include,
+        # the global config, `-c`), each URL is read again as every rule
+        # that matches rewrites it: a superset of git's longest match,
+        # which no tie-break of git's can leave. [151]
+        for url, base in self.urls:
+            for to in _rewritten(url, self.rewrites)[1:]:
+                self.local_remote(to, base)
+        queue, self.nxt = self.nxt, []
+        read(queue)
         # The global values, resolved where git will resolve them next: in
         # each local remote (push) and each submodule; the environment's in
         # the submodules only. [68] Every key, not DIR_KEYS alone: a global
@@ -2386,6 +2442,17 @@ def tree_named(scan: "ConfigScan") -> list[Path]:
 def config_refs(repo: Repo, foreign: bool = False) -> ConfigScan:
     """Read every config source of `repo` once: see ConfigScan."""
     return ConfigScan(repo, foreign).run()
+
+
+def _rewritten(url: str, rewrites: list[tuple[str, str]]) -> list[str]:
+    """`url`, then what each `url.<base>.insteadOf` / `pushInsteadOf` rule
+    (`rewrites`: (prefix, base)) whose prefix it starts with makes of it:
+    the base in place of the prefix, once, the prefix compared as written
+    (an empty one matches every URL). git keeps one, the longest prefix
+    (alias_url), a pushInsteadOf one for the push URL of a remote without
+    pushurl; all of them are returned. [151]"""
+    return [url, *dict.fromkeys(base + url[len(prefix):] for prefix, base in rewrites
+                                if url.startswith(prefix))]
 
 
 def _replaceable(p: Path) -> bool:
@@ -3996,20 +4063,18 @@ def _long_option(name: str, longs: dict[str, bool]) -> tuple[str | None, bool]:
     return None, False
 
 
-def _template_dir_configured(cli_config: list[str]) -> bool:
+def _template_dir_configured(cli: list[str], cli_env: list[str]) -> bool:
     """A template directory copies hooks into every new repository: like
     `--template=`, it rules out auto-trust. Every source git reads: the
-    global/system config *and the files it includes*, `-c`/`--config-env`,
-    GIT_CONFIG_COUNT/KEY_n, GIT_CONFIG_PARAMETERS, GIT_TEMPLATE_DIR. [42]"""
+    global/system config, `-c`/`--config-env`, GIT_CONFIG_COUNT/KEY_n,
+    GIT_CONFIG_PARAMETERS — *and the files any of them includes* —
+    GIT_TEMPLATE_DIR. [42] Read through the readers of the scan
+    (iter_command_config, iter_global_config), not by comparing key
+    names here. [150]"""
     if os.environ.get("GIT_TEMPLATE_DIR"):
         return True
-    if "init.templatedir" in os.environ.get("GIT_CONFIG_PARAMETERS", "").lower():
-        return True
-    keys = [c.split("=", 1)[0] for c in cli_config]
-    keys += [v for k, v in os.environ.items() if k.startswith("GIT_CONFIG_KEY_")]
-    if any(k.strip().lower() == "init.templatedir" for k in keys):
-        return True
-    return any(s == "init" and k == "templatedir" for _, s, k, _ in iter_global_config())
+    return any(s == "init" and k == "templatedir"
+               for _, s, k, _ in (*iter_command_config(cli, cli_env), *iter_global_config()))
 
 
 class NewRepo:
@@ -4122,7 +4187,7 @@ def parse_new_repo(args: list[str]) -> NewRepo | None:
             positional.append(a); j += 1
     auto_trust = not bare
     if template == "given" or (template == "default"
-                               and _template_dir_configured(o.config + o.config_env)):
+                               and _template_dir_configured(o.config, o.config_env)):
         warn("templateDir: no auto-trust, run 'gitguard trust' after inspection")
         auto_trust = False
     if sub == "clone":
@@ -4223,15 +4288,15 @@ def _legacy_remote_urls(repo: Repo, name: str) -> list[str]:
     return out
 
 
-def check_remote_destination(repo: Repo, rest: list[str], remote_names: set[str],
-                             refs: list[tuple[str, Path]]) -> None:
+def check_remote_destination(repo: Repo, rest: list[str], scan: "ConfigScan") -> None:
     """`git push <path>` to a local repository that no trusted config names:
     receive-pack runs that repository's hooks and honours its config, and
     nothing of it is in the fingerprint (only configured remotes are, [45]
     [61]). Refused, the way out named: make it a remote, then trust. A
     relative path is relative to the root of the tree (git chdirs there).
-    Not seen: a push through an alias, `url.<base>.insteadOf` rewriting a
-    URL into a local path, `send-pack`. Allowed: the repository itself
+    Not seen: a push through an alias, `send-pack`. The destination is
+    also read as `url.<base>.insteadOf` rewrites it: git does so for a URL
+    of the command line as for a remote's. [151] Allowed: the repository itself
     (`git push . main:x`) and a repository a configured remote already
     designates (its config is in `refs`, watched). [62]
     `git archive --remote=<path>` likewise: upload-archive runs in that
@@ -4240,12 +4305,12 @@ def check_remote_destination(repo: Repo, rest: list[str], remote_names: set[str]
         return
     cmd = rest[0]
     dest = (_push_destination if cmd == "push" else _archive_remote)(rest[1:])
-    if dest is None or dest in remote_names:
+    if dest is None or dest in scan.remote_names:
         return
-    urls = _legacy_remote_urls(repo, dest) or [dest]
-    for url in urls:
-        r = _local_remote(url, repo.root)
-        watched = {p for _, p in refs}
+    watched = {p for _, p in scan.refs}
+    for url, to in ((u, t) for u in _legacy_remote_urls(repo, dest) or [dest]
+                    for t in _rewritten(u, scan.rewrites)):
+        r = _local_remote(to, repo.root)
         if r is not None and r[1] != repo.common and (r[1] / "config") not in watched:
             again = "push <name>" if cmd == "push" else "archive --remote=<name>"
             raise Refuse(f"`git {cmd}` to {dest}: a local repository no trusted config names "
@@ -5200,7 +5265,7 @@ def main(argv: list[str]) -> int:
                 # trusted or as changed by the first push. [108]
                 if rest[:1] in (["push"], ["archive"]):
                     insp = inspect(repo)
-                    check_remote_destination(repo, rest, insp.scan.remote_names, insp.refs)
+                    check_remote_destination(repo, rest, insp.scan)
                 # Nor its sequence: the parent read the todos only if its
                 # own command could resume one ([147]); a child that can (a
                 # hook's or a `submodule foreach`'s `rebase --continue`, [36])
@@ -5212,7 +5277,7 @@ def main(argv: list[str]) -> int:
         refs, new = insp.refs, insp.new
         if mode == "exec":
             rest = split_global_options(argv, orig).rest
-            check_remote_destination(repo, rest, insp.scan.remote_names, refs)
+            check_remote_destination(repo, rest, insp.scan)
         old = load_manifest(key)
         fingerprinted = True
     except Refuse as e:

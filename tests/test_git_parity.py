@@ -1361,3 +1361,35 @@ def test_global_config_files_empty_variable_means_no_file(gg: GG, tmp_path: Path
         assert not any(home.resolve() in p.parents for p in got), got
     else:
         assert not any(p.name == "gitconfig" for p in got), got
+
+
+# ------------------------------------------- [151] url.<base>.insteadOf
+@pytest.mark.parametrize("rules,url", [
+    ([("/m/", "insteadOf", "https://h/")], "https://h/x.git"),
+    ([("/m/", "insteadOf", "https://h/")], "https://other/x.git"),            # no rule matches
+    ([("/a/", "insteadOf", "https://h/"), ("/b/", "insteadOf", "https://h/x/")], "https://h/x/y.git"),   # longest
+    ([("/b/", "insteadOf", "https://h/x/"), ("/a/", "insteadOf", "https://h/")], "https://h/x/y.git"),
+    ([("/a/", "insteadOf", "gh:"), ("/b/", "insteadOf", "gh:")], "gh:x"),     # a tie
+    ([("/a/", "insteadOf", "gh:"), ("/a/", "insteadOf", "hub:")], "hub:x"),   # two prefixes, one base
+    ([("/p/", "pushInsteadOf", "https://h/")], "https://h/x.git"),
+    ([("/p/", "pushInsteadOf", "https://h/"), ("/f/", "insteadOf", "https://h/")], "https://h/x.git"),
+    ([("/m/", "insteadOf", "HTTPS://h/")], "https://h/x.git"),                # the prefix is compared as written
+    ([("/m", "insteadOf", "https://h")], "https://h/x.git"),                  # no separator needed
+    ([("/m/", "insteadOf", "")], "https://h/x.git"),                          # the empty prefix
+    ([("/m/", "insteadOf", "/m/")], "/m/x.git"),                              # onto itself
+    ([("/n/", "insteadOf", "/m/"), ("/o/", "insteadOf", "/n/")], "/m/x.git"),  # once, not chained
+])
+def test_insteadof_rewrite_contains_what_git_uses(gg: GG, repo: Path, rules, url: str) -> None:
+    """[151] the URLs gitguard reads a remote as (`_rewritten`: the URL
+    and its rewriting by every rule that matches, a superset of git's
+    longest match) contain the ones git uses, fetch and push, for a
+    configured remote and for a URL on the command line."""
+    for base, key, prefix in rules:
+        assert gg.git("config", "--add", f"url.{base}.{key}", prefix, cwd=repo).rc == 0
+    gg.git("remote", "add", "origin", url, cwd=repo)
+    used = {gg.git("remote", "get-url", "origin", cwd=repo).out.strip(),
+            gg.git("remote", "get-url", "--push", "origin", cwd=repo).out.strip(),
+            gg.git("ls-remote", "--get-url", url, cwd=repo).out.strip()}
+    assert all(used), used
+    rewrites = [(prefix, base) for base, key, prefix in rules]
+    assert used <= set(gg_mod._rewritten(url, rewrites)), (used, rules)

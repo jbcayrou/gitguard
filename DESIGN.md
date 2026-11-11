@@ -588,7 +588,12 @@ Exception, a **local remote** (`remote.*.url`/`pushurl` = a path or
 `file://` to a repository, `_local_remote`): `push` runs its hooks and
 honours its config, so its `config` and `hooks/` are watched (scope `ext` or
 `wt`) and that config is parsed like the others — but its own remotes are
-not followed ([45]); +1.4 ms per command with one local remote. The remote
+not followed ([45]); +1.4 ms per command with one local remote. A URL is
+also read as `url.<base>.insteadOf` / `pushInsteadOf` rewrite it
+(`_rewritten`, once every source is read): a network URL the user's own
+rule turns into a mirror directory is that local repository for git
+([151]). Every rule that matches, not git's longest match alone: a
+superset, held to git in `test_git_parity.py`. The remote
 is **opened as receive-pack opens it**, a port of `enter_repo`: `<p>/.git`,
 `<p>`, `<p>.git/.git`, `<p>.git`, the gitfile followed, then `commondir`,
 without the environment (git clears it for the transport); the config and
@@ -825,7 +830,10 @@ basename without `.git`). After git succeeds, `save_trust` is called
 - `--template=<dir>`, **or** a template directory from any source git reads
   (`_template_dir_configured`): `init.templateDir` in the global/system
   config or a file it includes, global `-c`/`--config-env`,
-  `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`, `GIT_CONFIG_PARAMETERS`,
+  `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`, `GIT_CONFIG_PARAMETERS` — or a
+  file any of those includes (`-c include.path=<file>`, [150]: the gate
+  reads them through the scan's readers, `iter_command_config` and
+  `iter_global_config`, and compares no key name of its own) —
   `GIT_TEMPLATE_DIR` ([42]) — it copies hooks from an arbitrary directory the
   sandbox can write. (clone's own `-c` is applied after the template: no
   effect, verified with git 2.50). An **empty** `--template=` is no
@@ -1592,9 +1600,11 @@ the files, not the order.
 - A value whose path sh builds from a command's output other than the
   cwd (`$(cd sub && pwd)/t.sh`, `$(cat f)`) is beyond the sh readings
   ([58]): only the forms that reduce to the top of the tree or to a
-  literal word are covered (same family as [71], [74] above). A push destination reached through an alias,
-  `url.<base>.insteadOf` rewriting a URL into a local path, or `git
-  send-pack` is not checked ([62]).
+  literal word are covered (same family as [71], [74] above). A push destination reached through an alias or `git
+  send-pack` is not checked ([62]); one that `url.<base>.insteadOf`
+  rewrites into a local path is ([151]: every rule that matches, a
+  superset of git's longest match — with overlapping rules, a repository
+  git does not use may be watched too).
 - Ordinary commands that still prompt once, by design: `git fsck
   --lost-found` writes `.git/lost-found/` — kept watched, because fsck
   writes the dangling blobs' content there by opening each path, through

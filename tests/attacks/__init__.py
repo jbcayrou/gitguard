@@ -1082,6 +1082,38 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      GITGUARD_KEEP_FSMONITOR; held to git in test_claims.py (absorbed with
      the pin, a planted nested repository runs nothing; without, its
      fsmonitor runs). The message gives the paths relative to the cwd.
+[150] RCE (precondition: the user's own command or environment carries an
+     `include.path` naming a file of the volume): `git -c
+     include.path=<file> clone …` — or the key through `--config-env`,
+     GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS — makes git open the file,
+     and its `init.templateDir` copies a template's hooks into the clone.
+     _template_dir_configured, the gate of auto-trust, compared the key
+     names of the command line with `init.templatedir` (and searched
+     GIT_CONFIG_PARAMETERS for the substring) without opening what an
+     include among them names: the clone was trusted at once with the
+     hooks, and the next command carrying the same config ran them ([42]
+     reopened, the class of [136]: a reader fixed, not the site that
+     decides). Found by the third agentic audit, 2026-11-03. Fix: the
+     gate reads the command's config through env_config, the scan's own
+     reader, and follows its includes as iter_global_config does
+     (iter_command_config); no key is compared by name outside a reader.
+[151] RCE (precondition: a `url.<dir>.insteadOf` rule of the user's own,
+     trusted, whose `<dir>` the sandbox can write: a directory of local
+     mirrors): git rewrites a remote's URL before using it (remote.c
+     alias_url), so `remote.origin.url = https://host/x/hub.git` under
+     `url./vol/mirrors/.insteadOf = https://host/` is the local
+     repository `/vol/mirrors/x/hub.git`, and `git push origin` runs its
+     pre-receive. The scan read the URL as written, a network one, and
+     watched nothing of the hub ([45] behind another spelling); `git push
+     https://host/x/hub.git` and `archive --remote=` passed the [62] [70]
+     check the same way; `pushInsteadOf` likewise. Listed as not seen
+     under [62], confirmed by the fourth agentic audit, 2026-11-03. Fix:
+     once every config source is read, each remote URL — and the
+     destination of a push or an archive — is read again as every rule
+     whose prefix it starts with rewrites it (_rewritten): a superset of
+     git's longest match, held to git in test_git_parity.py; the hub's
+     config and hooks join the fingerprint like any local remote's. A
+     rule between network URLs (https → ssh) names nothing local.
 """
 from __future__ import annotations
 

@@ -1155,6 +1155,37 @@ PUSH_FORMS = ["{d} main", "-u {d} main", "--repo {d}", "--repo={d}", "--rep {d}"
               "--repo origin {d} main"]
 
 
+@pytest.mark.parametrize("key", ["insteadOf", "pushInsteadOf"])
+@pytest.mark.parametrize("cmd", ["push", "archive"])
+def test_destination_rewritten_by_insteadof_is_checked(gg: GG, repo: Path, tmp_path: Path,
+                                                       key: str, cmd: str) -> None:
+    """[151] `git push https://…/hub.git main` under a trusted
+    `url.<dir>.insteadOf = https://…/`: git rewrites the URL of the command
+    line as it does a remote's and pushes to `<dir>/hub.git`, a local
+    repository no config names; `archive --remote=` likewise (insteadOf
+    only). The [62] [70] check read the URL as written."""
+    if (cmd, key) == ("archive", "pushInsteadOf"):
+        pytest.skip("archive reads the fetch URL")
+    mark = tmp_path / "RAN"
+    hub = tmp_path / "vol-mirrors/hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    gg.git("config", "--global", f"url.{tmp_path}/vol-mirrors/.{key}", "https://example.invalid/")
+    gg.trust(repo)
+    url = "https://example.invalid/hub.git"
+    if cmd == "push":
+        write_exec(hub / "hooks/pre-receive", f"#!/bin/sh\ntouch '{mark}'\n")
+        args = ["push", "-q", url, "main"]
+    else:
+        gg.git("push", "-q", str(hub), "main", cwd=repo)
+        gg.git("config", "tar.x.command", f"touch '{mark}'; cat", cwd=hub)
+        gg.git("config", "tar.x.remote", "true", cwd=hub)
+        args = ["archive", f"--remote={url}", "--format=x", "-o", str(tmp_path / "out"), "main"]
+    r = gg.run("git", *args, cwd=repo)
+    assert r.blocked and f"[{62 if cmd == 'push' else 70}]" in r.err and not mark.exists(), r.text
+    gg.git(*args, cwd=repo)
+    assert mark.exists(), "control: git runs the hub's code"
+
+
 @pytest.mark.parametrize("form", PUSH_FORMS)
 def test_push_destination_forms_are_read(gg: GG, repo: Path, tmp_path: Path, form: str) -> None:
     """[62] every way of naming the destination on the command line, the
@@ -2521,6 +2552,50 @@ def test_template_dir_behind_a_prefix_include_withholds_auto_trust(gg: GG, repo:
     assert "new repository trusted" not in r.err and "no auto-trust" in r.err, r.text
     (tmp_path / "RAN").unlink()          # the clone's own checkout ran it: git's, as for any template [42]
     assert gg.run("git", "checkout", "-q", "-b", "x", cwd=tmp_path / "c").blocked
+    assert not (tmp_path / "RAN").exists()
+
+
+# ------------------------------------------- [150] an include.path given to the command itself
+@pytest.mark.parametrize("how", ["-c", "--config-env", "count", "parameters", "nested", "includeIf"])
+def test_template_dir_behind_a_command_line_include_withholds_auto_trust(
+        gg: GG, repo: Path, tmp_path: Path, how: str) -> None:
+    """[150] `git -c include.path=<file> clone …` (or the same key through
+    `--config-env`, GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS): git opens
+    the file, an absolute path, and its `init.templateDir` copies the
+    template's hooks into the clone. _template_dir_configured compared the
+    keys of the command line with `init.templatedir` and never opened what
+    an `include.path` among them names: the clone was trusted at once,
+    hooks included, and the next command carrying the same config ran
+    them. The gate reads what the scan reads."""
+    tpl = tmp_path / "tpl"
+    write_exec(tpl / "hooks/post-checkout", f"#!/bin/sh\ntouch '{tmp_path}/RAN'\n")
+    write_exec(tpl / "hooks/pre-commit", f"#!/bin/sh\ntouch '{tmp_path}/RAN'\n")
+    inc = tmp_path / "inc.cfg"
+    inc.write_text(f"[init]\n\ttemplateDir = {tpl}\n")
+    if how == "nested":                      # relative to the including file, as in any file
+        (tmp_path / "outer.cfg").write_text("[include]\n\tpath = inc.cfg\n")
+        inc = tmp_path / "outer.cfg"
+    key = "includeIf.gitdir:/.path" if how == "includeIf" else "include.path"
+    opts: list[str] = []
+    if how == "--config-env":
+        gg.env["INC"] = str(inc)
+        opts = [f"--config-env={key}=INC"]
+    elif how == "count":
+        gg.env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0=key, GIT_CONFIG_VALUE_0=str(inc))
+    elif how == "parameters":
+        gg.env["GIT_CONFIG_PARAMETERS"] = f"'{key}'='{inc}'"
+    else:
+        opts = ["-c", f"{key}={inc}"]
+    if how != "includeIf":                   # a condition is not evaluated: a superset, as in the scan
+        assert gg.git(*opts, "config", "--get", "init.templateDir", cwd=tmp_path).out.strip() == str(tpl), \
+            "git must read the template through the include"
+    r = gg.run("git", *opts, "clone", "-q", str(repo), str(tmp_path / "c"), cwd=tmp_path)
+    assert r.rc == 0, r.text
+    assert "new repository trusted" not in r.err and "no auto-trust" in r.err, r.text
+    if how != "includeIf":
+        assert (tmp_path / "c/.git/hooks/pre-commit").exists(), "the template was copied"
+        (tmp_path / "RAN").unlink()          # the clone's own checkout ran it: git's, as for any template [42]
+    assert gg.run("git", *opts, "commit", "-q", "--allow-empty", "-m", "x", cwd=tmp_path / "c").blocked
     assert not (tmp_path / "RAN").exists()
 
 
