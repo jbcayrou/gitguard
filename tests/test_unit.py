@@ -39,8 +39,31 @@ def test_parse_quotes_keep_hash(tmp_path: Path) -> None:
 
 def test_parse_escapes_and_continuation(tmp_path: Path) -> None:
     out = _cfg(tmp_path, '[alias]\n\tx = "a\\"b" \\\n\t  c\n')
-    # git 2.50 keeps the internal whitespace as is (verified with `git config -f`)
-    assert out == [("alias", "x", 'a"b \t  c')]
+    # git ≥ 2.45 keeps the internal whitespace as is (verified with `git
+    # config -f`), an older one reads the tab as a space: two entries. [152]
+    assert out == [("alias", "x", 'a"b \t  c'), ("alias", "x", 'a"b    c')]
+    assert [type(v).__name__ for _, _, v in out] == ["str", "_Before245"]
+    p = tmp_path / "config"
+    assert parse_git_config(p, "new") == out[:1] and parse_git_config(p, "old") == out[1:]
+
+
+def test_parse_one_entry_when_both_gits_agree(tmp_path: Path) -> None:
+    """[152] a quoted or escaped tab, a tab before the value, after it or
+    before a comment: the same value for every git, one entry."""
+    out = _cfg(tmp_path, '[a]\n\tq = "x\ty"\n\te = x\\ty\n\tl =\t\tx\n\tt = x\t\n\tc = x\t# y\n\ts = x  y\n')
+    assert out == [("a", "q", "x\ty"), ("a", "e", "x\ty"), ("a", "l", "x"), ("a", "t", "x"),
+                   ("a", "c", "x"), ("a", "s", "x  y")]
+    assert all(type(v) is str for _, _, v in out)
+
+
+def test_config_last_refuses_a_value_read_two_ways(tmp_path: Path) -> None:
+    """[152] where one value is needed (core.worktree), a tab between two
+    words is refused: the tree would depend on the git that runs."""
+    p = tmp_path / "config"
+    p.write_bytes(b"[core]\n\tworktree = ../my\ttree\n\tbare = false\n")
+    with pytest.raises(gg_mod.Refuse, match="before 2.45"):
+        gg_mod.config_last(p, "core", "worktree")
+    assert gg_mod.config_last(p, "core", "bare") == "false"
 
 
 def test_parse_boolean_without_value(tmp_path: Path) -> None:

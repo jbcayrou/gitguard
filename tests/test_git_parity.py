@@ -89,6 +89,16 @@ PARSER_OK = [
     ("nbsp_trailing", "[core]\n\thooksPath = .githooks\u00a0\n".encode()),
     ("trailing_space_then_comment", b"[core]\n\thooksPath = .githooks   # c\n"),
     ("quoted_then_space", b'[core]\n\thooksPath = "a b"  \n'),
+    # [152] a tab or a lone CR between two words, unquoted: a space for
+    # git < 2.45, kept since. Both are entries of gitguard's list.
+    ("tab_between_words", b"[core]\n\thooksPath = my\thooks\n"),
+    ("tabs_and_spaces_between_words", b"[core]\n\thooksPath = a \t\t b\tc\n"),
+    ("tab_after_continuation", b"[alias]\n\tlg = log \\\n\t\t--graph\n"),
+    ("quoted_tab_then_bare_tab", b'[core]\n\thooksPath = "a\tb"\tc\n'),
+    ("escaped_tab_then_bare_tab", b"[core]\n\thooksPath = a\\tb\tc\n"),
+    ("bare_tab_then_comment", b"[core]\n\thooksPath = a\tb\t# c\n"),
+    ("cr_then_tab_trailing", b"[core]\n\thooksPath = a\rb\r\t\n"),
+    ("two_keys_with_tabs", b"[core]\n\thooksPath = a\tb\n\tpager = c\td\n"),
 ]
 
 # Files git rejects (fatal: bad config line): gitguard's tolerance is harmless
@@ -117,6 +127,20 @@ def _assert_parser_covers_git(tmp_path: Path, data: bytes) -> None:
 @pytest.mark.parametrize("data", [c[1] for c in PARSER_OK], ids=[c[0] for c in PARSER_OK])
 def test_parser_matches_git(tmp_path: Path, data: bytes) -> None:
     _assert_parser_covers_git(tmp_path, data)
+
+
+@pytest.mark.parametrize("data", [c[1] for c in PARSER_OK], ids=[c[0] for c in PARSER_OK])
+def test_parser_reading_is_this_gits_exactly(tmp_path: Path, data: bytes) -> None:
+    """[152] the inclusion above holds for every git because a value git
+    reads two ways is two entries. Each reading on its own is exactly one
+    git's: "new" the list of a git ≥ 2.45, "old" the list of an older one —
+    the same entries, in the same order, nothing more."""
+    from tests.attacks._helpers import git_has
+    p = tmp_path / "cfg"
+    p.write_bytes(data)
+    reading = "new" if git_has("blanks_kept") else "old"
+    got = [(f"{s}.{k}", str(v)) for s, k, v in parse_git_config(p, reading)]
+    assert got == _git_list(p), reading
 
 
 def test_parser_nul_refused(tmp_path: Path) -> None:

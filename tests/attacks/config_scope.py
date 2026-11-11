@@ -784,3 +784,51 @@ def attack_insteadof_local_reaches_local_hub(gg: GG, repo: Path, tmp_path: Path)
 def attack_pushinsteadof_reaches_local_hub(gg: GG, repo: Path, tmp_path: Path) -> None:
     """[151] `url.<dir>.pushInsteadOf`: the push URL alone is rewritten"""
     _mirror_behind_insteadof(gg, repo, tmp_path, "pushInsteadOf", ["--global"])
+
+
+# [152] a tab or a lone CR between two words of an unquoted value: one
+# space for git < 2.45 (Debian 12, Ubuntu 24.04), the character itself
+# since. The config is the user's own, trusted; whichever git runs, what it
+# names is watched.
+def attack_hookspath_tab_between_words(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[152] `core.hooksPath = my<TAB>hooks`: git < 2.45 runs the hooks of `my hooks`"""
+    _hooks_in_tree_then_rewritten(gg, repo, b"[core]\n\thooksPath = my\thooks\n", "my hooks")
+
+
+def attack_hookspath_cr_between_words(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[152] the same with a lone CR"""
+    _hooks_in_tree_then_rewritten(gg, repo, b"[core]\n\thooksPath = my\rhooks\n", "my hooks")
+
+
+def attack_hookspath_tab_after_continuation(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[152] the tab that indents a continuation line: `my\\<LF><TAB>hooks`"""
+    _hooks_in_tree_then_rewritten(gg, repo, b"[core]\n\thooksPath = my\\\n\thooks\n", "my hooks")
+
+
+def attack_include_tab_between_words(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[152] `include.path = ../my<TAB>inc`: git < 2.45 reads `my inc`"""
+    inc = repo / "my inc"
+    inc.write_text("[core]\n")
+    cfg = repo / ".git/config"
+    cfg.write_bytes(cfg.read_bytes() + b"[include]\n\tpath = ../my\tinc\n")
+    gg.trust(repo)
+    inc.write_text("[core]\n\tsshCommand = /tmp/evil\n")
+
+
+def attack_local_remote_tab_between_words(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[152] `remote.origin.url = <dir>/my<TAB>hub.git`: git < 2.45 pushes to `my hub.git`"""
+    hub = tmp_path / "my hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    cfg = repo / ".git/config"
+    cfg.write_bytes(cfg.read_bytes() + f'[remote "origin"]\n\turl = {tmp_path}/my\thub.git\n'.encode())
+    gg.trust(repo)
+    write_exec(hub / "hooks/pre-receive", "#!/bin/sh\ntouch /tmp/evil\n")
+
+
+def attack_alias_quoted_program_tab(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[152] `alias.zz = !'./my<TAB>tools/ed'`: sh runs `./my tools/ed` under git < 2.45"""
+    write_exec(repo / "my tools/ed", "#!/bin/sh\nexit 0\n")
+    cfg = repo / ".git/config"
+    cfg.write_bytes(cfg.read_bytes() + b"[alias]\n\tzz = !'./my\ttools/ed'\n")
+    gg.trust(repo)
+    write_exec(repo / "my tools/ed")

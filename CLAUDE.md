@@ -41,7 +41,10 @@ paid for by a bypass.
 - **Read every file exactly as git does.** Bytes, git's `isspace`, one
   trailing newline, no `strip()`/`splitlines()`; a line git dies on is
   refused, not reinterpreted. Every reader has a parity test with git as
-  the oracle (`tests/test_git_parity.py`) and a byte-variant loop.
+  the oracle (`tests/test_git_parity.py`) and a byte-variant loop. As
+  every supported git does (2.39 to 2.56, the CI matrix): where two of
+  them read one file two ways, both readings are watched ([152]), and
+  gitguard never asks git its version.
 - **Fail closed.** Unreadable directory, unparsable config, unknown global
   option, internal error: refuse, git does not run.
 - **The state blessed is the state shown.** `save_trust` receives the

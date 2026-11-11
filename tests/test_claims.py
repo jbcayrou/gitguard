@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 import gitguard as gg_mod
+from tests.attacks._helpers import git_has
 from tests.conftest import GG, REAL_GIT
 from tests.test_commands import EDITOR, _gitlink_in_head, _gitlink_in_head_volatile_zone, _typechange_to_repo
 
@@ -256,8 +257,11 @@ def _options_from_help(text: str) -> tuple[dict[str, bool], set[str]]:
 
 
 # Options of the tables that an older git lacks (`git clone -h` has no
-# `--revision` before 2.49): the table may hold them, this git need not.
-NEWER_OPTIONS = {"clone": {"--revision"}, "init": set()}
+# `--revision` before 2.49, no `--ref-format` before 2.45): the table may
+# hold them, this git need not. A name it does not know, git dies on; and
+# no prefix it reads as one of its own options is made ambiguous by them
+# (`--ref`, `--re` already are, between its `--reference*`, `--recurs*`).
+NEWER_OPTIONS = {"clone": {"--revision", "--ref-format"}, "init": {"--ref-format"}}
 
 
 @pytest.mark.discovery
@@ -276,6 +280,11 @@ def test_new_repo_options_match_git(cmd: str) -> None:
         if name.startswith("--no-") and name not in longs and base in longs:
             assert gg_mod._long_option(name, longs) == (base, True)
             want_long[base] = want_long.pop(name)
+        elif name.startswith("--no-") and base in longs:
+            # `-n, --no-checkout` (git ≤ 2.43): an option named `no-x`,
+            # which parse-options also takes as `--x`; newer helps list
+            # both, the table holds both.
+            want_long.setdefault(base, want_long[name])
     for name, takes in want_long.items():
         assert name in longs, name
         assert longs[name] == takes, name
@@ -533,6 +542,7 @@ def test_keep_attached_disarms_the_detach(cmd: list[str], detach: str | None,
     assert gg_mod.keep_attached(["status"], Path.cwd()) == ["status"]
 
 
+@pytest.mark.skipif(not git_has("detach"), reason="git without `maintenance run --detach`")
 @pytest.mark.parametrize("abbr", ["--det", "--d"])
 def test_keep_attached_disarms_an_abbreviated_detach(gg: GG, repo: Path, abbr: str) -> None:
     """[132] parse-options takes any unique prefix of a long option: git
@@ -589,6 +599,8 @@ def test_maintenance_run_options_match_git(gg: GG, repo: Path) -> None:
     r = gg.git("maintenance", "run", "-h", cwd=repo)
     opts = {"--" + m.group(1): bool(m.group(2)) for m in re.finditer(
         r"^\s+(?:-\w, )?--(?:\[no-\])?([\w-]+)((?: <[^>]+>)?)", r.text, re.M)}
+    if not git_has("detach"):
+        opts["--detach"] = False         # 2.47's; an older git dies on it and on its prefixes
     assert opts == gg_mod.MAINTENANCE_RUN_OPTIONS, opts
 
 
@@ -674,9 +686,10 @@ def test_gc_options_match_git(gg: GG, repo: Path) -> None:
     r = gg.git("gc", "-h", cwd=repo)
     opts = {"--" + m.group(1): bool(m.group(2)) for m in re.finditer(
         r"^\s+(?:-\w, )?--(?:\[no-\])?([\w-]+)((?: <[^>]+>)?)", r.text, re.M)}
-    assert "--detach" in opts, r.text
+    newer = {"--expire-to"} | (set() if git_has("detach") else {"--detach", "--max-cruft-size"})
+    assert ("--detach" in opts) == git_has("detach"), r.text
     assert opts.items() <= gg_mod.GC_OPTIONS.items(), (opts, gg_mod.GC_OPTIONS)
-    assert set(gg_mod.GC_OPTIONS) - set(opts) <= {"--expire-to"}, set(gg_mod.GC_OPTIONS) - set(opts)
+    assert set(gg_mod.GC_OPTIONS) - set(opts) <= newer, set(gg_mod.GC_OPTIONS) - set(opts)
 
 
 @pytest.mark.parametrize("abbr", ["--detach", "--det", "--d"])
@@ -744,6 +757,7 @@ def test_network_url_classification_as_git(gg: GG, repo: Path, url: str) -> None
     assert r.rc != 0
     helper_or_path = ("remote helper" in r.err or "does not appear to be a git repository" in r.err
                       or "No such file" in r.err or "not a git repository" in r.err
+                      or "git: 'remote-" in r.err          # git ≤ 2.43's words for a missing helper
                       or "Could not read from remote" in r.err and "::" not in url and "://" not in url)
     if URL_CLASS[url]:
         assert "remote helper 'git-remote-" not in r.err or "git-remote-https" in r.err, r.err

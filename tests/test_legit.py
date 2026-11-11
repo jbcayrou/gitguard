@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.attacks._helpers import add_submodule, commit, make_source
+from tests.attacks._helpers import add_submodule, commit, git_has, make_source
 from tests.conftest import GG, write_exec
 
 
@@ -562,6 +562,7 @@ def test_sha256_repository_can_be_trusted(gg: GG, tmp_path: Path) -> None:
     assert not gg.check(r).blocked
 
 
+@pytest.mark.skipif(not git_has("reftable"), reason="git without the reftable backend")
 def test_reftable_commit_and_branch(gg: GG, tmp_path: Path) -> None:
     """[64] `git init --ref-format=reftable`: every ref update rewrites
     `reftable/tables.list` and the tables, which were fingerprinted."""
@@ -1334,3 +1335,29 @@ def test_mirror_behind_insteadof_is_watched_and_usable(gg: GG, repo: Path, tmp_p
     for cmd in (["push", "-q", "origin", "main"], ["fetch", "-q", "origin"], ["status", "--short"]):
         r = gg.run("git", *cmd, cwd=repo)
         assert r.rc == 0, (cmd, r.text)
+
+
+def test_multi_line_alias_indented_with_tabs_is_silent(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[152] the everyday shape of a tab between two words: the
+    continuation lines of an alias, indented with tabs, in the global and
+    in the local config. Two readings, the same words: no alert, the alias
+    runs, `push -u` keeps its auto-accept, and its script is watched."""
+    write_exec(repo / "tools/run", "#!/bin/sh\necho RUN \"$@\"\n")
+    alias = b"[alias]\n\tlg = log \\\n\t\t--oneline \\\n\t\t-1\n\tzz = !./tools/run \\\n\t\t--flag\n"
+    for cfg in (Path(gg.env["HOME"]) / ".gitconfig", repo / ".git/config"):
+        cfg.write_bytes(cfg.read_bytes() + alias)
+    gg.trust(repo)
+    assert not gg.check(repo).blocked
+    r = gg.run("git", "zz", cwd=repo)
+    assert r.rc == 0 and "RUN --flag" in r.out, r.text
+    assert gg.run("git", "lg", cwd=repo).rc == 0
+    hub = tmp_path / "hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    gg.git("remote", "add", "origin", str(hub), cwd=repo)
+    gg.trust(repo)
+    r = gg.run("git", "push", "-q", "-u", "origin", "main", cwd=repo)
+    assert r.rc == 0, r.text
+    r = gg.run("git", "status", "--short", cwd=repo)
+    assert r.rc == 0 and "reference updated" in r.err, r.text
+    write_exec(repo / "tools/run")
+    assert gg.check(repo).blocked

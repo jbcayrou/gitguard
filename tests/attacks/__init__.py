@@ -1114,6 +1114,23 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      git's longest match, held to git in test_git_parity.py; the hub's
      config and hooks join the fingerprint like any local remote's. A
      rule between network URLs (https → ssh) names nothing local.
+[152] RCE under git < 2.45 (Debian 12, Ubuntu 24.04; precondition: a tab
+     or a lone CR between two words of an unquoted value of the user's own
+     trusted config, where the path meant has a space): git counted the
+     whitespace inside a value and wrote it back as spaces until 2.45,
+     and keeps it since. gitguard's parser is the newer one:
+     `core.hooksPath = my<TAB>hooks` was watched as `my<TAB>hooks`, which
+     does not exist, while git 2.39 ran the hooks of `my hooks`; the same
+     for an `include.path`, a local remote's URL, a program quoted for
+     sh. The words of an alias are the same either way (the tabs that
+     indent its continuation lines). Found by running the suite against
+     git 2.39 and 2.43 for the test matrix, 2026-11-11; the difference is
+     the only one of config.c's parser between 2.39 and 2.56 (source
+     diff, and 10 000 random files against four gits). Fix: a value the
+     two parsers read differently is two entries, the reading of git ≥
+     2.45 then that of git < 2.45 (_Before245): every reader sees both,
+     no git is asked its version. `core.worktree`, where one value is
+     needed, refuses such a value.
 """
 from __future__ import annotations
 

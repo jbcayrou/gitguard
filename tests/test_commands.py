@@ -2341,6 +2341,9 @@ def test_child_maintenance_stays_in_the_command(gg: GG, repo: Path, tmp_path: Pa
                    input="\n".join(str(objs / str(i)) for i in range(600)), text=True,
                    capture_output=True)
     gg.git("config", "gc.auto", "1", cwd=sub)
+    # git 2.56's default strategy no longer runs `gc --auto` on loose
+    # objects; the one that does, under its name (older gits ignore it).
+    gg.git("config", "maintenance.strategy", "gc", cwd=sub)
     gg.trust(repo)
     commit(gg, src, "u", "2")
     loose = lambda: sum(1 for d in (repo / ".git/modules/sub/objects").glob("??") for _ in d.iterdir())
@@ -2683,3 +2686,35 @@ def test_non_utf8_repository_root_survives_every_command(gg: GG, tmp_path: Path)
     r = gg.run("forget", str(root), cwd=tmp_path)
     assert r.rc == 0 and "internal error" not in r.text, r.text
     assert gg.check(root).blocked                                   # never trusted again
+
+
+# ------------------------------------------- [152] a tab between two words of a value
+@pytest.mark.skipif(git_has("blanks_kept"), reason="git ≥ 2.45 keeps the tab: the value names no directory")
+def test_tab_between_words_names_the_spaced_directory_for_this_git(gg: GG, repo: Path,
+                                                                   tmp_path: Path) -> None:
+    """[152] control, on a git < 2.45: `core.hooksPath = my<TAB>hooks` is
+    `my hooks` for git, which runs its hooks. gitguard watches it: the
+    rewritten hook is refused where the real git runs it."""
+    mark = tmp_path / "RAN"
+    write_exec(repo / "my hooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    cfg = repo / ".git/config"
+    cfg.write_bytes(cfg.read_bytes() + b"[core]\n\thooksPath = my\thooks\n")
+    assert gg.git("config", "core.hooksPath", cwd=repo).out == "my hooks\n"
+    r = gg.trust(repo)
+    assert "my hooks" in r.text, r.text
+    write_exec(repo / "my hooks/pre-commit", f"#!/bin/sh\ntouch '{mark}'\n")
+    r = gg.run("git", "commit", "-q", "--allow-empty", "-m", "x", cwd=repo)
+    assert r.blocked and not mark.exists(), r.text
+    gg.git("commit", "-q", "--allow-empty", "-m", "x", cwd=repo)
+    assert mark.exists(), "control: this git runs the hook of `my hooks`"
+
+
+def test_worktree_read_two_ways_is_refused_with_the_way_out(gg: GG, repo: Path) -> None:
+    """[152] `core.worktree = ../my<TAB>tree`: the tree gitguard must judge
+    would be `my tree` or `my<TAB>tree` according to the git that runs.
+    Refused on every command, the message says what to write."""
+    cfg = repo / ".git/config"
+    cfg.write_bytes(cfg.read_bytes() + b"[core]\n\tworktree = ../my\ttree\n")
+    for cmd in ([], ["trust"], ["git", "status"]):
+        r = gg.run(*cmd, cwd=repo)
+        assert r.blocked and "before 2.45" in r.err and "internal error" not in r.text, (cmd, r.text)

@@ -4,7 +4,8 @@ Refuses to run `git` on a repository whose trusted files (`.git/config`,
 hooks, `.gitmodules`, gitfiles, every path the config makes git execute…)
 have changed since you last looked at them.
 
-One Python file, standard library only. Linux and macOS, Python ≥ 3.9.
+One Python file, standard library only. Linux and macOS, Python ≥ 3.9,
+git ≥ 2.39 (see [Supported versions](#supported-versions)).
 
 ## The problem
 
@@ -437,11 +438,27 @@ the 99 bypasses and false positives found so far (`tests/attacks/`).
 python3 -m pytest
 ```
 
-Needs `pytest` and `git`. The suite replays a corpus of attacks against a
+Needs `pytest` and `git`; `git` is the first one of the `PATH` that is not
+gitguard, or `GITGUARD_REAL_GIT`. The suite replays a corpus of attacks against a
 trusted repository and checks that each one is refused, that ordinary git
 operations are not, and that everything git reads (config syntax, includes,
 discovery, index gitlinks) gitguard reads the same way, with git as the
 oracle.
+
+### Supported versions
+
+gitguard reads a repository the way git does, and each of its readers is
+held to git by the suite: a git is supported when the whole suite passes
+against it. Every push runs it (`.github/workflows/tests.yml`) on Linux
+and macOS against git 2.39, 2.43, 2.47, 2.50 and 2.56, built from
+kernel.org by `ci/build-git.sh`; on Debian 12, Debian 13 and Ubuntu 24.04
+with the distribution's own git and python; and once on Python 3.9.
+
+gitguard never asks git its version. Where two supported gits read one
+file two ways — a tab between two words of a config value is a space
+before 2.45 — it watches what either reads. A git older than 2.39 is not
+supported, and one newer than 2.56 is not known until its inventory is
+classified (`DESIGN.md`, "Tests").
 
 ## License
 

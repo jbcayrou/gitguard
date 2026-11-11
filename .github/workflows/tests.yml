@@ -1,0 +1,77 @@
+# The suite takes git as its oracle: every supported git is a job, on both
+# systems. The versions are built from kernel.org (ci/build-git.sh) and
+# cached; `distro` runs a distribution's own git and python, patches
+# included, the target of the system-wide install (README).
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: git ${{ matrix.git }}, ${{ matrix.os }}, python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        git: ["2.39.5", "2.43.7", "2.47.3", "2.50.2", "2.56.1"]
+        python: ["3.x"]
+        include:
+          # The oldest python supported, once: the code is the same on every git.
+          - os: ubuntu-latest
+            git: "2.56.1"
+            python: "3.9"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/cache@v4
+        id: git
+        with:
+          path: ~/git-${{ matrix.git }}
+          key: git-${{ matrix.git }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/build-git.sh') }}
+      - name: Build git ${{ matrix.git }}
+        if: steps.git.outputs.cache-hit != 'true'
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update -q
+            sudo apt-get install -qy libcurl4-openssl-dev libexpat1-dev zlib1g-dev libssl-dev
+          fi
+          ci/build-git.sh ${{ matrix.git }} ~/git-${{ matrix.git }}
+      - name: Tests
+        run: |
+          export PATH=~/git-${{ matrix.git }}/bin:$PATH
+          git --version
+          python -m pip install -q pytest
+          python -m pytest
+
+  distro:
+    name: ${{ matrix.image }} (its git, its python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12", "debian:13", "ubuntu:24.04"]
+    container: ${{ matrix.image }}
+    steps:
+      - run: apt-get update -q && apt-get install -qy git python3 python3-pytest
+      - uses: actions/checkout@v4
+      # Not as root: root reads every file, and the tests of unreadable
+      # paths are skipped for it.
+      - name: Tests
+        run: |
+          id user 2>/dev/null || useradd -m user
+          chown -R user .
+          su user -c 'git --version && python3 -m pytest'

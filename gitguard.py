@@ -362,14 +362,28 @@ def _iskeychar(c: str) -> bool:
     return c.isascii() and (c.isalnum() or c == "-")
 
 
-def _parse_value(src: _Src) -> str | None:
-    """parse_value. None where git dies (bad escape, unterminated quote).
-    Leading whitespace skipped, trailing whitespace trimmed, internal
-    whitespace kept as is; `#`/`;` outside quotes start a comment; `\\` + newline
-    continues the value — inside a comment nothing is special any more."""
+class _Before245(str):
+    """A config value as git < 2.45 reads it, where that is not what git
+    ≥ 2.45 reads: the second entry _parse_config_text makes of such a
+    value. [152]"""
+    __slots__ = ()
+
+
+def _parse_value(src: _Src) -> tuple[str, str] | None:
+    """parse_value: the value, and the value as git < 2.45 reads it. None
+    where git dies (bad escape, unterminated quote). Leading whitespace
+    skipped, trailing whitespace trimmed, internal whitespace kept as is;
+    `#`/`;` outside quotes start a comment; `\\` + newline continues the
+    value — inside a comment nothing is special any more.
+    Before 2.45 (Debian 12, Ubuntu 24.04) git counted the whitespace
+    between two words of an unquoted value and wrote that many spaces: a
+    tab or a lone CR there is a space for it, the character itself since.
+    Nothing else differs between the two parsers (config.c, 2.39 to 2.56;
+    test_git_parity holds each reading to the git that reads that way). [152]"""
     out: list[str] = []
     quote = comment = False
     trim = -1                       # length before the trailing whitespace
+    blanks: list[int] = []          # where a tab or a CR stands between words, unquoted
     while True:
         c = src.get()
         if c == "\n":
@@ -377,13 +391,19 @@ def _parse_value(src: _Src) -> str | None:
                 return None
             if trim >= 0:
                 del out[trim:]
-            return "".join(out)
+            value = "".join(out)
+            for i in blanks:
+                if i < len(out):
+                    out[i] = " "
+            return value, "".join(out) if blanks else value
         if comment:
             continue
         if c in _GIT_SPACE and not quote:
             if trim < 0:
                 trim = len(out)
             if out:
+                if c != " ":
+                    blanks.append(len(out))
                 out.append(c)
             continue
         if not quote and c in "#;":
@@ -445,9 +465,16 @@ def _parse_section(src: _Src) -> str | None:
     return "".join(name) or None
 
 
-def _parse_config_text(text: str, where: str) -> list[tuple[str, str, str]]:
+def _parse_config_text(text: str, where: str, reading: str = "both") -> list[tuple[str, str, str]]:
     """git_parse_source. A line git rejects makes git die before running
-    anything: gitguard refuses too, rather than guess what follows."""
+    anything: gitguard refuses too, rather than guess what follows.
+    `reading`: a value git < 2.45 and git ≥ 2.45 read differently
+    (_parse_value) is two entries, the newer reading then the older one (a
+    _Before245): every reader of the list sees what either git sees,
+    whichever runs, and gitguard never asks which. "new" and "old" keep
+    one, for the parity tests. `core.hooksPath = my<TAB>hooks` in the
+    user's own config was watched as `my<TAB>hooks` while git 2.39 ran the
+    hooks of `my hooks`. [152]"""
     out: list[tuple[str, str, str]] = []
     if text.startswith("﻿"):          # UTF-8 BOM, only at the very start
         text = text[1:]
@@ -488,7 +515,11 @@ def _parse_config_text(text: str, where: str) -> list[tuple[str, str, str]]:
             v = _parse_value(src)
             if v is None:
                 break
-            value = v
+            value, before = v
+            if before != value and reading != "new":
+                if reading == "both":
+                    out.append((section, "".join(key), value))
+                value = _Before245(before)
         else:
             break
         out.append((section, "".join(key), value))
@@ -535,9 +566,11 @@ def is_file(p: Path) -> bool:
     return False
 
 
-def parse_git_config(path: Path) -> list[tuple[str, str, str]]:
+def parse_git_config(path: Path, reading: str = "both") -> list[tuple[str, str, str]]:
     """Return [(section, key, value)], section lower-cased with its subsection
-    ("includeIf.gitdir:x"), key lower-cased, exactly as git reads them. Never
+    ("includeIf.gitdir:x"), key lower-cased, exactly as git reads them — as
+    every supported git does: two entries where two gits read one value
+    two ways (_parse_config_text, `reading`). Never
     via `git config`: git would honour the very config we are trying to judge.
     A NUL byte makes git truncate the value (C string): refused instead, a
     config is never meant to contain one. Read as bytes: text mode would turn
@@ -549,7 +582,7 @@ def parse_git_config(path: Path) -> list[tuple[str, str, str]]:
         return []
     if "\0" in text:
         raise Refuse(f"{path}: NUL byte in a config file")
-    return _parse_config_text(text, str(path))
+    return _parse_config_text(text, str(path), reading)
 
 
 def _unquote(raw: str) -> str:
@@ -557,16 +590,23 @@ def _unquote(raw: str) -> str:
     v = _parse_value(_Src(raw))
     if v is None:
         raise ValueError(f"bad config value {raw!r}")
-    return v
+    return v[0]
 
 
 def config_last(path: Path, section: str, key: str) -> str | None:
     """The value git keeps for `section.key` from one file: the last one
     (each config callback overwrites the previous), None when absent. A
-    reader that returned at the first match diverged from git. [84]"""
+    reader that returned at the first match diverged from git. [84]
+    One value is needed here (the tree `core.worktree` names): one that
+    git < 2.45 and git ≥ 2.45 read differently is refused rather than
+    guessed, the tree judged would depend on the git that runs. [152]"""
     value = None
     for s, k, v in parse_git_config(path):
         if s == section and k == key:
+            if isinstance(v, _Before245):
+                raise Refuse(f"{path}: {section}.{key} holds a tab or a carriage return "
+                             f"between two words, which git reads as a space before 2.45 "
+                             f"and as written since: write a space, or quote the value")
             value = v
     return value
 
@@ -3909,10 +3949,15 @@ def cmd_pending(args: list[str]) -> None:
 # option may take an argument, and guessing wrong made gitguard take
 # `--config-env`'s argument for the subcommand, ignore the `-C` that followed
 # and check another directory than git's. git refuses unknown options too. [40]
+# `--super-prefix` is git ≤ 2.39's (Debian 12): its submodule recursion
+# passes it to the child it runs in each submodule (`clone
+# --recurse-submodules`, `submodule foreach --recursive`, `absorbgitdirs`),
+# and that child is gitguard; it names a prefix for the paths git prints,
+# never a repository. A newer git dies on it by itself.
 GLOBAL_WITH_ARG = {"-c", "--config-env", "--namespace", "-C", "--git-dir", "--work-tree",
-                   "--attr-source", "--shallow-file"}
+                   "--attr-source", "--shallow-file", "--super-prefix"}
 GLOBAL_WITH_EQ = ("--config-env=", "--namespace=", "--git-dir=", "--work-tree=",
-                  "--attr-source=", "--shallow-file=", "--exec-path=",
+                  "--attr-source=", "--shallow-file=", "--super-prefix=", "--exec-path=",
                   "--list-cmds=")
 GLOBAL_FLAGS = {"-p", "--paginate", "-P", "--no-pager", "--no-replace-objects",
                 "--literal-pathspecs", "--no-literal-pathspecs", "--glob-pathspecs",

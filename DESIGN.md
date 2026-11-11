@@ -660,6 +660,23 @@ the value, a C string). `~user/` is expanded like `~/` ([50]). The file is read 
 turned a lone CR into a line break where git keeps it inside the value ([52]). The cost is
 ~2 ms for a 17 KB config.
 
+**One file, every supported git.** The parser is a port of config.c, and
+config.c changed once between 2.39 and 2.56: before 2.45 the whitespace
+between two words of an unquoted value was counted and written back as
+spaces, since then it is kept — a tab or a lone CR there is a space for
+Debian 12's and Ubuntu 24.04's git, the character itself for a newer one
+(`core.hooksPath = my<TAB>hooks` names `my hooks`, then `my<TAB>hooks`).
+gitguard does not ask git which it is (a version is one more thing learnt
+by running git, and the indented continuation lines of an alias would
+have asked it at every command): `_parse_value` returns both readings
+and such a value is **two entries** of the list, the older one marked
+(`_Before245`), so that every reader — the scan, the include walk, the
+auto-accept comparison, the sequence readers — sees what either git
+sees. Only `config_last` needs one value (`core.worktree`): it refuses
+the marked one. Held to git both ways in `test_git_parity.py`: git's
+list is included in gitguard's on every git, and each reading alone is
+exactly the list of the gits that read that way ([152]).
+
 **Config files parsed** (not merely hashed): `config` and `config.worktree`
 of the gitdir **and of the commondir** (a linked worktree has no `config` of
 its own and uses the main repository's), the `config` of every submodule
@@ -1162,6 +1179,21 @@ into the tree was not watched.
 
 ## Tests
 
+**The matrix** (`.github/workflows/tests.yml`): the suite on every push,
+Linux and macOS, against each supported git (2.39, 2.43, 2.47, 2.50,
+2.56, built by `ci/build-git.sh` with the dashed builtins as symlinks, as
+conftest expects), on Debian 12, Debian 13 and Ubuntu 24.04 with the
+distribution's git, and once on the oldest python (3.9). A git is
+supported when the whole suite passes against it; a test that needs a
+feature probes the git under test for it (`git_has`), never its version.
+What its first run by hand found, 2026-11-11: git ≤ 2.39 passes
+`--super-prefix` to the child it runs in each submodule, an option
+gitguard had dropped — every recursive submodule command was refused on
+Debian 12; git < 2.45 reads a tab between two words of a config value as
+a space ([152]); git 2.56's default maintenance strategy no longer runs
+`gc --auto`, which the test of [117] observed — it names the `gc`
+strategy now. A new git enters the matrix with its inventory.
+
 **`python3 -m pytest`** (~1300 tests, expected failures [44], [71], [74], [95], [123], [126], [129] — accepted
 limitations; ~280 s, ~60 s with `-n 8` on the command line),
 to run before any change:
@@ -1493,7 +1525,12 @@ the files, not the order.
   `xfail(strict=True)`; none is open at the moment (the former ones, [46]
   to [50], and the sh expansions of [58] are fixed). Deliberate divergences,
   fail-closed: NUL in a config
-  (refused, git truncates), a bad config line (refused, git dies).
+  (refused, git truncates), a bad config line (refused, git dies), a
+  `core.worktree` holding a tab or a lone CR between two words (refused:
+  two gits, two trees, [152]). Where supported gits disagree on a config
+  value, both readings are entries: the cost is a path watched that the
+  running git does not read — the `my hooks` twin of a `my<TAB>hooks`
+  under git ≥ 2.45.
   `core.bare = true` in a non-bare layout is not handled (git then has no
   work tree).
 - **Accepted limitation [44]** (decided 2026-10-23, xfail test kept as the

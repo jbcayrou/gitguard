@@ -84,7 +84,11 @@ _FEATURES: dict[str, bool] = {}
 def git_has(feature: str) -> bool:
     """`alias_subsection`: `[alias "x"] command = …` (git 2.54).
     `config_hooks`: `hook.<name>.command` + `hook.<name>.event` (git 2.54).
-    `optional_path`: the `:(optional)` prefix of a pathname value (git 2.52+)."""
+    `optional_path`: the `:(optional)` prefix of a pathname value (git 2.52+).
+    `detach`: `maintenance run --detach` and `gc --detach` (git 2.47).
+    `reftable`: `init --ref-format=reftable` (git 2.45).
+    `blanks_kept`: a tab between two words of an unquoted config value is
+    read as a tab (git 2.45+), not as a space."""
     if feature not in _FEATURES:
         import os
         import tempfile
@@ -102,6 +106,15 @@ def git_has(feature: str) -> bool:
                 ok = "HOOKRAN" in r.stdout + r.stderr      # a hook's stdout goes to stderr
             elif feature == "optional_path":
                 ok = run("-c", "x.y=:(optional)/", "config", "--type=path", "x.y").stdout == "/\n"
+            elif feature == "detach":
+                run("init", "-q", ".")
+                ok = "detach" in run("maintenance", "run", "-h").stdout + run("maintenance", "run", "-h").stderr
+            elif feature == "blanks_kept":
+                with open(os.path.join(d, "cfg"), "wb") as f:
+                    f.write(b"[a]\n\tb = x\ty\n")
+                ok = run("config", "-f", "cfg", "a.b").stdout == "x\ty\n"
+            elif feature == "reftable":
+                ok = run("init", "-q", "--ref-format=reftable", "rt").returncode == 0
             else:
                 raise ValueError(feature)
         _FEATURES[feature] = ok
