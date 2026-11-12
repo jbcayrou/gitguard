@@ -1131,6 +1131,29 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      2.45 then that of git < 2.45 (_Before245): every reader sees both,
      no git is asked its version. `core.worktree`, where one value is
      needed, refuses such a value.
+[153] False positive: a `notes merge` stopped on a conflict leaves, at the
+     gitdir root, the refs `NOTES_MERGE_PARTIAL` and `NOTES_MERGE_REF`
+     and the notes to resolve, `NOTES_MERGE_WORKTREE/<oid>`; neither
+     volatile nor read, every command was asked about until `notes merge
+     --commit` or `--abort`. The inventory ([100]) had not listed them:
+     its patterns saw a literal given to `git_path` / `repo_git_path`,
+     not a macro (`NOTES_MERGE_WORKTREE "/%s"`), not the `_replace` and
+     `_append` forms, not a root ref, which git opens through the ref
+     store. Found by the fourth agentic audit, 2026-11-03. Fix: the two
+     refs are volatile; so is a regular file named by an object id in
+     `NOTES_MERGE_WORKTREE` at a root (NOTES_MERGE_NOTE) — data `--commit`
+     hashes into a blob, never runs. The files git writes, not the
+     directory: `--commit` reads an entry there through stat(), so a
+     symlink named like an object puts a file of the host into a note
+     the sandbox reads, and a `.gitattributes` there chooses the clean
+     filter of the notes; both stay entries (tests/attacks/gitdir.py, the
+     two behaviours held to git in test_claims.py). The inventory follows
+     macros, every path function and the root refs; of the 31 names it
+     gained, one more was a false positive of the same kind:
+     `objects/loose-object-idx`, the two names of each loose object
+     under `extensions.compatObjectFormat` (experimental), rewritten
+     with every object — every commit there was asked about; volatile,
+     part of the object store.
 """
 from __future__ import annotations
 

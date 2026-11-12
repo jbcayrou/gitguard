@@ -14,8 +14,10 @@ classify what is new.
 
 Sections (one item per line, `# ` comments, blank lines ignored):
 
-  [gitdir]    names git opens under a gitdir: GIT_PATH_FUNC and the literal
-              arguments of repo_git_path/git_path (printf patterns dropped).
+  [gitdir]    names git opens under a gitdir: GIT_PATH_FUNC, the name given
+              to any function of the git_path / common_path family (a
+              literal, or a macro defined as one), and the root refs, which
+              the files backend keeps as files at a gitdir root.
   [pathname]  config keys read through git_config_pathname /
               *_config_get_pathname: a value that is a path git opens.
   [bool]      config keys read through git_config_bool / git_config_maybe_bool
@@ -63,16 +65,35 @@ def c_files(src: Path, suffix: str = "*.c") -> list[Path]:
 
 
 def gitdir_names(src: Path) -> set[str]:
-    """GIT_PATH_FUNC(fn, "name") in .c/.h, and repo_git_path(r, "name") /
-    git_path("name") literals. A name with a printf pattern (`%s`) is a
-    family (lost-found/%s/%s, sharedindex.%s): kept with the pattern."""
+    """GIT_PATH_FUNC(fn, "name") in .c/.h, and the name given to a function
+    of the git_path / common_path family — repo_git_path, its `_replace`
+    and `_append` forms, repo_common_path*, read_line_from_git_path… —
+    after at most two other arguments: a literal, or a macro defined as
+    one, with the literal that follows it (`NOTES_MERGE_WORKTREE "/%s"`).
+    The first pattern knew `git_path("name")` and `repo_git_path(r,
+    "name")` only: a name behind a macro or a `_replace` was never
+    classified, and NOTES_MERGE_WORKTREE alerted on every command of a
+    stopped `notes merge` ([153]). A name with a printf pattern (`%s`) is
+    a family (lost-found/%s/%s, sharedindex.%s): kept with the pattern.
+
+    Plus the root refs, files at a gitdir root under the files backend
+    and opened through the ref store, not through a path function: the
+    irregular ones of refs.c (git ≥ 2.45) and every `*_HEAD` literal."""
     out: set[str] = set()
+    texts = [p.read_text(errors="replace") for p in c_files(src) + c_files(src, "*.h")]
+    macros = dict(m for t in texts for m in re.findall(r'^#define\s+(\w+)\s+"([^"]+)"\s*$', t, re.M))
     pat_func = re.compile(r'GIT_PATH_FUNC\(\w+,\s*"([^"]+)"')
-    pat_call = re.compile(r'(?:repo_)?git_path(?:dup)?\(\s*(?:[\w>.-]+,\s*)?"([^"]+)"')
-    for p in c_files(src) + c_files(src, "*.h"):
-        text = p.read_text(errors="replace")
+    pat_call = re.compile(r'\b\w*(?:git_path|common_path)\w*\(\s*(?:[\w>.&-]+,\s*){0,2}'
+                          r'(?:([A-Z][A-Z0-9_]*)\b\s*)?(?:"([^"]*)")?')
+    for text in texts:
         out.update(pat_func.findall(text))
-        out.update(pat_call.findall(text))
+        for macro, literal in pat_call.findall(text):
+            if macro and macro not in macros:
+                continue                                 # NULL, a variable in capitals
+            out.add(macros.get(macro, "") + literal)
+        out.update(re.findall(r'"([A-Z][A-Z_]*_HEAD)"', text))
+    m = re.search(r"irregular_root_refs\[\]\s*=\s*\{(.*?)\}", (src / "refs.c").read_text(), re.S)
+    out.update(re.findall(r'"(\w+)"', m.group(1)) if m else ())
     out.discard("FOO")                                   # path.c's own example
     return {n for n in out if re.search(r"[A-Za-z0-9]", n) and not n.startswith("%")}
 

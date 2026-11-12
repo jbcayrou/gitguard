@@ -460,6 +460,33 @@ def test_walk_gitdir_anchors_roots_under_modules_only(tmp_path: Path) -> None:
     assert not gg_mod.gitdir_excluded(g / "modules/lib/foo/config", g)
 
 
+def test_notes_merge_names_are_volatile_where_git_writes_them(tmp_path: Path) -> None:
+    """[153] the two refs and the notes named by an object id (sha1, sha256)
+    at a gitdir root, their locks for the refs; nothing else beside the
+    notes, no symlink, no other position."""
+    oid, oid256 = "a" * 40, "b" * 64
+    g = tmp_path / ".git"
+    volatile = ["NOTES_MERGE_PARTIAL", "NOTES_MERGE_REF", "NOTES_MERGE_REF.lock",
+                f"NOTES_MERGE_WORKTREE/{oid}", f"NOTES_MERGE_WORKTREE/{oid256}",
+                "worktrees/wt/NOTES_MERGE_REF", f"worktrees/wt/NOTES_MERGE_WORKTREE/{oid}"]
+    watched = ["NOTES_MERGE_WORKTREE/.gitattributes", f"NOTES_MERGE_WORKTREE/{oid}.lock",
+               f"NOTES_MERGE_WORKTREE/{oid}~", f"NOTES_MERGE_WORKTREE/{oid[:39]}",
+               f"NOTES_MERGE_WORKTREE/{'g' * 40}", f"NOTES_MERGE_WORKTREE/x/{oid}",
+               f"hooks/NOTES_MERGE_WORKTREE/{oid}", "hooks/NOTES_MERGE_REF",
+               "NOTES_MERGE_OTHER"]
+    for f in ["HEAD", "worktrees/wt/HEAD", *volatile, *watched]:
+        (g / f).parent.mkdir(parents=True, exist_ok=True)
+        (g / f).write_text("x")
+    link = f"NOTES_MERGE_WORKTREE/{'c' * 40}"
+    (g / link).symlink_to(tmp_path / "elsewhere")
+    paths = sorted(e.path for e in gg_mod.walk_gitdir(g, "local"))
+    assert paths == sorted([*watched, link])
+    for f in volatile:
+        assert gg_mod.gitdir_excluded(g / f, g), f
+    for f in [*watched, link]:
+        assert not gg_mod.gitdir_excluded(g / f, g), f
+
+
 def test_walk_error_ignores_vanished_dir_but_refuses_permission() -> None:
     gg_mod._walk_error(FileNotFoundError(2, "No such file or directory", "/x"))
     with pytest.raises(gg_mod.Refuse):

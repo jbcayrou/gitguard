@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.attacks._helpers import add_submodule, commit, git_has, make_source
+from tests.attacks._helpers import add_submodule, commit, conflicting_notes, git_has, make_source
 from tests.conftest import GG, write_exec
 
 
@@ -876,6 +876,60 @@ def test_editor_aborted_leaves_edit_buffers(gg: GG, repo: Path) -> None:
     assert left, "git left no edit buffer behind: scenario void"
     r = gg.check(repo)
     assert not r.blocked, (left, r.text)
+
+
+@pytest.mark.parametrize("where", ["main", "linked"])
+@pytest.mark.parametrize("end", ["--commit", "--abort"])
+def test_notes_merge_stopped_on_a_conflict(gg: GG, repo: Path, tmp_path: Path,
+                                           where: str, end: str) -> None:
+    """[153] a `notes merge` that stops on a conflict leaves the two refs
+    NOTES_MERGE_PARTIAL and NOTES_MERGE_REF and the note to resolve,
+    NOTES_MERGE_WORKTREE/<oid>, at the gitdir root (a linked worktree's
+    own): every command was asked about until `--commit` or `--abort`.
+    The directory git leaves empty afterwards is no entry."""
+    tree = repo
+    if where == "linked":
+        tree = tmp_path / "wt"
+        assert gg.git("worktree", "add", "-q", str(tree), "-b", "wt", cwd=repo).rc == 0
+    conflicting_notes(gg, repo)
+    for t in {tree, repo}:
+        gg.trust(t)
+    r = gg.run("git", "notes", "merge", "other", cwd=tree)
+    assert r.rc != 0 and "gitguard:" not in r.err, r.text
+    gitdir = repo / ".git" if where == "main" else repo / ".git/worktrees/wt"
+    notes = list((gitdir / "NOTES_MERGE_WORKTREE").iterdir())
+    assert len(notes) == 1, "git left no note to resolve: scenario void"
+    for t in (tree, repo):
+        r = gg.run("git", "status", "--short", cwd=t)
+        assert r.rc == 0 and not r.err, r.text
+    notes[0].write_text("resolved\n")
+    r = gg.run("git", "notes", "merge", end, cwd=tree)
+    assert r.rc == 0, r.text
+    assert not list((gitdir / "NOTES_MERGE_WORKTREE").iterdir())
+    r = gg.check(repo)
+    assert not r.blocked, r.text
+    want = "resolved" if end == "--commit" else "ours"
+    assert gg.git("notes", "show", "HEAD", cwd=repo).out.strip() == want
+
+
+def test_compat_object_format_map_follows_the_objects(gg: GG, tmp_path: Path) -> None:
+    """[153] `extensions.compatObjectFormat` (experimental, git ≥ 2.45): git
+    keeps the two names of every loose object in objects/loose-object-idx,
+    rewritten with each of them — every commit was asked about. Found by
+    the inventory once it followed `repo_common_path_replace`."""
+    r = tmp_path / "compat"
+    assert gg.git("init", "-q", "--object-format=sha256", str(r)).rc == 0
+    gg.git("config", "extensions.compatObjectFormat", "sha1", cwd=r)
+    (r / "f").write_text("a\n")
+    gg.git("add", "f", cwd=r)
+    if gg.git("commit", "-qm", "one", cwd=r).rc or not (r / ".git/objects/loose-object-idx").is_file():
+        pytest.skip("this git has no extensions.compatObjectFormat")
+    gg.trust(r)
+    (r / "f").write_text("b\n")
+    r1 = gg.run("git", "commit", "-qam", "two", cwd=r)
+    assert r1.rc == 0, r1.text
+    r2 = gg.run("git", "status", "--short", cwd=r)
+    assert r2.rc == 0 and not r2.err, r2.text
 
 
 # ------------------------------------------------- [101] clones through index-pack

@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 import gitguard as gg_mod
-from tests.attacks._helpers import git_has
+from tests.attacks._helpers import conflicting_notes, git_has
 from tests.conftest import GG, REAL_GIT
 from tests.test_commands import EDITOR, _gitlink_in_head, _gitlink_in_head_volatile_zone, _typechange_to_repo
 
@@ -404,6 +404,27 @@ GITDIR_HASHED = {
                       "one only through the index's `link`, refused [31]",
     "fsmonitor--daemon.ipc": "the builtin fsmonitor's socket: not a regular file, _hash_file "
                              "skips it; a regular file put there is watched, git runs nothing from it",
+    # Names behind a macro, a `_replace`/`_append` form or the ref store,
+    # which the inventory did not see before [153].
+    "NOTES_MERGE_WORKTREE": "the directory of the notes to resolve: no entry by itself; a symlink is one",
+    "NOTES_MERGE_WORKTREE/%s": "the notes to resolve, named by an object id: volatile at a root "
+                               "(NOTES_MERGE_NOTE, [153]); any other name there is watched",
+    "NOTES_MERGE_WORKTREE/.test": "never created: the argument of safe_create_leading_directories",
+    "NOTES_MERGE_*": "a pattern printed in a message, opened by nothing",
+    "CHECKOUT_AUTOSTASH_HEAD": "the autostash of `checkout -m`, created and deleted by the one "
+                               "command: not left behind (replayed on git 2.56), deny by default",
+    "hooks/%s": "the hooks: the point",
+    "branches/%s": "a remote defined the old way: watched, and read for a local URL (_legacy_remote_urls)",
+    "remotes/%s": "same",
+    "modules/": "submodule gitdirs, walked as roots (_child_root)",
+    "modules/%s": "same",
+    "worktrees/%s": "linked worktrees, walked as roots (_child_root)",
+    "worktrees/%s/gitdir": "where a linked worktree is: watched, git follows it",
+    "worktrees/%s/locked": "volatile at the worktree's root (`locked` in VOLATILE_FILES)",
+    "objects": "the object store: its fan-out and packs are volatile, the rest is watched",
+    "objects/%s": "temporaries of the object store (odb_mkstemp), renamed or unlinked by the command",
+    "tXXXXXX": "init's probe for symlinks, unlinked at once",
+    "CoNfIg": "init's probe for a case-insensitive filesystem: `config` itself, or nothing",
 }
 
 
@@ -857,3 +878,44 @@ def test_absorbgitdirs_runs_only_the_pinned_fsmonitor(gg: GG, repo: Path, tmp_pa
         assert gg.git(*pre, "submodule", "absorbgitdirs", cwd=r).rc == 0
         assert (r / "vendor/.git").is_file()
         assert mark.exists() == expect, ("pin" if pin else "control", mark.exists())
+
+
+# ================== the notes of a stopped `notes merge` are data ([153])
+def _stopped_notes_merge(gg: GG, repo: Path) -> Path:
+    """The note git left to resolve."""
+    conflicting_notes(gg, repo)
+    assert gg.git("notes", "merge", "other", cwd=repo).rc != 0
+    (note,) = (repo / ".git/NOTES_MERGE_WORKTREE").iterdir()
+    return note
+
+
+def test_notes_merge_hashes_the_note_and_runs_nothing(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """A file excluded as `NOTES_MERGE_WORKTREE/<oid>` is hashed into a
+    blob, never run: the note replaced by an executable script, `status`
+    and `notes merge --commit` run nothing and the note is the script's
+    text."""
+    from tests.conftest import write_exec
+    note, mark = _stopped_notes_merge(gg, repo), tmp_path / "RAN"
+    write_exec(note, f"#!/bin/sh\ntouch {mark}\n")
+    gg.git("status", cwd=repo)
+    assert gg.git("notes", "merge", "--commit", cwd=repo).rc == 0
+    assert not mark.exists()
+    assert gg.git("notes", "show", "HEAD", cwd=repo).out == f"#!/bin/sh\ntouch {mark}\n"
+
+
+def test_notes_merge_reads_what_stays_an_entry(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """The two names beside the notes that are not excluded, and why: a
+    `.gitattributes` there chooses the clean filter `notes merge --commit`
+    runs on a note (the filter is the trusted config's; which files it
+    runs on is the sandbox's), and a symlink named like an object is read
+    through — a file outside the repository becomes a note."""
+    note, mark = _stopped_notes_merge(gg, repo), tmp_path / "RAN"
+    assert gg.git("config", "filter.x.clean", f"touch {mark}; cat", cwd=repo).rc == 0
+    (note.parent / ".gitattributes").write_text("* filter=x\n")
+    secret, other = tmp_path / "secret", "a" * len(note.name)
+    secret.write_text("key\n")
+    (note.parent / other).symlink_to(secret)
+    assert gg.git("notes", "merge", "--commit", cwd=repo).rc == 0
+    assert mark.exists(), "invalid control: no clean filter on a note any more"
+    assert gg.git("notes", "show", other, cwd=repo).out == "key\n", \
+        "invalid control: a symlinked note is no longer read through"

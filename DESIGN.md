@@ -496,6 +496,26 @@ aborted editor leaves at the root (`ADD_EDIT.patch`, `NOTES_EDITMSG`,
 `REPLACE_EDITOBJ`, [100]) came out of that list on the first run, not out
 of a review.
 
+The list was short of the names its patterns did not see: one behind a
+macro, one given to a `_replace` or `_append` form of the path functions,
+and the root refs, files at a gitdir root that git opens through the ref
+store. A `notes merge` stopped on a conflict leaves three of them, and
+every command was asked about until `--commit` or `--abort` ([153]):
+`NOTES_MERGE_PARTIAL` and `NOTES_MERGE_REF`, two refs, volatile like
+`MERGE_HEAD`; and `NOTES_MERGE_WORKTREE/<oid>`, the notes to resolve, one
+file per annotated object, which `--commit` hashes into blobs and never
+runs. That last exclusion is **the files git writes, not the directory**
+(`NOTES_MERGE_NOTE`, a regular file named by an object id, at a root):
+`--commit` reads each entry there through `stat()`, so a symlink named
+like an object puts a file of the host into a note — in the object store
+the sandbox reads — and a `.gitattributes` there chooses the clean filter
+the notes go through; both stay entries, both held to git in
+`test_claims.py`. The inventory follows macros, every path function and
+the root refs since. Of the names it gained, one more alerted on an
+ordinary command: `objects/loose-object-idx`, the two names of each loose
+object under `extensions.compatObjectFormat`, rewritten with every object
+— part of the object store, volatile like its fan-out.
+
 ## What the fingerprint watches outside the gitdir
 
 One entry per file: `(scope, path) → (kind, mode, sha256)`. A **symlink** is
@@ -1266,7 +1286,9 @@ to run before any change:
   for "a value it runs") proves the generic rule reaches each value syntax.
 - `tests/inventory.py` and `tests/inventory/git-<ver>.txt` — **git's
   universe, from its source**: the names git opens under a gitdir
-  (`GIT_PATH_FUNC`, `repo_git_path`), the config keys it reads through
+  (`GIT_PATH_FUNC`, every function of the `git_path` / `common_path`
+  family with a literal or a macro, the root refs; [153]), the config keys
+  it reads through
   `git_config_pathname`, as a boolean (`git_config_bool`…, `[bool]`) or a
   number (`git_config_int`…, `[int]`; the two are `VALUE_KEYS`, [129]),
   the hooks of `githooks.adoc`, the options of `git.c`, the callers that

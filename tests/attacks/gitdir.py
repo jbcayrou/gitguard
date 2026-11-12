@@ -88,3 +88,38 @@ def attack_lock_suffixed_file_under_hooks(gg: GG, repo: Path, tmp_path: Path) ->
     d = repo / ".git/hooks/pre-commit.d"
     d.mkdir()
     write_exec(d / "20-evil.lock")
+
+
+def attack_notes_merge_note_is_a_symlink(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[153] a note to resolve that is a symlink: `notes merge --commit`
+    reads it through stat(), and a file of the host becomes a note the
+    sandbox reads; only the regular files git writes there are volatile"""
+    secret = tmp_path / "secret"
+    secret.write_text("key\n")
+    d = repo / ".git/NOTES_MERGE_WORKTREE"
+    d.mkdir()
+    (d / ("a" * 40)).symlink_to(secret)
+
+
+def attack_notes_merge_gitattributes(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[153] a `.gitattributes` beside the notes to resolve chooses the
+    clean filter `notes merge --commit` runs on them: not a name git
+    writes there, an entry"""
+    d = repo / ".git/NOTES_MERGE_WORKTREE"
+    d.mkdir()
+    (d / ".gitattributes").write_text("* filter=lfs\n")
+
+
+def attack_notes_merge_name_under_hooks(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[153] the exclusion is a position under a gitdir root:
+    `hooks/NOTES_MERGE_WORKTREE/<oid>` is a file like any other"""
+    d = repo / ".git/hooks/NOTES_MERGE_WORKTREE"
+    d.mkdir()
+    write_exec(d / ("a" * 40))
+
+
+def attack_notes_merge_name_below_the_notes(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[153] nor is a file one level below the notes"""
+    d = repo / ".git/NOTES_MERGE_WORKTREE/x"
+    d.mkdir(parents=True)
+    write_exec(d / ("a" * 40))

@@ -14,6 +14,15 @@ def commit(gg: GG, repo: Path, name: str = "f", content: str = "b") -> None:
     assert gg.git("commit", "-qm", f"c-{name}-{content}", cwd=repo).rc == 0
 
 
+def conflicting_notes(gg: GG, repo: Path) -> None:
+    """Two notes refs, `commits` and `other`, that disagree on HEAD's note:
+    `git notes merge other` stops on a conflict."""
+    assert gg.git("notes", "add", "-m", "base", "HEAD", cwd=repo).rc == 0
+    assert gg.git("update-ref", "refs/notes/other", "refs/notes/commits", cwd=repo).rc == 0
+    assert gg.git("notes", "add", "-f", "-m", "ours", "HEAD", cwd=repo).rc == 0
+    assert gg.git("notes", "--ref=other", "add", "-f", "-m", "theirs", "HEAD", cwd=repo).rc == 0
+
+
 def make_source(gg: GG, tmp_path: Path, name: str = "subsrc") -> Path:
     s = tmp_path / name
     if not s.exists():

@@ -197,15 +197,20 @@ VOLATILE_DIRS = {"refs", "logs", "lfs", "rr-cache", "rebase-merge", "rebase-appl
 # fails (`:cq`) or changes nothing; `MERGE_LABELS` and `rebased-patches`, the
 # same class (data git applies to the index or the objects, both volatile,
 # never a program). Every following command was refused. [100]
+# `NOTES_MERGE_PARTIAL`, `NOTES_MERGE_REF`: the two refs of a `notes merge`
+# stopped on a conflict, like MERGE_HEAD. `objects/loose-object-idx`: the
+# two names of each loose object under extensions.compatObjectFormat,
+# rewritten with every object, part of the object store like its fan-out. [153]
 VOLATILE_FILES = {"index", "HEAD", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "MERGE_MSG",
                   "MERGE_MODE", "MERGE_RR", "MERGE_AUTOSTASH", "AUTO_MERGE", "REBASE_HEAD",
                   "CHERRY_PICK_HEAD", "REVERT_HEAD", "SQUASH_MSG", "COMMIT_EDITMSG",
                   "TAG_EDITMSG", "packed-refs", "shallow", "gc.log", "gc.pid",
                   "commit-graph", "multi-pack-index", "locked", "EDIT_DESCRIPTION",
                   "ADD_EDIT.patch", "NOTES_EDITMSG", "REPLACE_EDITOBJ", "MERGE_LABELS",
-                  "rebased-patches",
+                  "rebased-patches", "NOTES_MERGE_PARTIAL", "NOTES_MERGE_REF",
                   "info/refs", "objects/info/packs", "objects/info/commit-graph",
-                  "objects/info/multi-pack-index", "info/sparse-checkout"}
+                  "objects/info/multi-pack-index", "objects/loose-object-idx",
+                  "info/sparse-checkout"}
 OBJECT_FANOUT = re.compile(r"^objects/[0-9a-f]{2}$")
 # `sharedindex.<oid>` at a gitdir root: the entries of a split index, read by
 # git only through the `link` extension of `index` — which is refused
@@ -213,6 +218,15 @@ OBJECT_FANOUT = re.compile(r"^objects/[0-9a-f]{2}$")
 # deletes stale ones only while writing a split index): an orphan nobody
 # reads, volatile; the presence test refused the repository for ever. [148]
 SHARED_INDEX = re.compile(r"^sharedindex\.[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+# A `notes merge` stopped on a conflict: the refs NOTES_MERGE_PARTIAL and
+# NOTES_MERGE_REF (VOLATILE_FILES) and, here, the notes to resolve, one
+# file per annotated object, which the user edits and `notes merge
+# --commit` hashes into blobs — data, never run (test_claims.py). The
+# files git writes, not the directory: `--commit` reads an entry there
+# through stat(), so a symlink named like an object would put a file of
+# the host into a note the sandbox can read, and a `.gitattributes` there
+# chooses the clean filter; both stay entries. [153]
+NOTES_MERGE_NOTE = re.compile(r"^NOTES_MERGE_WORKTREE/[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 # Volatile files git reads back as instructions cannot be hashed (rewritten
 # at every step) and cannot be ignored: each has a reader that refuses what
 # would run — VOLATILE_READERS, after the readers. [19] [51]
@@ -3021,6 +3035,8 @@ def _volatile_file(rel: str, is_symlink: bool) -> bool:
     LOCKED_FILES; anchored, like every exclusion. [144]"""
     if is_symlink:
         return False                     # a symlink is always an entry, even *.lock
+    if rel.startswith("NOTES_MERGE_WORKTREE/"):
+        return bool(NOTES_MERGE_NOTE.match(rel))
     if rel.endswith(".lock"):
         rel = rel[:-5]
         if rel in LOCKED_FILES:
