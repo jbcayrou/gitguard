@@ -1415,3 +1415,134 @@ def test_multi_line_alias_indented_with_tabs_is_silent(gg: GG, repo: Path, tmp_p
     assert r.rc == 0 and "reference updated" in r.err, r.text
     write_exec(repo / "tools/run")
     assert gg.check(repo).blocked
+
+
+# ------------------------------- [154] a tree trusted with the repository that holds its gitdir
+def _inherits(gg: GG, tree: Path, holder: Path) -> None:
+    """The first git run from `tree` is let through and says whose trust
+    it took; from then on the tree has its own reference and is silent."""
+    r = gg.run("git", "status", "--short", cwd=tree)
+    assert r.rc == 0 and f"trusted with {holder}" in r.err, r.text
+    assert gg.key_for(tree).is_file()
+    r = gg.run("git", "status", "--short", cwd=tree)
+    assert r.rc == 0 and "gitguard:" not in r.err, r.text
+
+
+@pytest.mark.parametrize("how", ["clone", "trust"])
+def test_submodule_is_trusted_with_its_superproject(gg: GG, repo: Path, tmp_path: Path, how: str) -> None:
+    """[154] Every file a submodule's own check watches is in the
+    fingerprint of its superproject: `clone --recurse-submodules`
+    auto-trusted them, a `trust` of the superproject showed them. A git
+    run from the submodule died "never trusted" all the same, until a
+    `gitguard trust` in each. Then the submodule is judged under its own
+    reference, as before."""
+    add_submodule(gg, repo, tmp_path)
+    top = repo
+    if how == "clone":
+        top = tmp_path / "cl"
+        r = gg.run("git", "clone", "-q", "--recurse-submodules", str(repo), str(top), cwd=tmp_path)
+        assert r.rc == 0 and f"new repository trusted: {top}" in r.err, r.text
+    else:
+        gg.trust(repo)
+    _inherits(gg, top / "sub", top)
+    assert gg.run("git", "commit", "-q", "--allow-empty", "-m", "in sub", cwd=top / "sub").rc == 0
+    gg.git("config", "core.pager", "cat", cwd=top / "sub")
+    r = gg.check(top / "sub")
+    assert r.blocked and "has changed" in r.err and "pager" in r.err, r.text
+
+
+def test_submodule_with_its_own_hooks_is_trusted_with_its_superproject(gg: GG, repo: Path,
+                                                                     tmp_path: Path) -> None:
+    """[154] what the submodule's config names in its tree — a hooks
+    directory, a `.lfsconfig` — and what a global relative `core.hooksPath`
+    names there are hashed by the superproject ([39] [68] [125]): covered."""
+    sub = add_submodule(gg, repo, tmp_path)
+    gg.git("config", "core.hooksPath", ".hk", cwd=sub)
+    write_exec(sub / ".hk/pre-push", "#!/bin/sh\nexit 0\n")
+    (sub / ".lfsconfig").write_text("[lfs]\n\turl = https://example.invalid/lfs\n")
+    gg.git("config", "--global", "core.hooksPath", ".githooks")
+    for tree in (repo, sub):
+        write_exec(tree / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    gg.trust(repo)
+    _inherits(gg, sub, repo)
+
+
+def test_nested_submodule_is_trusted_with_the_superproject(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[154] a submodule's submodule: its gitdir is under the superproject's
+    too. The tree's own structure (`.gitmodules`, the gitfiles) is named by
+    nobody ([125]) and is not asked of the superproject."""
+    sub = add_submodule(gg, repo, tmp_path)
+    inner = add_submodule(gg, sub, tmp_path / "i", name="inner")
+    gg.git("commit", "-qam", "sub", cwd=repo)
+    gg.trust(repo)
+    _inherits(gg, inner, repo)
+    _inherits(gg, sub, repo)
+
+
+def test_linked_worktree_is_trusted_with_the_main_tree(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[154] a linked worktree reads the main repository's config and
+    hooks: once the main tree's reference holds its `worktrees/<id>` (the
+    question `worktree add` raises, answered), a git run from the worktree
+    has nothing left to show. Hooks the config names in the tree are the
+    worktree's own copy: covered when they are the bytes trusted at the
+    same place in the main tree."""
+    gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
+    write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    gg.git("add", "-A", cwd=repo)
+    gg.git("commit", "-qm", "hooks", cwd=repo)
+    wt = tmp_path / "wt"
+    assert gg.git("worktree", "add", "-q", str(wt), cwd=repo).rc == 0
+    gg.trust(repo)
+    _inherits(gg, wt, repo)
+    assert gg.run("git", "commit", "-q", "--allow-empty", "-m", "in wt", cwd=wt).rc == 0
+    assert not gg.check(repo).blocked
+
+
+# --------------------------------- [155] the pointers a `git worktree` command writes
+def _silent(gg: GG, repo: Path, *cmd: str) -> None:
+    """The `git worktree` command runs, says it updated the reference, and
+    the next command has nothing to ask."""
+    r = gg.run("git", *cmd, cwd=repo)
+    assert r.rc == 0 and "reference updated" in r.err and "✗" not in r.err, r.text
+    c = gg.check(repo)
+    assert not c.blocked, c.text
+
+
+@pytest.mark.parametrize("where", ["outside", "inside"])
+def test_worktree_commands_through_gitguard_ask_nothing(gg: GG, repo: Path, tmp_path: Path,
+                                                        where: str) -> None:
+    """[155] `worktree add` writes `worktrees/<id>/commondir` and `gitdir`,
+    `move` rewrites the second, `remove` and `prune` delete both: every one
+    was asked about at the next command, and the new tree was "never
+    trusted". Run through gitguard on a repository in its trusted state,
+    the command's own pointers are accepted, and the tree takes the main
+    tree's trust ([154]). Outside the tree, or inside it (`.claude/
+    worktrees/x`, where agents put theirs)."""
+    base = tmp_path if where == "outside" else repo / ".claude/worktrees"
+    wt, wt2 = base / "x", base / "y"
+    _silent(gg, repo, "worktree", "add", "-q", str(wt))
+    r = gg.run("git", "status", "--short", cwd=wt)
+    assert r.rc == 0 and f"trusted with {repo}" in r.err, r.text
+    _silent(gg, repo, "worktree", "add", "-q", "-b", "other", str(base / "z"))
+    _silent(gg, repo, "worktree", "move", str(wt), str(wt2))
+    r = gg.run("git", "status", "--short", cwd=wt2)
+    assert r.rc == 0 and f"trusted with {repo}" in r.err, r.text
+    _silent(gg, repo, "worktree", "remove", str(wt2))
+    import shutil
+    shutil.rmtree(base / "z")
+    _silent(gg, repo, "worktree", "prune")
+    assert not (repo / ".git/worktrees").exists()
+
+
+def test_worktree_add_with_a_tracking_branch_asks_nothing(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[155] `worktree add -b feat <path> origin/main` also writes the
+    branch's tracking into `config`, the auto-accepted change of `checkout
+    -b`: one command, both accepted."""
+    hub = tmp_path / "hub.git"
+    gg.git("init", "-q", "--bare", str(hub))
+    gg.git("remote", "add", "origin", str(hub), cwd=repo)
+    gg.git("push", "-q", "origin", "main", cwd=repo)
+    gg.trust(repo)
+    wt = tmp_path / "wt"
+    _silent(gg, repo, "worktree", "add", "-q", "-b", "feat", str(wt), "origin/main")
+    assert "feat" in gg.git("config", "--get-regexp", r"^branch\.", cwd=repo).out

@@ -464,10 +464,11 @@ rewrites under a lock. The rule used to be the suffix `*.lock` at any
 depth, and `hooks/pre-commit.d/x.lock` escaped the fingerprint ([144]):
 every exclusion is anchored, this one too.
 An unknown file or directory is
-therefore watched. Accepted consequence: `remote add`, `worktree add`,
-`submodule add` require a `trust` (they change `config` or the structure) —
-`push -u` / `branch -u` too, but that precise case is accepted on its own in
-exec mode (see "Exec-mode shortcuts"); commit, checkout, merge, rebase,
+therefore watched. Accepted consequence: `remote add` to a local path,
+`submodule add`, `submodule update --init` require a `trust` (they change
+`config` or the structure) — `push -u` / `branch -u` too, and `worktree
+add`, but those precise cases are accepted on their own in exec mode (see
+"Exec-mode shortcuts"); commit, checkout, merge, rebase,
 stash, bisect, notes, gc, repack, fsck do not alert. On a false positive for
 an ordinary git operation, **add the file to the exclusion list**, never go
 back to an inclusion list.
@@ -892,6 +893,51 @@ option puts it. A clone or init run by a child git (pre-commit, a hook)
 is the user's: same rules, unless the marker already covers the new
 repository (`submodule add`'s clone into `modules/<x>`, [107]).
 
+## Trusted with the repository that holds the gitdir
+
+A submodule's gitdir is `<super>/.git/modules/<x>`, a linked worktree's
+`<main>/.git/worktrees/<id>`: the walk of the holding repository descends
+both (`gitdir_roots`), and its scan reads their config against their own
+tree ([39] [68] [125]). Whoever trusted the holder — `gitguard trust`, a
+`y`, the auto-trust of `clone --recurse-submodules` — trusted every byte a
+check run from that tree would hash; such a check found no reference under
+the tree's own key all the same and died "never trusted", one `gitguard
+trust` per submodule and per worktree, typed blind ([154]). `trust_holder`
+is the marker's rule for a child git (`Judged.covers`, "Nested
+repositories") held to the holder's **reference** instead of to a live
+command. A tree never trusted takes the holder's trust, says so (`trusted
+with <holder>: <tree>`) and from then on has its own reference, when:
+
+- the holder — the nearest directory named `.git` above the gitdir — is
+  **in its trusted state**, checked at that moment as a command run there
+  would be. Inclusion alone is blind to a removal: a file the tree's
+  config named and that went missing is one entry less on the tree's
+  side, and a difference on the holder's;
+- **the gitdir names the tree back**: `worktrees/<id>/gitdir`, or the
+  submodule's `core.worktree`, both in the holder's reference. A copy of a
+  trusted gitfile planted in another directory (`src/.git`) reaches the
+  same gitdir, and every file it watches is in the reference: git run from
+  there would work on another HEAD and another index, silently;
+- **every watched file is in the holder's reference**, same content and
+  mode, at the same absolute path — or, for what the config names in a
+  linked worktree's tree (a relative `core.hooksPath` resolves there,
+  [120]), the same content at the same place in the holder's tree: the
+  hooks of the commit both have checked out, not another branch's. The
+  tree's own structure (its gitfile, `.gitmodules`, the gitfiles of its
+  submodules) is not asked of the holder: no config names it ([125]),
+  `check_structure` judged it.
+
+Nothing is taken under `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or
+`GIT_INDEX_FILE` (the tree git works in is not the one the gitdir names,
+[72]), from a holder whose gitdir is not `<tree>/.git` (`--separate-git-
+dir`), nor by a submodule of a linked worktree from that worktree's own
+reference (the nearest `.git` is the main repository's): those are trusted
+by hand, as before. A worktree created by something gitguard did not run
+inherits once the holder's reference holds its `worktrees/<id>`, that is
+once the question it raises there is answered; one gitguard ran itself has
+it there already (next section, [155]). The cost is one inspection of the
+holder, paid once per tree, on the path that used to refuse.
+
 ## Exec-mode shortcuts: auto-accept, prompt, pending
 
 When `gitguard git …` finds a deviation from the reference, three shortcuts
@@ -926,6 +972,36 @@ before refusing (`check_or_die`, `interactive=True` only in exec mode;
    without a demonstration that the key cannot execute anything
    (`branch.x.rebase`, `remote.*.url`, a lone comment: refused → prompt). A `config` that differs only by comments
    is not accepted either (empty delta = not for us).
+   **The pointers of a `git worktree` command** (`WORKTREE_WRITES`,
+   `worktree_pointers`, `accept_worktree_pointers`, [155]). `worktree add`
+   writes `worktrees/<id>/commondir` and `gitdir`, `move` rewrites the
+   second, `remove` and `prune` delete both. Both are hashed — the first
+   says where the worktree's config is, the second where its tree is — so
+   each of these commands raised a question at the next one, and a second
+   `worktree add` in a row was asked about the first; with no terminal (an
+   agent's harness, an IDE) that is a wait and a refusal. Here the
+   acceptance is tied to **the command gitguard runs**, not to the state
+   found: for those four subcommands, in the main repository, on a
+   reference just found current, gitguard waits for git as it does for a
+   clone and looks at what moved. Accepted when the difference is that
+   command's own — `add`: one worktree, both pointers new; `move`: one,
+   `gitdir` rewritten; `remove`: one gone; `prune`: some gone, the
+   directory `worktrees/<id>` with them — when `commondir` is git's
+   `../..` and `gitdir` an absolute `<tree>/.git` whose gitfile names the
+   same `worktrees/<id>` back, and when anything else that moved is the
+   branch tracking above (`add -b x <path> origin/main`). Otherwise
+   nothing is recorded and the next command shows it all: a file the
+   sandbox wrote meanwhile, a second worktree, a pointer that is not
+   git's. The same pointers written by any other git (the sandbox's, an
+   IDE's bundled one) are shown and asked, as before: accepted by their
+   shape alone, a worktree planted in a directory of the tree
+   (`src/.git`) would move whoever works there to another HEAD and index;
+   and a pointer naming a tree that does not point back is what `git
+   worktree repair` "repairs" — replayed on git 2.54, it rewrote the
+   gitfile of another repository's worktree, outside the volume, to the
+   planted gitdir. Not from a linked worktree (the pointers land under
+   two references, this worktree's and the main tree's), nor for an
+   alias or a child git: asked at the next command, as before.
 2. **Question on the terminal** (`ask_on_tty`): the diff is shown as before,
    then "Trust this state and run git? [y/N]". Read and written on
    **`/dev/tty`**, never on stdin: git will consume stdin (`apply < patch`,
@@ -1673,10 +1749,22 @@ the files, not the order.
   writes the dangling blobs' content there by opening each path, through
   a symlink a sandbox would plant (a volatile directory is not checked for
   symlinks below two levels); `git --git-dir=<repo>/.git …` from another
-  directory, or a new `git worktree add`, is another tree, hence another
-  trust key ([72]); a transient `-c core.sshCommand='ssh -i <key>'` names
+  directory is another tree, hence another trust key ([72]) — a linked
+  worktree too, which takes the main tree's trust on its own ([154]
+  [155]); a transient `-c core.sshCommand='ssh -i <key>'` names
   a file, which joins the fingerprint of that command ([48]) and leaves it
-  at the next one without the `-c`.
+  at the next one without the `-c`: one question each way, at every
+  alternation. Only for a file the user can rewrite (`_replaceable`):
+  `-c core.editor=/usr/bin/vim` is silent. The frequent case is `gh`,
+  which passes `-c credential.helper='!"<gh>" auth git-credential'` to
+  every git it runs over the network; installed by Homebrew, `<gh>` is
+  the user's. Making the setting permanent (`gh auth setup-git`, an
+  `IdentityFile` in `~/.ssh/config`) puts the file in the fingerprint of
+  every command: asked once per repository, then silent, with or without
+  the `-c` (replayed 2026-11-12). Keeping the files a command's own
+  config names apart in the reference would remove the alternation; not
+  done — it changes the comparison every check rests on, for a case one
+  command settles.
 - A `-c`/`--config-env` given to a git that gitguard did not wrap (hook,
   IDE) is invisible — an alias's own `-c` is read ([80]); the one of the wrapped command and the
   environment are read ([48]). Same for the repository-local variables
@@ -1721,7 +1809,7 @@ the files, not the order.
 - A context without a terminal and without a desktop session (ssh, cron,
   systemd) gets no notification: the record is written, the wait times out,
   `gitguard pending` shows it later. A script runs `gitguard trust` after
-  its `remote add`/`worktree add`, or uses the real git if the repository is
+  its `submodule add`, or uses the real git if the repository is
   not exposed to a sandbox.
 - `caller_chain` is informational: it says which program to look at, never
   decides anything.

@@ -242,9 +242,13 @@ or the target already held a gitdir, in which case it says so).
 ## Day to day
 
 Commit, checkout, merge, rebase, stash, bisect and gc touch only volatile
-files: nothing to do. `worktree add`, `submodule add` and `submodule update
---init` write to the gitdir: the next command asks once. When a command
-finds the repository changed, one of three things happens.
+files: nothing to do. `submodule add` and `submodule update --init` write
+to the gitdir: the next command asks once. `git worktree add`, `move`,
+`remove` and `prune` run through gitguard ask nothing (a worktree created
+by another git, an IDE's bundled one, is asked about once). A submodule or
+a linked worktree needs no trust of its own: the first git run there takes
+the trust of the repository that holds it, and says so (`trusted with …`).
+When a command finds the repository changed, one of three things happens.
 
 `git --version` is never checked: it reads no repository, and the tools
 that run it first (lazygit, fugitive) took a refusal for an old git.
@@ -328,6 +332,34 @@ a blocklist of dangerous ones: nothing enters it without a demonstration
 that the key cannot make git execute anything. Since git writes these
 lines *after* the check (`push -u` runs, then records the tracking), it is
 the next command that accepts them.
+
+One more thing is accepted without a question, on other grounds: the two
+pointers `git worktree add`, `move`, `remove` and `prune` write under
+`.git/worktrees/`, when gitguard ran that command itself, in the main
+repository, on a state it had just found trusted, and nothing else moved
+meanwhile. The same files written by anything else are shown and asked.
+
+### `gh`, `ssh -i`: a `-c` that names a file
+
+A setting given on the command line (`git -c key=value …`) that names a
+file you can rewrite puts that file in the fingerprint of that command
+only. The command with the `-c` asks about the file ("added"), the next
+one without it asks again ("removed"), and so on at every alternation.
+
+`gh` does exactly that: every git it runs over the network gets `-c
+credential.helper='!"/opt/homebrew/bin/gh" auth git-credential'`, and a
+Homebrew install belongs to you (a `gh` from a distribution package,
+owned by root, is silent). Make the setting permanent and the file is in
+every command's fingerprint: one question per repository, then nothing,
+with or without `gh`.
+
+```sh
+gh auth setup-git
+```
+
+Same for a script that runs `git -c core.sshCommand='ssh -i ~/.ssh/deploy'
+…`: name the key in `~/.ssh/config` (`IdentityFile`) instead, or set
+`core.sshCommand` in the repository's config once.
 
 Tried on Debian with the system-wide install, on a repository modified
 behind the user's back: starship, oh-my-zsh, fish and `__git_ps1` prompts

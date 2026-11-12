@@ -919,3 +919,44 @@ def test_notes_merge_reads_what_stays_an_entry(gg: GG, repo: Path, tmp_path: Pat
     assert mark.exists(), "invalid control: no clean filter on a note any more"
     assert gg.git("notes", "show", other, cwd=repo).out == "key\n", \
         "invalid control: a symlinked note is no longer read through"
+
+
+# ===================== the pointers a `git worktree` command writes ([155])
+@pytest.mark.parametrize("sub", sorted(gg_mod.WORKTREE_WRITES))
+def test_worktree_command_writes_its_pointers_and_nothing_else(gg: GG, repo: Path, tmp_path: Path,
+                                                               sub: str) -> None:
+    """What gitguard accepts after a `git worktree <sub>` it ran, held to the
+    git under test: the fingerprint moves by `worktrees/<id>/commondir` and
+    `gitdir` only, in the shape WORKTREE_WRITES gives the subcommand, and
+    with the bytes worktree_pointers asks for."""
+    import shutil
+    wt, w2 = tmp_path / "wt", tmp_path / "w2"
+    assert gg.git("worktree", "add", "-q", str(wt), cwd=repo).rc == 0
+    gg.trust(repo)
+    argv = {"add": ["add", "-q", str(w2)], "move": ["move", str(wt), str(w2)],
+            "remove": ["remove", str(wt)], "prune": ["prune"]}[sub]
+    if sub == "prune":
+        shutil.rmtree(wt)
+    assert gg.git("worktree", *argv, cwd=repo).rc == 0
+    moved = sorted(l.split() for l in gg.check(repo).err.splitlines()
+                   if re.match(r"\s+(added|removed|modified)\s", l))
+    gone = [["removed", "worktrees/wt/commondir"], ["removed", "worktrees/wt/gitdir"]]
+    assert moved == {"add": [["added", "worktrees/w2/commondir"], ["added", "worktrees/w2/gitdir"]],
+                     "move": [["modified", "worktrees/wt/gitdir"]],
+                     "remove": gone, "prune": gone}[sub]
+    if sub in ("add", "move"):
+        adm = repo / ".git/worktrees" / ("w2" if sub == "add" else "wt")
+        assert (adm / "commondir").read_bytes() == b"../..\n"
+        text = (adm / "gitdir").read_text()
+        assert text.endswith("/.git\n") and Path(text[:-1]).resolve() == (w2 / ".git").resolve(), text
+        assert (w2 / ".git").read_text().rstrip("\n") == f"gitdir: {adm.resolve()}"
+    else:
+        assert not (repo / ".git/worktrees/wt").exists()
+
+
+def test_worktree_subcommand_is_spelt_in_full(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """WORKTREE_WRITES is matched on the whole word: git takes no prefix of
+    a `worktree` subcommand, and none comes after an option."""
+    for argv in (["worktree", "ad", str(tmp_path / "a")], ["worktree", "-q", "add", str(tmp_path / "b")]):
+        assert gg.git(*argv, cwd=repo).rc != 0, argv
+    assert not (repo / ".git/worktrees").exists()

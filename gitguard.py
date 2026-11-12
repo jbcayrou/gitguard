@@ -52,7 +52,7 @@ import shlex
 import stat
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from functools import cached_property
 from pathlib import Path
 
@@ -4541,7 +4541,7 @@ def keep_attached(args: list[str], orig: Path) -> list[str]:
 
 
 def run_git(args: list[str], orig: Path, newrepo: NewRepo | None, git: str,
-            judged: Judged | None = None) -> int:
+            judged: Judged | None = None, after: Callable[[], None] | None = None) -> int:
     """Run the real git. A clone/init is waited for and the new repository
     trusted (Auto-trust), by a child git too (pre-commit's cache, a hook's
     clone [107]) — unless the marker already covers it: `submodule add`'s
@@ -4552,9 +4552,20 @@ def run_git(args: list[str], orig: Path, newrepo: NewRepo | None, git: str,
     pin_config_env()
     if judged is not None:
         args = keep_attached(args, orig)
-    if newrepo is None:
+    if newrepo is None and after is None:
         os.execv(git, [git, *args])
     import subprocess
+    if newrepo is None:
+        # Waited for, like a clone: what the command wrote is looked at once
+        # it is done (`git worktree add`, [155]). Its exit status is git's;
+        # a refusal there leaves the reference as it was.
+        rc = subprocess.call([git, *args])
+        if rc == 0:
+            try:
+                after()
+            except Refuse:
+                pass
+        return rc
     d = newrepo.dir
     # A gitdir already there is reinitialised, its hooks and config kept:
     # `<dir>/.git`, or the `--separate-git-dir` target. [113]
@@ -4570,7 +4581,7 @@ def run_git(args: list[str], orig: Path, newrepo: NewRepo | None, git: str,
             # The new repository, whatever the environment designates: a
             # child's GIT_DIR is its parent's (git exports it to `submodule
             # add`'s clone), and open_repo would have judged the superproject.
-            for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"):
+            for k in REPO_ENV:
                 os.environ.pop(k, None)
             try:
                 insp = inspect(open_repo(d))
@@ -4687,6 +4698,95 @@ def auto_accept(repo: Repo, key: Path, old: Manifest, new: dict) -> list[str]:
                                 parse_git_config(scope_base(repo, scope) / "config"))
 
 
+# `git worktree <sub>` that write a linked worktree's two pointers,
+# `worktrees/<id>/commondir` and `gitdir`, and what each does to them: the
+# kind of change, and whether exactly one worktree is concerned. Both are
+# hashed — the first says where the worktree's config is, the second where
+# its tree is — so each of these commands was asked about at the next one,
+# and the new tree was "never trusted". Run by gitguard on a repository in
+# its trusted state, their own pointers are accepted (worktree_pointers);
+# written by anything else, they are shown, as before. A closed list, each
+# entry held to git (tests/test_claims.py); the subcommand is the first
+# word after `worktree`, in full. [155]
+WORKTREE_WRITES = {"add": ("added", True), "move": ("moved", True),
+                   "remove": ("removed", True), "prune": ("removed", False)}
+_WORKTREE_POINTER = re.compile(r"^worktrees/([^/]+)/(?:commondir|gitdir)$")
+
+
+def worktree_pointers(repo: Repo, sub: str, old: dict, new: dict) -> tuple[dict, list[str]] | None:
+    """(`old` with the worktree pointers of `new`, the worktrees concerned)
+    when those pointers changed as `git worktree <sub>` changes them, and
+    are what git writes; None otherwise. Any other difference is left in
+    place, for auto_accept (`add -b x <path> origin/main` writes the
+    branch's tracking) or for the next command.
+
+    - added, moved: `commondir` is `../..`, git's bytes, and `gitdir` an
+      absolute `<tree>/.git` whose gitfile names this `worktrees/<id>`
+      back. What was hashed is what is read here (the sha). A pointer to a
+      tree that does not point back is what `git worktree repair`
+      "repairs": it rewrote the gitfile of another repository's worktree,
+      outside the volume, to this gitdir.
+    - removed: the directory `worktrees/<id>` is gone, not one file of it.
+    - the shape of WORKTREE_WRITES: `add` adds one worktree, `move`
+      repoints one, `remove` removes one, `prune` removes some; a second
+      one that appeared meanwhile is nobody's command. [155]"""
+    kind, one = WORKTREE_WRITES[sub]
+    ids = sorted({m.group(1) for _, (scope, path) in changes(old, new)
+                  if scope == "local" and (m := _WORKTREE_POINTER.match(path))})
+    if not ids or (one and len(ids) != 1):
+        return None
+    out = dict(old)
+    for name in ids:
+        adm = repo.gitdir / "worktrees" / name
+        keys = [("local", f"worktrees/{name}/{f}") for f in ("commondir", "gitdir")]
+        was, now = [k in old for k in keys], [k in new for k in keys]
+        for k in keys:
+            out.pop(k, None)
+            if k in new:
+                out[k] = new[k]
+        if not any(now):
+            if kind != "removed" or os.path.lexists(adm):
+                return None
+            continue
+        if not all(now) or was != [kind == "moved"] * 2:
+            return None
+        c, g = new[keys[0]], new[keys[1]]
+        if kind == "moved" and c != old[keys[0]]:
+            return None
+        try:
+            raw = read_file(adm / "gitdir")
+            back = Path(raw.rstrip(b"\r\n").decode(errors="surrogateescape"))
+            if (c.kind, c.sha) != ("f", hashlib.sha256(b"../..\n").hexdigest()) \
+                    or (g.kind, g.sha) != ("f", hashlib.sha256(raw).hexdigest()) \
+                    or b"\0" in raw or not back.is_absolute() or back.name != ".git" \
+                    or read_gitfile(back) != adm.resolve():
+                return None
+        except (Refuse, OSError):
+            return None
+    return out, ids
+
+
+def accept_worktree_pointers(repo: Repo, key: Path, sub: str) -> None:
+    """After a `git worktree <sub>` gitguard ran itself on a repository in
+    its trusted state: when the fingerprint moved by that command's
+    pointers (worktree_pointers) and at most by the branch tracking `add`
+    writes (auto_accept), the state is the reference. Anything else, and
+    nothing is recorded: the next command shows it all. [155]"""
+    old = load_manifest(key)
+    if old is None or not old.current:
+        return
+    insp = inspect(open_repo(repo.label))
+    moved = worktree_pointers(insp.repo, sub, old.entries, insp.new)
+    if moved is None:
+        return
+    mid, names = moved
+    if mid != insp.new and not auto_accept(insp.repo, key, Manifest(old.version, old.root, old.refs, mid),
+                                           insp.new):
+        return
+    save_trust(insp.repo, insp.refs, insp.new)
+    info(f"worktree {', '.join(names)} ({WORKTREE_WRITES[sub][0]}) → reference updated")
+
+
 def ask_on_tty(question: str) -> bool:
     """Ask the question on /dev/tty — never on stdin, which git will consume
     (`git apply < patch`, `commit -F -`, `update-index --stdin`). False when
@@ -4742,6 +4842,77 @@ def can_ask() -> bool:
 
 
 # --------------------------------------------------------------------- main
+# git's variables that take the gitdir, the tree, the common dir or the
+# index from somewhere else than the directory git runs in.
+REPO_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")
+
+
+def trust_holder(insp: Inspection) -> Path | None:
+    """The repository whose trust a tree never trusted takes, or None: the
+    one whose `.git` holds its gitdir — a submodule's `modules/<x>`, a
+    linked worktree's `worktrees/<id>`. The user trusted every byte of
+    such a tree with that repository (its walk descends those roots,
+    gitdir_roots; its scan reads their config against their tree, [39]
+    [68] [125]), and a git run from the tree died "never trusted" all the
+    same, until a `gitguard trust` in each submodule and each worktree.
+    The marker's rule for a child git (Judged.covers), held to the
+    reference instead of to a live command. Taken when:
+
+    - the holder is in its trusted state, checked now, as a command run
+      there would: a file this tree's config named and that went missing
+      is a difference there, and is none here (one entry less);
+    - the gitdir names this tree back — a worktree's `gitdir` file, a
+      submodule's `core.worktree`, both in the holder's reference. A copy
+      of the gitfile planted elsewhere (`src/.git`) reaches the same
+      gitdir: git run there would work on another HEAD and index, unseen;
+    - every file this tree's check watches is in the holder's reference,
+      same bytes, same mode — or, for what the config names in a linked
+      worktree's tree (a relative hooksPath resolves there, [120]), the
+      same content at the same place in the holder's tree. Not the
+      tree's own structure (`.gitmodules`, the gitfiles): named by
+      nobody ([125]), checked by check_structure, which ran.
+
+    Never under REPO_ENV: the tree git works in is then not the one the
+    gitdir names ([72]). The nearest `.git` above the gitdir, nothing
+    else: a superproject with a separate gitdir, a submodule of a linked
+    worktree seen from that worktree are trusted by hand, as before. [154]"""
+    repo = insp.repo
+    if any(os.environ.get(k) for k in REPO_ENV):
+        return None
+    top = next((a for a in repo.gitdir.parents if a.name == ".git"), None)
+    if top is None:
+        return None
+    try:
+        holder = open_repo(top.parent)
+        if holder.gitdir != top:
+            return None
+        old = load_manifest(holder.key)
+        if old is None or not old.current or inspect(holder).new != old.entries:
+            return None
+        if repo.gitdir != repo.common:
+            back = Path(_read_path_file(repo.gitdir / "gitdir"))
+            back = back if back.is_absolute() else repo.gitdir / back
+            named = back.parent.resolve() if back.name == ".git" else None
+        else:
+            named = _core_worktree(repo.gitdir, repo.common, False)
+    except (Refuse, OSError):            # a holder git refuses, no `gitdir` file
+        return None
+    if named != repo.label:
+        return None
+    blessed = {scope_base(holder, scope) / rel: e for (scope, rel), e in old.entries.items()}
+
+    def same(a: Entry | None, b: Entry) -> bool:
+        return a is not None and (a.kind, a.mode, a.sha) == (b.kind, b.mode, b.sha)
+    for (scope, rel), e in insp.new.items():
+        p = scope_base(repo, scope) / rel
+        if p in insp.scan.structure or same(blessed.get(p), e):
+            continue
+        if scope == "wt" and repo.common == holder.gitdir and same(old.entries.get(("wt", rel)), e):
+            continue
+        return None
+    return holder.label
+
+
 def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
                  refs: list[tuple[str, Path]], interactive: bool = False) -> None:
     """Refuse if the repository is not in the trusted state. In exec mode
@@ -5390,6 +5561,15 @@ def main(argv: list[str]) -> int:
         return 0
 
     try:
+        if old is None:
+            # A submodule, a linked worktree: trusted with the repository
+            # that holds its gitdir, then judged under its own reference. [154]
+            holder = trust_holder(insp)
+            if holder is not None:
+                save_trust(repo, refs, new)
+                clear_pending(key)
+                info(f"trusted with {holder}: {repo.label}")
+                old = load_manifest(key)
         # A child never asks, waits, auto-accepts or notifies: it shares the
         # parent's terminal, which the parent git may be reading, and nobody
         # is left waiting on it. It refuses at once and records.
@@ -5402,7 +5582,14 @@ def main(argv: list[str]) -> int:
         raise
     if mode == "exec":
         set_judged("repo", str(repo.gitdir), str(repo.common), str(repo.root), str(repo.label))
-        return run_git(argv, orig, newrepo, git, judged)
+        after = None
+        rest = _COMMAND or []
+        if (judged is None and repo.gitdir == repo.common and rest[:1] == ["worktree"]
+                and rest[1:2] and rest[1] in WORKTREE_WRITES):
+            # The main repository, judged here and now in its trusted
+            # state: the pointers this command writes are its own. [155]
+            after = lambda: accept_worktree_pointers(repo, key, rest[1])
+        return run_git(argv, orig, newrepo, git, judged, after)
     return 0
 
 if __name__ == "__main__":

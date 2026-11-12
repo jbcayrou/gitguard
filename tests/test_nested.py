@@ -11,6 +11,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import pytest
+
 from tests.conftest import GG, write_exec
 from tests.test_attacks import assert_blocked_now
 
@@ -108,3 +110,168 @@ def test_undeclared_nested_repo_without_gitlink_is_invisible(gg: GG, repo: Path)
     assert not gg.check(repo).blocked
     gg.env["GITGUARD_SCAN_TREE"] = "1"
     assert not gg.check(repo).blocked
+
+
+# ---------------------------------------------- [154] what a tree does not inherit
+# A submodule or a linked worktree takes the trust of the repository whose
+# `.git` holds its gitdir when that repository is in its trusted state and
+# every file the tree's own check watches is in its reference. Each test is
+# one way of not being there: the tree stays "never trusted".
+def _sub(gg: GG, repo: Path, tmp_path: Path) -> Path:
+    from tests.attacks._helpers import add_submodule
+    sub = add_submodule(gg, repo, tmp_path)
+    gg.trust(repo)
+    return sub
+
+
+def _refused(gg: GG, tree: Path) -> None:
+    r = gg.run("git", "status", "--short", cwd=tree)
+    assert r.blocked and "never trusted" in r.err and "trusted with" not in r.err, r.text
+    assert not gg.key_for(tree).is_file()
+
+
+def test_no_inheritance_from_a_changed_superproject(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """The sandbox rewrites the submodule's config after the trust: the
+    superproject is not in its trusted state, nothing is inherited — the
+    diff is the superproject's to show."""
+    sub = _sub(gg, repo, tmp_path)
+    gg.git("config", "core.pager", "sh evil.sh", cwd=sub)
+    _refused(gg, sub)
+    r = gg.check(repo)
+    assert r.blocked and "modules/sub/config" in r.err, r.text
+
+
+def test_no_inheritance_when_a_named_file_went_missing(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """A file the submodule's config names in its tree is gone: nothing of
+    the submodule's own fingerprint differs from the reference (one entry
+    less), the superproject's does."""
+    from tests.attacks._helpers import add_submodule
+    sub = add_submodule(gg, repo, tmp_path)
+    gg.git("config", "core.hooksPath", ".hk", cwd=sub)
+    write_exec(sub / ".hk/pre-push", "#!/bin/sh\nexit 0\n")
+    gg.trust(repo)
+    (sub / ".hk/pre-push").unlink()
+    _refused(gg, sub)
+
+
+def test_no_inheritance_from_a_superproject_never_trusted(gg: GG, repo: Path, tmp_path: Path) -> None:
+    sub = _sub(gg, repo, tmp_path)
+    assert gg.run("forget", str(repo)).rc == 0
+    _refused(gg, sub)
+
+
+def test_no_inheritance_under_a_redirecting_environment(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """`GIT_WORK_TREE`, `GIT_DIR`…: the tree git works in is not the one
+    the gitdir names; judged by hand, as before ([72])."""
+    sub = _sub(gg, repo, tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    gg.env["GIT_WORK_TREE"] = str(other)
+    r = gg.run("git", "status", "--short", cwd=sub)
+    assert r.blocked and "never trusted" in r.err, r.text
+
+
+def test_no_inheritance_for_a_worktree_the_main_tree_has_not_seen(gg: GG, repo: Path,
+                                                                 tmp_path: Path) -> None:
+    """`worktree add` by something gitguard did not run: its `worktrees/<id>`
+    is not in the main tree's reference yet."""
+    wt = tmp_path / "wt"
+    assert gg.git("worktree", "add", "-q", str(wt), cwd=repo).rc == 0
+    _refused(gg, wt)
+
+
+def test_no_inheritance_when_the_worktree_hook_differs(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """A relative `core.hooksPath` resolves in the worktree's own tree
+    ([120]): another branch's hooks, or the sandbox's, were shown to
+    nobody."""
+    gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
+    write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    gg.git("add", "-A", cwd=repo)
+    gg.git("commit", "-qm", "hooks", cwd=repo)
+    wt = tmp_path / "wt"
+    assert gg.git("worktree", "add", "-q", str(wt), cwd=repo).rc == 0
+    gg.trust(repo)
+    write_exec(wt / ".githooks/pre-commit", "#!/bin/sh\necho other\n")
+    _refused(gg, wt)
+    write_exec(wt / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    write_exec(wt / ".githooks/post-checkout", "#!/bin/sh\necho new\n")
+    _refused(gg, wt)
+
+
+# ------------------------------- [155] what a `git worktree` command does not get accepted
+def _hooked_add(gg: GG, repo: Path, tmp_path: Path, hook: str) -> Path:
+    """`worktree add` through gitguard while something else writes into the
+    gitdir: a trusted post-checkout hook stands for the sandbox, running in
+    the new worktree before the command returns."""
+    write_exec(repo / ".git/hooks/post-checkout", "#!/bin/sh\n" + hook)
+    gg.trust(repo)
+    wt = tmp_path / "wt"
+    r = gg.run("git", "worktree", "add", "-q", str(wt), cwd=repo)
+    assert r.rc == 0 and "reference updated" not in r.err, r.text
+    return wt
+
+
+def test_worktree_add_accepts_nothing_else_written_meanwhile(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """Another file of the gitdir changed during the command: nothing is
+    accepted, the next command shows the pointers and the rest."""
+    wt = _hooked_add(gg, repo, tmp_path, f"echo '#!/bin/sh' > '{repo}/.git/hooks/pre-commit'\n")
+    r = gg.check(repo)
+    assert r.blocked and "hooks/pre-commit" in r.err and "worktrees/wt/gitdir" in r.err, r.text
+    assert gg.run("git", "status", "--short", cwd=wt).blocked
+
+
+def test_worktree_add_accepts_one_worktree(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """A second worktree planted during the command, pointers and gitfile
+    consistent: `add` writes one."""
+    adm = repo / ".git/worktrees/evil"
+    _hooked_add(gg, repo, tmp_path,
+                f"mkdir -p '{adm}' '{repo}/src' && echo 'ref: refs/heads/main' > '{adm}/HEAD' && "
+                f"echo ../.. > '{adm}/commondir' && echo '{repo}/src/.git' > '{adm}/gitdir' && "
+                f"echo 'gitdir: {adm}' > '{repo}/src/.git'\n")
+    r = gg.check(repo)
+    assert r.blocked and "worktrees/evil/gitdir" in r.err, r.text
+    assert gg.run("git", "status", "--short", cwd=repo / "src").blocked
+
+
+@pytest.mark.parametrize("pointer, content", [
+    ("gitdir", "{repo}/src/.git"),             # a tree whose gitfile does not point back
+    ("gitdir", "{repo}/src"),                  # not a `.git`
+    ("gitdir", "../../../../wt/.git"),         # relative: not what git writes without the extension
+    ("commondir", "../../"),                   # git reads the same directory; not git's bytes
+    ("commondir", "{repo}/.git"),
+])
+def test_worktree_add_accepts_only_what_git_writes(gg: GG, repo: Path, tmp_path: Path,
+                                                   pointer: str, content: str) -> None:
+    """The pointers of the new worktree rewritten during the command."""
+    (repo / "src").mkdir()
+    value = content.format(repo=repo)
+    _hooked_add(gg, repo, tmp_path, f"printf '%s\\n' '{value}' > '{repo}/.git/worktrees/wt/{pointer}'\n")
+    r = gg.check(repo)
+    assert r.blocked and "worktrees/wt/gitdir" in r.err, r.text
+
+
+def test_worktree_command_on_a_changed_repository_is_asked_first(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """Not in its trusted state: the command does not run, as any other."""
+    write_exec(repo / ".git/hooks/pre-commit")
+    r = gg.run("git", "worktree", "add", "-q", str(tmp_path / "wt"), cwd=repo)
+    assert r.blocked and not (tmp_path / "wt").exists(), r.text
+
+
+def test_worktree_add_by_another_git_is_still_asked(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """The same pointers, written by a git gitguard did not run (the
+    sandbox's, an IDE's bundled one): shown, asked."""
+    assert gg.git("worktree", "add", "-q", str(tmp_path / "wt"), cwd=repo).rc == 0
+    r = gg.run("git", "status", "--short", cwd=repo)
+    assert r.blocked and "worktrees/wt/commondir" in r.err, r.text
+
+
+def test_worktree_add_from_a_linked_worktree_is_still_asked(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """Run from a linked worktree, the pointers land in the main
+    repository's gitdir, under two references (this worktree's, the main
+    tree's): left to the next command of each."""
+    w1 = tmp_path / "w1"
+    assert gg.run("git", "worktree", "add", "-q", str(w1), cwd=repo).rc == 0
+    assert gg.run("git", "status", "--short", cwd=w1).rc == 0
+    r = gg.run("git", "worktree", "add", "-q", str(tmp_path / "w2"), cwd=w1)
+    assert r.rc == 0 and "reference updated" not in r.err, r.text
+    assert gg.check(repo).blocked and gg.check(w1).blocked

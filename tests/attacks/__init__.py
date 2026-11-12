@@ -1154,6 +1154,48 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      under `extensions.compatObjectFormat` (experimental), rewritten
      with every object — every commit there was asked about; volatile,
      part of the object store.
+[154] False positive: a git run from a submodule or from a linked
+     worktree died "repository never trusted" although the repository
+     that holds its gitdir was trusted — `clone --recurse-submodules`
+     auto-trusted it, `gitguard trust` showed it — and every file the
+     tree's own check watches was in that reference: the walk descends
+     `modules/<x>` and `worktrees/<id>`, the scan reads their config
+     against their tree ([39] [68] [125]). One `gitguard trust` in each
+     submodule and each worktree, typed blind. Found by the fourth
+     agentic audit, 2026-11-03; measured 2026-11-12: the 33 entries of a
+     submodule's fingerprint are in the superproject's, a linked
+     worktree's all but its own gitfile. Fix: trust_holder — a tree never
+     trusted takes the trust of the repository whose `.git` holds its
+     gitdir when that repository is in its trusted state, the gitdir
+     names the tree back (a worktree's `gitdir` file, a submodule's
+     `core.worktree`) and every watched file is in the reference, or, for
+     what the config names in a linked worktree's tree, the same content
+     at the same place; it then has its own reference. What takes
+     nothing: a copy of a trusted gitfile planted in another directory
+     (git there would work on another HEAD and index, unseen), a gitdir
+     planted in a volatile zone, a tree whose hooks are not the trusted
+     ones, a holder that changed, anything under GIT_DIR or GIT_WORK_TREE
+     (tests/attacks/nested.py, tests/test_nested.py).
+[155] False positive: `git worktree add` writes `worktrees/<id>/commondir`
+     and `gitdir`, `move` rewrites the second, `remove` and `prune` delete
+     both; hashed, each raised a question at the next command (a second
+     `worktree add` in a row was asked about the first), and with no
+     terminal — an agent's harness creating a worktree per task — a wait
+     and a refusal. Found by the fourth agentic audit, 2026-11-03. Fix:
+     accepted for the command gitguard runs, not for the state found
+     (WORKTREE_WRITES, worktree_pointers): for those four subcommands, in
+     the main repository, on a reference just found current, gitguard
+     waits for git and records the new state when what moved is that
+     command's own pointers — one worktree for `add`, `move` and
+     `remove` — with git's bytes (`commondir` = `../..`, `gitdir` an
+     absolute `<tree>/.git` whose gitfile names the same `worktrees/<id>`
+     back), and at most the branch tracking `add -b` writes. Not accepted
+     by shape alone: replayed on git 2.54, a planted `worktrees/<id>`
+     whose `gitdir` names the gitfile of another repository's worktree
+     makes `git worktree repair` rewrite that gitfile, outside the volume;
+     and a consistent one planted in a directory of the tree moves whoever
+     works there to another HEAD and index. Held to git in
+     tests/test_claims.py; what is not accepted, in tests/test_nested.py.
 """
 from __future__ import annotations
 

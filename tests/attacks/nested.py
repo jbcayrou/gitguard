@@ -268,3 +268,39 @@ def attack_embryonic_submodule_gitdir_config_planted(gg: GG, repo: Path, tmp_pat
     (repo / "libs/c").mkdir(parents=True)
     (repo / "libs/c/.git").write_text("gitdir: ../../.git/modules/libs/c\n")
     (repo / ".gitmodules").write_text('[submodule "libs/c"]\n\tpath = libs/c\n\turl = ../c.git\n')
+
+
+def attack_gitfile_copy_of_a_trusted_submodule(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[154] a copy of a trusted submodule's gitfile planted in another
+    directory: the gitdir is the superproject's, its `core.worktree` names
+    the real tree — the planted one inherits nothing"""
+    sub = add_submodule(gg, repo, tmp_path)
+    gg.trust(repo)
+    (repo / "src").mkdir()
+    (repo / "src/.git").write_text(f"gitdir: {repo}/.git/modules/{sub.name}\n")
+
+
+def attack_gitfile_copy_of_a_trusted_worktree(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[154] a copy of a trusted linked worktree's gitfile planted in a
+    directory of the main tree: `worktrees/<id>/gitdir` names the real
+    worktree — git run from the planted one would work on another HEAD and
+    index, unseen"""
+    wt = tmp_path / "wt"
+    assert gg.git("worktree", "add", "-q", str(wt), cwd=repo).rc == 0
+    gg.trust(repo)
+    assert gg.run("git", "status", "--short", cwd=wt).rc == 0      # the real one inherits
+    (repo / "src").mkdir()
+    (repo / "src/.git").write_text((wt / ".git").read_text())
+
+
+def attack_worktree_gitdir_planted_in_a_volatile_zone(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[154] a linked worktree's gitdir planted where nothing is hashed
+    (`logs/`), its `commondir` the trusted repository: the main tree's
+    check sees nothing, and none of it is in its reference"""
+    adm = repo / ".git/logs/w"
+    adm.mkdir(parents=True)
+    (adm / "HEAD").write_text("ref: refs/heads/main\n")
+    (adm / "commondir").write_text("../..\n")
+    (adm / "gitdir").write_text(f"{repo}/src/.git\n")
+    (repo / "src").mkdir()
+    (repo / "src/.git").write_text(f"gitdir: {adm}\n")

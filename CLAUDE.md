@@ -25,8 +25,10 @@ paid for by a bypass.
   `PINNED_CONFIG` (`core.fsmonitor=false`, the one key an in-process
   reader executes from a repository nobody judged, [126]; the proof is the
   in-process table), `NEVER_RESUMES`/`SEQUENCE_ENDS` (commands that never
-  run a todo line, [147]) and the two ways out let through a structural
-  refusal (`_repairs_split_index` [148], `_absorbs_nested` [149]). The exclusion lists
+  run a todo line, [147]), the two ways out let through a structural
+  refusal (`_repairs_split_index` [148], `_absorbs_nested` [149]) and
+  `WORKTREE_WRITES` (the `git worktree` subcommands whose own two
+  pointers are accepted after gitguard ran them, [155]). The exclusion lists
   (`DATA_KEYS`, `VALUE_KEYS`) are mechanical where they can be:
   `VALUE_KEYS` is the `[bool]`/`[int]` sections of the inventory, taken
   from git's source, never curated ([129]); a string key stays under the
@@ -66,7 +68,11 @@ paid for by a bypass.
   was hashed ([115] [120]); a served repository, exactly ([121] [122]). It
   lives as long as the process that set it, pid and start time
   (`_ancestors`), never a clock ([104] [114]); a child git does not
-  detach (`keep_attached`, [117]).
+  detach (`keep_attached`, [117]). A tree never trusted (a submodule, a
+  linked worktree) takes the trust of the repository holding its gitdir
+  on the same terms, held to that repository's reference: in its trusted
+  state, the gitdir naming the tree back, every watched file in the
+  reference (`trust_holder`, [154]).
 - **A child never refuses what its own command just wrote**: those
   writes are judged at the next command ([124]: a re-check lost
   autostashed work).
@@ -112,6 +118,8 @@ are honoured as git honours them.
 | config parser | `_Src`, `_parse_value`, `parse_git_config` | same, "Config files parsed" |
 | output, colours, `san` | `san`, `Style`, `set_output` | Display and sanitization |
 | state files, keys, locking | `save_trust`, `load_manifest`, `update_pending` | Storage |
+| a submodule, a linked worktree trusted with the repository holding its gitdir | `trust_holder`, `REPO_ENV` | Trusted with the repository that holds the gitdir |
+| the pointers of a `git worktree` command gitguard ran | `WORKTREE_WRITES`, `worktree_pointers`, `accept_worktree_pointers`, `run_git` | Exec-mode shortcuts |
 | exec mode: options, clone/init, prompt, pending | `split_global_options`, `parse_new_repo`, `check_or_die`, `ask_on_tty`, `wait_for_decision` | Auto-trust; Exec-mode shortcuts |
 | passthroughs that read no repository | `TRANSPORT`, `main` | Which git runs |
 | child gits: the marker (pid + start + judged gitdir/common/root/label), coverage by `gitdir_roots` and `tree_named`, `new`, the served repository, no detach, the exec-path wrap, its check and its macOS shim | `Judged`, `_ancestors`, `_proc_lineage`, `read_judged`, `set_judged`, `NewRepo`, `_served_repository`, `keep_attached`, `check_wrap`, `cmd_exec_path`, `PATH_QUERIES`, `run_git` | Nested repositories; DESIGN-exec-path.md |

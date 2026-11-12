@@ -49,6 +49,15 @@ DEFERRED = {
     "attack_env_common_dir_head_planted_in_subdir": ("cd", "src"),
 }
 
+# Trees planted next to a trusted repository to take its trust ([154]):
+# the repository itself is as it was, git run from the planted tree is
+# refused.
+NO_INHERIT = {
+    "attack_gitfile_copy_of_a_trusted_submodule": "src",
+    "attack_gitfile_copy_of_a_trusted_worktree": "src",
+    "attack_worktree_gitdir_planted_in_a_volatile_zone": "src",
+}
+
 
 # Known open flaws: the attack is in the corpus, the refusal is not there yet.
 # xfail(strict): a fix makes the test XPASS, then remove the entry.
@@ -85,6 +94,12 @@ def test_attack_is_blocked(gg: GG, repo: Path, tmp_path: Path, fn) -> None:
         r2 = gg.run("git", *resume, cwd=repo)
         assert r2.blocked and "gitguard:" in r2.err, f"the resuming command ran\n{r2.text}"
         return
+    planted = NO_INHERIT.get(fn.__name__)
+    if planted is not None:
+        assert not gg.check(repo).blocked          # nothing of the repository changed
+        assert_blocked_now(gg, repo / planted)
+        assert "trusted with" not in gg.check(repo / planted).err
+        return
     deferred = DEFERRED.get(fn.__name__)
     if deferred is None:
         assert_blocked_now(gg, repo)
@@ -103,6 +118,7 @@ def test_deferred_list_matches_corpus() -> None:
     assert set(DEFERRED) <= names, set(DEFERRED) - names
     assert set(RESUME) <= names, set(RESUME) - names
     assert set(OPEN) <= names, set(OPEN) - names
+    assert set(NO_INHERIT) <= names, set(NO_INHERIT) - names
 
 
 def test_corpus_is_not_empty() -> None:
