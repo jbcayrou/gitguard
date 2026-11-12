@@ -1,5 +1,7 @@
 # gitguard
 
+[![tests](https://github.com/jbcayrou/gitguard/actions/workflows/tests.yml/badge.svg)](https://github.com/jbcayrou/gitguard/actions/workflows/tests.yml)
+
 Refuses to run `git` on a repository whose trusted files (`.git/config`,
 hooks, `.gitmodules`, gitfiles, every path the config makes git execute…)
 have changed since you last looked at them.
@@ -451,8 +453,9 @@ gitguard reads a repository the way git does, and each of its readers is
 held to git by the suite: a git is supported when the whole suite passes
 against it. Every push runs it (`.github/workflows/tests.yml`) on Linux
 and macOS against git 2.39, 2.43, 2.47, 2.50 and 2.56, built from
-kernel.org by `ci/build-git.sh`; on Debian 12, Debian 13 and Ubuntu 24.04
-with the distribution's own git and python; and once on Python 3.9.
+kernel.org by `ci/build-git.sh`; on Debian 12, Debian 13, Ubuntu 24.04
+and Ubuntu 26.04 with the distribution's own git and python; and once on
+Python 3.9.
 
 gitguard never asks git its version. Where two supported gits read one
 file two ways — a tab between two words of a config value is a space

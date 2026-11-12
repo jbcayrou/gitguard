@@ -1182,8 +1182,8 @@ into the tree was not watched.
 **The matrix** (`.github/workflows/tests.yml`): the suite on every push,
 Linux and macOS, against each supported git (2.39, 2.43, 2.47, 2.50,
 2.56, built by `ci/build-git.sh` with the dashed builtins as symlinks, as
-conftest expects), on Debian 12, Debian 13 and Ubuntu 24.04 with the
-distribution's git, and once on the oldest python (3.9). A git is
+conftest expects), on Debian 12, Debian 13, Ubuntu 24.04 and Ubuntu 26.04
+with the distribution's git, and once on the oldest python (3.9). A git is
 supported when the whole suite passes against it; a test that needs a
 feature probes the git under test for it (`git_has`), never its version.
 What its first run by hand found, 2026-11-11: git ≤ 2.39 passes
@@ -1192,7 +1192,11 @@ gitguard had dropped — every recursive submodule command was refused on
 Debian 12; git < 2.45 reads a tab between two words of a config value as
 a space ([152]); git 2.56's default maintenance strategy no longer runs
 `gc --auto`, which the test of [117] observed — it names the `gc`
-strategy now. A new git enters the matrix with its inventory.
+strategy now. What its first run on GitHub found: `ubuntu-latest` is
+Ubuntu 26.04, where git 2.39, 2.43 and 2.47 did not build (cause not
+read) and python 3.9 is not offered — the Linux runner is named
+(`ubuntu-24.04`), and Ubuntu 26.04 is tested with its own git. A new git
+enters the matrix with its inventory.
 
 **`python3 -m pytest`** (~1300 tests, expected failures [44], [71], [74], [95], [123], [126], [129] — accepted
 limitations; ~280 s, ~60 s with `-n 8` on the command line),
