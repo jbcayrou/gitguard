@@ -256,7 +256,22 @@ entries are reported as "legacy", `gitguard retrust` re-validates them.
    and the messages stay on the
    directory holding `.git` (`Repo.anchor`, `Repo.label`): a `core.worktree`
    written by the sandbox is an ordinary config change shown in the diff,
-   not a "never trusted" repository.
+   not a "never trusted" repository. **A gitdir named apart** is the
+   other half of the key: when `GIT_DIR` / `--git-dir` names a gitdir
+   that `<directory>/.git` does not lead to (`gitdir_apart`: neither that
+   directory nor the target of that gitfile) — vcsh's and yadm's layout,
+   a bare repository of dotfiles with the home directory as its tree, a
+   `git --git-dir=<other>` typed anywhere, a child git sent into another
+   repository — the repository is the pair, and so are its state key
+   (`state_key`), its records and its name in every message (`Repo.title`,
+   `Repo.dotgit`). The directory alone was the key: two repositories
+   sharing a tree shared one reference, the second shown as
+   "`<tree>/.git` has changed" — a `.git` that does not exist — with its
+   difference from the first, a repository never trusted presented as a
+   change, each `y` replacing the other's reference, the question back at
+   every switch ([157]). The `GIT_DIR` git exports to its own children (a
+   hook, a submodule's, a linked worktree's) names the gitdir the tree
+   already has: the same repository, the same key.
 2. **`open_repo`** (`read_gitfile`): `.git` must not be a symlink; if it
    is a `gitdir:` file, the target must not be *inside* the work tree
    (legitimate worktrees and submodules point outside). The common dir is
@@ -874,11 +889,13 @@ to fall through to a silent check, exit 0). The scopes: `local` (gitdir), `commo
 
 `$XDG_STATE_HOME/gitguard/`, i.e. `~/.local/state/gitguard/` (mode 700;
 XDG's home for per-machine, non-portable state), key = first 16 hex digits of the
-sha256 of the root's absolute path:
+sha256 of the root's absolute path — of the root and the gitdir, NUL
+between them, for a gitdir named apart from it (`state_key`, [157]):
 
 ```
-<key>           reference manifest
-<key>.d/        backup of the watched files (.root, local/…, common/…, wt/…); an
+<key>           reference manifest (`root`; `gitdir` when named apart)
+<key>.d/        backup of the watched files (.root, .gitdir when named apart,
+                local/…, common/…, wt/…); an
                 `ext` file is hashed but never copied: restore never writes
                 outside the repository [25] [56]
 <key>.idx       cache of the index parse: version, then one record per index file
@@ -905,6 +922,19 @@ lock files of earlier versions.
 The root is canonicalised (`readlink -f`): accessing the repository through
 a symlinked path gives the same key. A moved repository becomes "never
 trusted" again: intended, a `mv` by the sandbox must not inherit a trust.
+
+The management commands open a record as the command that wrote it did
+(`open_record`): with the recorded gitdir as `GIT_DIR` when it is named
+apart, with none otherwise — whatever `GIT_DIR` they were started with.
+They opened `<root>/.git` for every record: a repository of dotfiles was
+listed as `structure` and skipped by `retrust`. A path given to `forget`
+or `pending` designates the directory's own record and those of every
+repository named apart that has it as its tree or as its gitdir
+(`records_at`, read from `.d/.root`, `.d/.gitdir` and the pending
+records): the tree for all of them, a gitdir for its own. A reference
+recorded before [157] for such a repository sits under the directory's
+key, with no gitdir: the repository is "never trusted" once under its
+own, and `gitguard forget <tree>` drops the old one ([157]).
 
 ## Auto-trust (clone/init)
 
@@ -1806,7 +1836,9 @@ the files, not the order.
 - `git --work-tree=<other> …` changes the set of hooks git runs, so the
   fingerprint differs from the repository's own tree ([72]): the tree is
   blessed with `GIT_WORK_TREE=<other> gitguard trust` (same state key),
-  and switching between trees prompts each time.
+  and switching between trees prompts each time. The mirror case, two
+  gitdirs on one tree, has a key each ([157]); this one — one gitdir
+  discovered from the cwd, several trees — keeps the directory's key.
 - A global `core.hooksPath` (or any config path) that is a symlink to a
   directory outside the tree (a stow-managed hooks directory) is refused
   ([75]): the link would have to be watched apart from the directory it
@@ -1836,7 +1868,8 @@ the files, not the order.
   writes the dangling blobs' content there by opening each path, through
   a symlink a sandbox would plant (a volatile directory is not checked for
   symlinks below two levels); `git --git-dir=<repo>/.git …` from another
-  directory is another tree, hence another trust key ([72]) — a linked
+  directory is another tree, hence another trust key ([72]; the key of
+  that directory and that gitdir together, [157]) — a linked
   worktree too, which takes the main tree's trust on its own ([154]
   [155]); a transient `-c core.sshCommand='ssh -i <key>'` names
   a file, which joins the fingerprint of that command ([48]) and leaves it

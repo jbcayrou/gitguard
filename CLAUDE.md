@@ -126,7 +126,7 @@ are honoured as git honours them.
 | the check pipeline (scan → structure → fingerprint) | `inspect`, `Inspection`, `save_trust` | Organization of gitguard.py |
 | config parser | `_Src`, `_parse_value`, `parse_git_config` | same, "Config files parsed" |
 | output, colours, `san` | `san`, `Style`, `set_output` | Display and sanitization |
-| state files, keys, locking | `save_trust`, `load_manifest`, `update_pending` | Storage |
+| state files, keys, locking; a gitdir named apart from its tree (GIT_DIR: vcsh, dotfiles) is half of the key and of the records ([157]) | `save_trust`, `load_manifest`, `update_pending`, `state_key`, `gitdir_apart`, `Repo.key`/`title`/`dotgit`, `open_record`, `records_at` | Storage; What the script checks, 1 |
 | a submodule, a linked worktree trusted with the repository holding its gitdir | `trust_holder`, `REPO_ENV` | Trusted with the repository that holds the gitdir |
 | the pointers of a `git worktree` command gitguard ran | `WORKTREE_WRITES`, `worktree_pointers`, `accept_worktree_pointers`, `run_git` | Exec-mode shortcuts |
 | exec mode: options, clone/init, prompt, pending | `split_global_options`, `parse_new_repo`, `check_or_die`, `ask_on_tty`, `wait_for_decision` | Auto-trust; Exec-mode shortcuts |

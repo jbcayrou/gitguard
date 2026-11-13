@@ -482,6 +482,33 @@ def test_judged_covers_the_repositories_it_borrows_from(tmp_path: Path, monkeypa
         assert not gg_mod.read_judged().covers(_repo(tmp_path, m)), paths
 
 
+def test_state_key_is_the_directory_unless_the_gitdir_is_named_apart(tmp_path: Path, monkeypatch) -> None:
+    """[157] one key per directory while `<directory>/.git` leads to the
+    gitdir — a directory, a gitfile (a linked worktree, a submodule, a
+    separate gitdir), whatever names it; the pair's key for any other
+    gitdir: another repository on the same tree."""
+    monkeypatch.setattr(gg_mod, "STATE", tmp_path / "state")
+    d, wt, bare = tmp_path / "d", tmp_path / "wt", tmp_path / "dot.git"
+    for p in (d / ".git/worktrees/wt", wt, bare, tmp_path / "plain"):
+        p.mkdir(parents=True)
+    (wt / ".git").write_text(f"gitdir: {d}/.git/worktrees/wt\n")
+    key = gg_mod.key_for
+    assert gg_mod.state_key(d, d / ".git") == key(d)
+    assert gg_mod.state_key(wt, d / ".git/worktrees/wt") == key(wt)
+    assert gg_mod.state_key(d, bare) == key(d, bare) != key(d), "another gitdir on a tree that has its own"
+    assert gg_mod.state_key(tmp_path / "plain", bare) == key(tmp_path / "plain", bare), "a tree without a .git"
+    assert gg_mod.state_key(wt, bare) == key(wt, bare), "nor the one its gitfile names"
+    (wt / ".git").write_text("not a gitfile\n")
+    assert gg_mod.state_key(wt, d / ".git/worktrees/wt") != key(wt), "a gitfile git dies on leads nowhere"
+    assert len({key(d), key(d, bare), key(bare, d), key(d, tmp_path / "other.git")}) == 4
+    r = gg_mod.Repo(d, bare, bare, d)
+    assert r.apart and r.key == key(d, bare) and r.named == str(bare)
+    assert r.title == f"{d} (git dir {bare})" and r.dotgit == f"{bare} (work tree {d})"
+    r = gg_mod.Repo(d, d / ".git", d / ".git", d)
+    assert not r.apart and r.key == key(d) and r.named is None
+    assert r.title == str(d) and r.dotgit == f"{d}/.git"
+
+
 @pytest.mark.parametrize("text,want", [
     (b"", []), (b"\n\n", []), (b"/a\n/b", [b"/a", b"/b"]), (b"/a \n", [b"/a "]), (b"/a\r\n", [b"/a\r"]),
     (b"# /a\n/b\n", [b"/b"]), (b" # /a\n", [b" # /a"]), (b"/a # x\n", [b"/a # x"]),

@@ -212,6 +212,10 @@ to compile; +2.5 ms with one mirror (its config and the fourteen sample
 hooks of a `clone --mirror`). What the fix gives back is not in the
 table: the clone no longer downloads what the mirror holds.
 
+The state key of [157] costs one `stat` and one `resolve` per check, to
+tell whether the gitdir is the one `<directory>/.git` leads to: within
+the noise of the same A/B (53.1–53.8 ms before, 53.7–53.8 ms after).
+
 ## Where the time goes (2026-10-17 figures)
 
 | component                                             | cost            |

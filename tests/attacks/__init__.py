@@ -1219,6 +1219,27 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      is then a change of the borrower (tests/attacks/config_scope.py); not
      covered: a served repository's alternates, the environment's
      (DESIGN.md, Known limitations).
+[157] False positive, and a reference replaced unseen: the state key was
+     the directory alone, so two repositories working on one tree
+     through GIT_DIR and GIT_WORK_TREE (vcsh; `git --git-dir=<other>`
+     typed in a repository; a child git sent into another one, [156])
+     shared one reference. The second was shown as "<tree>/.git has
+     changed" — a `.git` that may not exist — with its difference from
+     the first: a repository never trusted presented as a change, each
+     `y` replacing the other's reference, the question back at every
+     switch; and `list` opened `<tree>/.git` for every record, so a
+     repository of dotfiles (a bare gitdir, the home directory as its
+     tree) was `structure` for ever and `retrust` skipped it. Found by
+     the fourth agentic audit, 2026-11-03; replayed 2026-11-13. Fix: a
+     gitdir that `<directory>/.git` does not lead to is half of the key
+     (gitdir_apart, state_key, Repo.key), of the records (manifest and
+     pending: `gitdir`) and of the name shown (Repo.title, Repo.dotgit);
+     the management commands open a record with its gitdir
+     (open_record) and take a tree or a gitdir as an argument
+     (records_at). The GIT_DIR git exports to its own children names the
+     gitdir the tree has: the same key as before. A reference recorded
+     earlier for such a repository is under the directory's key: trusted
+     once more.
 """
 from __future__ import annotations
 

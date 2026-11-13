@@ -1685,3 +1685,109 @@ def test_submodule_updated_with_a_reference(gg: GG, repo: Path, tmp_path: Path) 
     commit(gg, src, "ahead", "2")
     trace = _traced(gg, "fetch", "-q", cwd=clone / "sub")
     assert _enters(trace, mirror), trace
+
+
+# -------------------- two repositories, one directory ([157], 2026-11-13)
+def _named(gg: GG, gitdir: Path, tree: Path) -> GG:
+    """gitguard as vcsh, yadm or a `git --git-dir=… --work-tree=…` alias
+    runs git: the gitdir and the tree both named by the environment."""
+    return GG({**gg.env, "GIT_DIR": str(gitdir), "GIT_WORK_TREE": str(tree)}, gg.state, gg.raw_exec)
+
+
+def _dotfiles(gg: GG, tmp_path: Path) -> tuple[Path, Path, Path]:
+    """vcsh's layout: `zsh.git` and `vim.git`, kept apart, each tracking
+    its own files of one directory. Their configs differ."""
+    tree = tmp_path / "home-tree"
+    tree.mkdir()
+    gitdirs = []
+    for n in ("zsh", "vim"):
+        g = tmp_path / f"{n}.git"
+        w = [f"--git-dir={g}", f"--work-tree={tree}"]
+        assert gg.git("init", "-q", "--bare", str(g)).rc == 0
+        assert gg.git(*w, "config", "core.bare", "false").rc == 0
+        (tree / f".{n}rc").write_text(n + "\n")
+        assert gg.git(*w, "add", "-f", f".{n}rc").rc == 0
+        assert gg.git(*w, "commit", "-qm", n).rc == 0
+        gitdirs.append(g)
+    assert gg.git(f"--git-dir={gitdirs[1]}", "config", "user.name", "vim").rc == 0
+    return tree, gitdirs[0], gitdirs[1]
+
+
+def test_two_gitdirs_on_one_tree_have_a_reference_each(gg: GG, tmp_path: Path) -> None:
+    """[157] two repositories sharing a tree (vcsh) shared one state key,
+    the tree's: the second was shown as "<tree>/.git has changed" — a
+    `.git` that does not exist — with its difference from the first, each
+    `y` replaced the other's reference, and the question came back at
+    every switch. One reference each: trusted once, then silent, whatever
+    the order; a change of one is that one's."""
+    tree, zsh, vim = _dotfiles(gg, tmp_path)
+    z, v = _named(gg, zsh, tree), _named(gg, vim, tree)
+    r = z.run("git", "status", "--short", cwd=tree)
+    assert r.blocked and "never trusted" in r.err and str(zsh) in r.err, r.text
+    z.trust(tree)
+    assert z.run("git", "status", "--short", cwd=tree).rc == 0
+    r = v.run("git", "status", "--short", cwd=tree)
+    assert r.blocked and "never trusted" in r.err and str(vim) in r.err, r.text
+    assert "has changed" not in r.err, "a repository never trusted shown as a change of another"
+    v.trust(tree)
+    for g in (z, v, z, v):
+        r = g.run("git", "status", "--short", cwd=tree)
+        assert r.rc == 0 and not r.err, r.text
+    with open(vim / "config", "a") as f:
+        f.write("[core]\n\thooksPath = /nowhere\n")
+    r = v.run("git", "status", "--short", cwd=tree)
+    assert r.blocked and f"{vim} (work tree {tree}) has changed" in r.err, r.text
+    assert f"{tree}/.git" not in r.err, "a gitdir that does not exist named as the one that changed"
+    r = z.run("git", "status", "--short", cwd=tree)
+    assert r.rc == 0 and not r.err, r.text
+
+
+def test_list_forget_and_retrust_reach_a_gitdir_named_apart(gg: GG, tmp_path: Path) -> None:
+    """[157] the management commands opened `<root>/.git` for every record:
+    a repository of dotfiles (a bare gitdir, the home directory as its
+    tree) was listed as `structure` and `retrust` skipped it. `forget
+    <tree>` reaches every repository of that tree, `forget <gitdir>` its
+    own."""
+    tree, zsh, vim = _dotfiles(gg, tmp_path)
+    z, v = _named(gg, zsh, tree), _named(gg, vim, tree)
+    z.trust(tree)
+    v.trust(tree)
+    listing = gg.run("list").text
+    for g in (zsh, vim):
+        line = next(ln for ln in listing.splitlines() if str(g) in ln)
+        assert line.startswith("ok") and str(tree) in line, listing
+    r = gg.run("retrust")
+    assert r.rc == 0 and "2 repository(ies) re-trusted, 0 skipped" in r.text, r.text
+    r = gg.run("forget", str(vim))
+    assert r.rc == 0 and str(vim) in r.text, r.text
+    assert v.check(tree).blocked and not z.check(tree).blocked
+    v.trust(tree)
+    r = gg.run("forget", str(tree))
+    assert r.text.count("forgotten") == 2, r.text
+    assert z.check(tree).blocked and v.check(tree).blocked
+
+
+def test_own_gitdir_named_by_the_environment_is_the_same_repository(gg: GG, repo: Path) -> None:
+    """[157] GIT_DIR naming the gitdir the tree already has — what git
+    exports to its hooks and children, what `git --git-dir=.git` spells —
+    is that repository, under its reference."""
+    assert _named(gg, repo / ".git", repo).run("git", "status", "--short", cwd=repo).rc == 0
+    r = gg.run("git", "--git-dir=.git", "status", "--short", cwd=repo)
+    assert r.rc == 0 and not r.err, r.text
+
+
+def test_another_gitdir_named_from_a_trusted_tree_is_not_its_change(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[157] `git --git-dir=<other>/.git` typed (or run by a child git) in
+    a trusted repository: another repository, never trusted, said so and
+    recorded so — it was compared with the reference of the directory it
+    ran in, "<repo>/.git has changed" with the other's config as the
+    diff, and a `y` there replaced the reference of `repo`."""
+    other = make_source(gg, tmp_path, "other")
+    r = gg.run("git", f"--git-dir={other / '.git'}", "log", "--oneline", cwd=repo)
+    assert r.blocked and "never trusted" in r.err and str(other / ".git") in r.err, r.text
+    assert "has changed" not in r.err, r.text
+    assert not gg.check(repo).blocked
+    pending = gg.run("pending").text
+    assert str(other / ".git") in pending and "never" in pending, pending
+    r = gg.run("pending", "-c", str(other / ".git"))
+    assert "cleared" in r.text and "nothing pending" in gg.run("pending").text, r.text

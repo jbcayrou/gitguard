@@ -412,6 +412,24 @@ bulk the ones that are unchanged and skips the modified ones. Installed at
 the same path, the new version is what the exec path's `git` already
 links to; nothing else to redo.
 
+### Dotfiles, vcsh, yadm: a gitdir kept apart from its tree
+
+A repository run through `GIT_DIR` / `--git-dir` with a gitdir that is not
+the tree's own `.git` — a bare repository of dotfiles with your home
+directory as its tree, several vcsh repositories on that one directory —
+has its own reference, named by the tree **and** the gitdir. Trust it the
+way you run it:
+
+```sh
+GIT_DIR=~/.dotfiles.git GIT_WORK_TREE=~ gitguard trust
+```
+
+`gitguard list` shows it with its gitdir; `forget` and `pending` take the
+tree (every repository on it) or the gitdir (that one). If you trusted
+such a repository with an earlier version, trust it once more: its
+reference was filed under the directory alone, shared by every
+repository using that directory.
+
 ## Commands
 
 | Command | What it does |
@@ -423,7 +441,7 @@ links to; nothing else to redo.
 | `gitguard git <args>` | Check, then run the real git. Honours `-C`, `--git-dir`, `--work-tree`, `-c`. |
 | `gitguard list` | Registered repositories and their status (ok / modified / structure / missing / legacy / unknown). |
 | `gitguard pending [<repo>… \| -a \| -c <repo>…]` | Decisions waiting for a git blocked by a program: list, review and allow/refuse, or clear. |
-| `gitguard forget <repo>…` / `--missing` | Remove entries; the repository becomes "never trusted" again. |
+| `gitguard forget <repo>…` / `--missing` | Remove entries; the repository becomes "never trusted" again. `<repo>` is its directory, or its gitdir when kept apart. |
 | `gitguard prune` | Same as `forget --missing`. |
 | `gitguard retrust` | Re-validate unchanged repositories after an upgrade. |
 | `gitguard version` | The version, which is the package's. |

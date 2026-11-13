@@ -629,12 +629,45 @@ def config_last(path: Path, section: str, key: str) -> str | None:
 
 
 # ---------------------------------------------------------- repo / gitdir
-def key_for(root: Path) -> Path:
+def key_for(root: Path, gitdir: Path | None = None) -> Path:
     """State key of a repository: first 16 hex digits of the sha256 of its
     canonical root — its bytes (fsencode), a root that is not UTF-8 being
     legal on Linux ([138]: a strict encode crashed every command on it,
-    `forget` included)."""
-    return STATE / hashlib.sha256(os.fsencode(str(root))).hexdigest()[:16]
+    `forget` included). With `gitdir`: of the root and of a gitdir named
+    apart from it (state_key)."""
+    name = os.fsencode(str(root)) + (b"\0" + os.fsencode(str(gitdir)) if gitdir is not None else b"")
+    return STATE / hashlib.sha256(name).hexdigest()[:16]
+
+
+def gitdir_apart(anchor: Path, gitdir: Path) -> bool:
+    """Is `gitdir` another one than `<anchor>/.git` leads to (the directory,
+    or the gitfile's target)? Only GIT_DIR / `--git-dir` can make it so:
+    vcsh's and yadm's layout, a bare repository of dotfiles with the home
+    directory as its tree, a child git sent into another repository. The
+    GIT_DIR git exports to its own children (hooks, a submodule's, a linked
+    worktree's) names the gitdir the tree already has: not apart."""
+    own = anchor / ".git"
+    try:
+        return (read_gitfile(own) if own.is_file() else own.resolve()) != gitdir
+    except (Refuse, OSError):
+        return True
+
+
+def state_key(anchor: Path, gitdir: Path) -> Path:
+    """The state key of the repository `gitdir` works on from `anchor`: the
+    directory's, as long as its `.git` leads to that gitdir; the pair's
+    when the gitdir is named apart. One key per directory made one
+    reference of two repositories sharing a tree: every switch from one to
+    the other was shown as "<tree>/.git has changed", a gitdir never
+    trusted as a difference with the other's, and each answer replaced the
+    other's reference. [157]"""
+    return key_for(anchor, gitdir) if gitdir_apart(anchor, gitdir) else key_for(anchor)
+
+
+def titled(root: object, gitdir: object = None) -> str:
+    """A repository as named to the user in a listing or a record: its
+    directory, and its gitdir when named apart."""
+    return f"{root} (git dir {gitdir})" if gitdir else str(root)
 
 
 class Repo:
@@ -653,14 +686,36 @@ class Repo:
     def __repr__(self) -> str:
         return f"Repo({self.root!r}, {self.gitdir!r}, {self.common!r}, {self.anchor!r})"
 
-    @property
+    @cached_property
+    def apart(self) -> bool:
+        """The gitdir is not the one `<label>/.git` leads to (gitdir_apart)."""
+        return gitdir_apart(self.label, self.gitdir)
+
+    @cached_property
     def key(self) -> Path:
-        return key_for(self.anchor or self.root)
+        return key_for(self.label, self.gitdir) if self.apart else key_for(self.label)
 
     @property
     def label(self) -> Path:
-        """How the repository is named to the user: the directory holding `.git`."""
+        """The directory holding `.git`, or the tree a gitdir named apart
+        works on: what the state key and the records are named after."""
         return self.anchor or self.root
+
+    @property
+    def named(self) -> str | None:
+        """The gitdir, for the records, when it is named apart."""
+        return str(self.gitdir) if self.apart else None
+
+    @property
+    def title(self) -> str:
+        """How the repository is named to the user."""
+        return titled(self.label, self.named)
+
+    @property
+    def dotgit(self) -> str:
+        """How its gitdir is named to the user: `<label>/.git`, which a
+        gitdir named apart is not."""
+        return f"{self.gitdir} (work tree {self.label})" if self.apart else f"{self.label}/.git"
 
     @property
     def index(self) -> Path:
@@ -3421,9 +3476,11 @@ class Manifest:
     refs: list[tuple[str, Path]]            # roots designated by the trusted config
     entries: dict[tuple[str, str], Entry]
 
+    gitdir: str | None                      # the gitdir, when named apart from the root [157]
+
     def __init__(self, version: int, root: str | None, refs: list[tuple[str, Path]],
-                 entries: dict[tuple[str, str], Entry]) -> None:
-        self.version, self.root, self.refs, self.entries = version, root, refs, entries
+                 entries: dict[tuple[str, str], Entry], gitdir: str | None = None) -> None:
+        self.version, self.root, self.refs, self.entries, self.gitdir = version, root, refs, entries, gitdir
 
     @property
     def current(self) -> bool:
@@ -3442,7 +3499,7 @@ def load_manifest(key: Path) -> Manifest | None:
             return Manifest(version, None, [], {})
         entries = {(e["scope"], e["path"]): Entry(**e) for e in data["entries"]}
         refs = [(sc, Path(p)) for sc, p in data.get("refs", [])]
-        return Manifest(version, data.get("root"), refs, entries)
+        return Manifest(version, data.get("root"), refs, entries, data.get("gitdir"))
     except (json.JSONDecodeError, TypeError, KeyError, ValueError, AttributeError):
         return Manifest(1, None, [], {})     # unreadable: treated as an older format
 
@@ -3465,6 +3522,9 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]],
     tmp = Path(str(key) + ".tmp")
     tmp.write_text(json.dumps({
         "version": FORMAT_VERSION, "root": str(repo.label),
+        # A gitdir named apart (GIT_DIR): what `list` and `retrust` open
+        # the repository with, the root alone names another one. [157]
+        **({"gitdir": repo.named} if repo.apart else {}),
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         # Roots designated by the trusted config: the only zones where
         # `restore` allows itself to delete (outside the gitdir).
@@ -3479,6 +3539,8 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]],
     shutil.rmtree(new, ignore_errors=True)
     new.mkdir()
     (new / ".root").write_bytes(os.fsencode(str(repo.label)) + b"\n")     # its bytes [138]
+    if repo.apart:
+        (new / ".gitdir").write_bytes(os.fsencode(repo.named) + b"\n")    # found by records_at [157]
     for (scope, rel), e in man.items():
         if scope == "ext":
             continue                     # hashed, never copied: see restore
@@ -3501,7 +3563,7 @@ def save_trust(repo: Repo, refs: list[tuple[str, Path]],
         if not same:
             shutil.rmtree(new, ignore_errors=True)
             tmp.unlink(missing_ok=True)
-            raise Refuse(f"{repo.label} changed while the question was pending "
+            raise Refuse(f"{repo.title} changed while the question was pending "
                          f"({_label(scope, rel)}): not trusted, run the command again")
     shutil.rmtree(bak, ignore_errors=True)
     os.rename(new, bak)
@@ -3656,12 +3718,14 @@ def notify_pending(label, text: str) -> None:
 
 def record_pending(key: Path, kind: str, label, message: str,
                    new: dict | None = None, refs: list[tuple[str, Path]] | None = None,
-                   waiter: dict | None = None, notify_user: bool = True) -> None:
+                   waiter: dict | None = None, notify_user: bool = True,
+                   gitdir: str | None = None) -> None:
     """Create or refresh `<key>.pending` (kind: changed | never | structural)
     and notify once per NOTIFY_COOLDOWN. `new`/`refs` (changed only) describe
     the latest state seen; `waiter` registers the blocked process. A child
     git (`notify_user` False) records without notifying: its parent's
-    stderr carries the message."""
+    stderr carries the message. `gitdir`: the repository's, when named
+    apart from `label` (Repo.named): `pending` opens it with both. [157]"""
     now = time.time()
     notify = []
 
@@ -3669,6 +3733,8 @@ def record_pending(key: Path, kind: str, label, message: str,
         d = cur if cur and cur.get("root") == str(label) else {"created": now, "notified": 0.0,
                                                                "waiters": []}
         d.update(kind=kind, root=str(label), message=san(message), seen=now)
+        if gitdir:
+            d["gitdir"] = gitdir
         if new is not None and refs is not None:
             d["entries"] = [e.__dict__ for e in sorted(new.values(), key=lambda e: (e.scope, e.path))]
             d["refs"] = [[sc, str(p)] for sc, p in refs]
@@ -3685,7 +3751,7 @@ def record_pending(key: Path, kind: str, label, message: str,
 
     update_pending(key, fn)
     if notify and notify_user:
-        notify_pending(label, "git is waiting for your decision. In a terminal: gitguard pending"
+        notify_pending(titled(label, gitdir), "git is waiting for your decision. In a terminal: gitguard pending"
                        if kind == "changed" else f"{message} — in a terminal: gitguard pending")
 
 
@@ -3717,7 +3783,8 @@ def wait_for_decision(repo: Repo, key: Path, new: dict, refs: list[tuple[str, Pa
     ("timeout", the record stays for `gitguard pending`)."""
     timeout = wait_seconds()
     me = {"pid": os.getpid(), "since": time.time(), "caller": caller_chain()} if timeout else None
-    record_pending(key, "changed", repo.label, "has changed since the last trust", new, refs, me)
+    record_pending(key, "changed", repo.label, "has changed since the last trust", new, refs, me,
+                   gitdir=repo.named)
     if not timeout:
         return "timeout"
     deadline = time.monotonic() + timeout
@@ -3796,7 +3863,7 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
             trusted_refs: list[tuple[str, Path]]) -> None:
     bak = Path(str(key) + ".d")
     if not bak.is_dir():
-        raise Refuse(f"no backup for {repo.label} (run 'gitguard trust' again when the repository is clean)")
+        raise Refuse(f"no backup for {repo.title} (run 'gitguard trust' again when the repository is clean)")
     plan = [(("delete" if a == "added" else "restore"), k) for a, k in changes(old, new)]
     # A deletion may only target the inside of the gitdir or of a root that the
     # **trusted** config designated. Without this, an `ext:` path that appeared
@@ -3842,7 +3909,7 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
     if not plan:
         if kept:
             raise Refuse("nothing else to restore")
-        info(f"nothing to restore, {repo.label} is in the trusted state")
+        info(f"nothing to restore, {repo.title} is in the trusted state")
         return
     err(STYLE.bold(f"Actions on {san(repo.root)}:"))
     for action, (scope, path) in plan:
@@ -3875,58 +3942,96 @@ def restore(repo: Repo, key: Path, old: dict, new: dict, yes: bool,
         if action == "restore":
             _copy_entry(bak / scope / path.lstrip("/"), dst)
     if manifest(repo, config_refs(repo).refs) == old:
-        info(f"{len(plan)} file(s) restored, {repo.label} matches the trusted state again")
+        info(f"{len(plan)} file(s) restored, {repo.title} matches the trusted state again")
     else:
         warn("restore done, but the fingerprint still differs — check with 'gitguard diff'")
 
 
 # --------------------------------------------------------- state management
-def entries() -> Iterator[tuple[Path, Path | None, str]]:
-    """(key, root, status) for each registered repository."""
+def open_record(root: Path, gitdir: str | None) -> Repo:
+    """The repository a state record names, opened as the command that
+    wrote the record opened it: with its gitdir named apart as GIT_DIR, or
+    with none — whatever GIT_DIR this process was started with. The root
+    alone opened `<root>/.git`: a repository of dotfiles was listed as
+    `structure` for ever, and `retrust` could not reach it. [157]"""
+    if gitdir:
+        os.environ["GIT_DIR"] = gitdir
+    else:
+        os.environ.pop("GIT_DIR", None)
+    return open_repo(root)
+
+
+def entries() -> Iterator[tuple[Path, Path | None, str | None, str]]:
+    """(key, root, gitdir when named apart, status) for each registered
+    repository."""
     for key in sorted(STATE.glob("????????????????")):
         if not key.is_file():
             continue
         data = load_manifest(key)
         root_s = data.root if data else None
+        gitdir = data.gitdir if data else None
         if not root_s:
             rf = Path(str(key) + ".d") / ".root"
             root_s = os.fsdecode(rf.read_bytes()).strip() if rf.is_file() else None
         root = Path(root_s) if root_s else None
         if root is None:
-            yield key, None, "unknown"
+            yield key, None, None, "unknown"
             continue
-        if not root.is_dir():
-            yield key, root, "missing"
+        if not root.is_dir() or (gitdir and not Path(gitdir).is_dir()):
+            yield key, root, gitdir, "missing"
             continue
         try:
-            insp = inspect(open_repo(root))
+            insp = inspect(open_record(root, gitdir))
         except Refuse:
-            yield key, root, "structure"
+            yield key, root, gitdir, "structure"
             continue
         except OSError:
             # One repository nobody can read must not blank the listing
             # of the others ([137]: a `chmod 0300 .git/logs` took `list`,
             # `prune` and `retrust` down for every repository).
-            yield key, root, "unreadable"
+            yield key, root, gitdir, "unreadable"
             continue
         if data is None or not data.current:
-            yield key, root, "legacy"
+            yield key, root, gitdir, "legacy"
         elif insp.new != data.entries:
-            yield key, root, "modified"
+            yield key, root, gitdir, "modified"
         elif not (Path(str(key) + ".d")).is_dir():
-            yield key, root, "legacy"
+            yield key, root, gitdir, "legacy"
         else:
-            yield key, root, "ok"
+            yield key, root, gitdir, "ok"
+
+
+def records_at(path: Path) -> list[Path]:
+    """The state keys a path given to `forget` or `pending` designates: the
+    directory's own, and those of every repository whose gitdir is named
+    apart and has `path` as its tree or as that gitdir — a directory two
+    repositories work on is one argument for both, each gitdir an
+    argument for its own. Read from the small files beside the references
+    (`.d/.root`, `.d/.gitdir`) and from the pending records. [157]"""
+    keys = [key_for(path)]
+
+    def names(f: Path) -> str:
+        try:
+            return os.fsdecode(f.read_bytes()).rstrip("\n")
+        except OSError:
+            return ""
+    for g in sorted(STATE.glob("????????????????.d/.gitdir")):
+        if str(path) in (names(g), names(g.with_name(".root"))):
+            keys.append(Path(str(g.parent)[:-len(".d")]))
+    for key, d in _pending_records():
+        if d.get("gitdir") and str(path) in (str(d["gitdir"]), str(d["root"])):
+            keys.append(key)
+    return list(dict.fromkeys(keys))
 
 
 def cmd_list() -> None:
     colors = {"ok": STYLE.green, "modified": STYLE.red, "structure": STYLE.red, "unreadable": STYLE.red,
               "missing": STYLE.yellow, "legacy": STYLE.yellow, "unknown": STYLE.yellow}
     n = 0
-    for key, root, st in sorted(entries(), key=lambda t: str(t[1])):
+    for key, root, gitdir, st in sorted(entries(), key=lambda t: (str(t[1]), str(t[2]))):
         n += 1
         date = time.strftime("%Y-%m-%d %H:%M", time.localtime(key.stat().st_mtime))
-        label = str(root) if root else f"<key {key.name}, trusted by an older version>"
+        label = titled(root, gitdir) if root else f"<key {key.name}, trusted by an older version>"
         err(f"{colors[st](f'{st:<10}')} {date}  {san(label)}")
     if n == 0:
         info(f"no repository registered in {STATE}")
@@ -3949,11 +4054,11 @@ def cmd_forget(args: list[str]) -> None:
         raise Refuse("usage: gitguard forget <repo>... | --missing")
     if args[0] == "--missing":
         n = 0
-        for key, root, st in entries():
+        for key, root, gitdir, st in entries():
             if st in ("missing", "unknown"):
                 forget_key(key)
                 n += 1
-                info(f"forgotten: {root or key.name}")
+                info(f"forgotten: {titled(root, gitdir) if root else key.name}")
         # A never-trusted repository has a record but no manifest, so
         # entries() does not list it: once deleted, its record stayed. [57]
         for p in sorted(STATE.glob("????????????????.pending")):
@@ -3962,10 +4067,11 @@ def cmd_forget(args: list[str]) -> None:
                 continue
             d = load_pending(key)
             root = d.get("root") if d else None
-            if root is None or not Path(root).is_dir():
+            gitdir = d.get("gitdir") if d else None
+            if root is None or not Path(root).is_dir() or (gitdir and not Path(gitdir).is_dir()):
                 forget_key(key)
                 n += 1
-                info(f"forgotten: {root or key.name}")
+                info(f"forgotten: {titled(root, gitdir) if root else key.name}")
         # Lock files of earlier versions, nothing takes them any more. [57]
         for p in STATE.glob("????????????????.pending.lock"):
             p.unlink(missing_ok=True)
@@ -3974,26 +4080,35 @@ def cmd_forget(args: list[str]) -> None:
         return
     for a in args:
         root = Path(a).resolve()
-        key = key_for(root)
-        if not key.is_file() and not pending_path(key).is_file():
+        keys = [k for k in records_at(root) if k.is_file() or pending_path(k).is_file()]
+        if not keys:
             warn(f"not registered: {root}")
-            continue
-        forget_key(key)
-        info(f"forgotten: {root}")
+        for key in keys:
+            name = _record_title(key) or str(root)
+            forget_key(key)
+            info(f"forgotten: {name}")
+
+
+def _record_title(key: Path) -> str | None:
+    """The repository a state key is recorded for, as named to the user."""
+    m, d = load_manifest(key), load_pending(key)
+    if m is not None and m.root:
+        return titled(m.root, m.gitdir)
+    return titled(d["root"], d.get("gitdir")) if d else None
 
 
 def cmd_retrust() -> None:
     n = skipped = 0
-    for key, root, st in entries():
+    for key, root, gitdir, st in entries():
         if st in ("ok", "legacy") and root:
-            insp = inspect(open_repo(root))
+            insp = inspect(open_record(root, gitdir))
             save_trust(insp.repo, insp.refs, insp.new)
             clear_pending(key)
             n += 1
-            info(f"re-trusted: {root}")
+            info(f"re-trusted: {titled(root, gitdir)}")
         else:
             skipped += 1
-            warn(f"skipped ({st}): {root or key.name}")
+            warn(f"skipped ({st}): {titled(root, gitdir) if root else key.name}")
     info(f"{n} repository(ies) re-trusted, {skipped} skipped")
     check_safe_bare()
     check_wrap()
@@ -4004,7 +4119,7 @@ def review(repo: Repo, key: Path, old: dict, new: dict, refs: list[tuple[str, Pa
     """Show what differs from the reference, ask on the terminal, and record
     exactly the state that was shown. True when recorded."""
     rule()
-    warn(STYLE.bold(f"{repo.label}/.git has changed since the last trust"))
+    warn(STYLE.bold(f"{repo.dotgit} has changed since the last trust"))
     show_changes(repo, old, new, key)
     err("")
     rule()
@@ -4012,7 +4127,7 @@ def review(repo: Repo, key: Path, old: dict, new: dict, refs: list[tuple[str, Pa
         return False
     save_trust(repo, refs, new)
     clear_pending(key)
-    info(f"trust state recorded for {repo.label}")
+    info(f"trust state recorded for {repo.title}")
     return True
 
 
@@ -4045,7 +4160,8 @@ def _show_waiters(d: dict) -> list[dict]:
 
 
 def review_pending(key: Path, d: dict) -> None:
-    label = Path(str(d["root"]))
+    gitdir = str(d["gitdir"]) if d.get("gitdir") else None
+    label = titled(d["root"], gitdir)
     kind = str(d.get("kind", "?"))
     err(STYLE.bold(f"{san(label)}") + f"  [{san(kind)}, since {_age(d.get('created'))}]")
     _show_waiters(d)
@@ -4053,7 +4169,7 @@ def review_pending(key: Path, d: dict) -> None:
         err(f"  {san(str(d.get('message', '')))}")
         hint("Inspect, then:  gitguard trust  (clears this record)   or:  gitguard pending -c <repo>")
         return
-    insp = inspect(open_repo(label))
+    insp = inspect(open_record(Path(str(d["root"])), gitdir))
     repo, refs, live = insp.repo, insp.refs, insp.new
     old = load_manifest(key)
     if old is None or not old.current:
@@ -4084,12 +4200,13 @@ def cmd_pending(args: list[str]) -> None:
         if len(args) < 2:
             raise Refuse("usage: gitguard pending -c <repo>...")
         for a in args[1:]:
-            key = key_for(Path(a).resolve())
-            if pending_path(key).is_file():
-                clear_pending(key)
-                info(f"cleared: {Path(a).resolve()}")
-            else:
+            keys = [k for k in records_at(Path(a).resolve()) if pending_path(k).is_file()]
+            if not keys:
                 warn(f"nothing pending: {Path(a).resolve()}")
+            for key in keys:
+                name = _record_title(key) or str(Path(a).resolve())
+                clear_pending(key)
+                info(f"cleared: {name}")
         return
     records = _pending_records()
     if not args:
@@ -4101,7 +4218,7 @@ def cmd_pending(args: list[str]) -> None:
             colors = {"changed": STYLE.yellow, "never": STYLE.red, "structural": STYLE.red}
             kind = str(d.get("kind", "?"))
             err(f"{colors.get(kind, str)(f'{kind:<11}')} {_age(d.get('created')):>6}  "
-                f"{n} waiting  {san(str(d['root']))}")
+                f"{n} waiting  {san(titled(d['root'], d.get('gitdir')))}")
         hint("gitguard pending <repo>   to see the diff and decide     -a: all")
         return
     if args == ["-a"]:
@@ -4109,12 +4226,10 @@ def cmd_pending(args: list[str]) -> None:
     else:
         targets = []
         for a in args:
-            key = key_for(Path(a).resolve())
-            d = load_pending(key)
-            if d is None:
+            found = [(k, d) for k in records_at(Path(a).resolve()) if (d := load_pending(k)) is not None]
+            if not found:
                 warn(f"nothing pending: {Path(a).resolve()}")
-            else:
-                targets.append((key, d))
+            targets += found
     for key, d in targets:
         review_pending(key, d)
 
@@ -5088,7 +5203,12 @@ def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
     if old is None or not old.current:
         rule()
         why = "trusted by an older version" if old else "never trusted"
-        raise Refuse(f"repository {why}: {repo.label}\n  Inspect .git/config and .git/hooks, then:  "
+        if repo.apart:
+            # `gitguard trust` typed in the tree would bless `<tree>/.git`.
+            raise Refuse(f"repository {why}: {repo.title}\n  Inspect its config and hooks, then:  "
+                         + STYLE.cyan(f"GIT_DIR={shlex.quote(str(repo.gitdir))} "
+                                      f"GIT_WORK_TREE={shlex.quote(str(repo.label))} gitguard trust"))
+        raise Refuse(f"repository {why}: {repo.title}\n  Inspect .git/config and .git/hooks, then:  "
                      + STYLE.cyan("gitguard trust"))
     if old.entries == new:
         if pending_path(key).is_file():
@@ -5105,7 +5225,7 @@ def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
             info(f"config: {'; '.join(what)} → reference updated")
             return
     rule()
-    warn(STYLE.bold(f"{repo.label}/.git has changed since the last trust"))
+    warn(STYLE.bold(f"{repo.dotgit} has changed since the last trust"))
     show_changes(repo, old.entries, new, key)
     err("")
     rule()
@@ -5113,14 +5233,14 @@ def check_or_die(repo: Repo, key: Path, old: Manifest | None, new: dict,
             "Trust this state and run git? [y/N] ")):
         save_trust(repo, refs, new)
         clear_pending(key)
-        info(f"trust state recorded for {repo.label}")
+        info(f"trust state recorded for {repo.title}")
         return
     if interactive and not has_tty():
         # Run by a program (editor, build, cron): nobody reads this. Record
         # the state and wait for `gitguard pending`; shortcut 3.
         outcome = wait_for_decision(repo, key, new, refs)
         if outcome == "allowed":
-            info(f"allowed through gitguard pending: {repo.label}")
+            info(f"allowed through gitguard pending: {repo.title}")
             return
         e = Refuse("refused through gitguard pending." if outcome == "refused" else
                    f"no decision within {wait_seconds():g} s: refusing to run git. "
@@ -5324,7 +5444,7 @@ class Judged:
             if os.environ.get("GITGUARD_DEBUG"):
                 err(san(f"child git: the config names {named[0]} in the served repository's tree"))
             return False
-        old = load_manifest(key_for(Path(self.paths[3])))
+        old = load_manifest(state_key(Path(self.paths[3]), gitdir))
         if old is None or not old.current:
             if os.environ.get("GITGUARD_DEBUG"):
                 err(san(f"child git: the config names {named[0]} in another tree, nothing hashed"))
@@ -5654,6 +5774,7 @@ def main(argv: list[str]) -> int:
     # recorded for `gitguard pending`. The "changed" case records itself
     # (and waits); here the never-trusted and structural ones.
     label: Path = Path.cwd()
+    named: str | None = None
     key: Path | None = None
     old: Manifest | None = None
     fingerprinted = False
@@ -5670,7 +5791,7 @@ def main(argv: list[str]) -> int:
                 raise Refuse(f"no git repository here: {Path.cwd()}")      # [30]
             return 0
         repo = open_repo(root)
-        label, key = repo.label, repo.key
+        label, key, named = repo.label, repo.key, repo.named
         if mode == "exec":
             _COMMAND = split_global_options(argv, orig).rest       # [147]
         if judged is not None:
@@ -5708,7 +5829,7 @@ def main(argv: list[str]) -> int:
         if mode == "exec" and not e.recorded and (judged is not None or not has_tty()):
             kind = "never" if fingerprinted and (old is None or not old.current) else "structural"
             record_pending(key or key_for(Path.cwd().resolve()), kind, label, str(e),
-                           notify_user=judged is None)
+                           notify_user=judged is None, gitdir=named)
             e.recorded = True
         raise
 
@@ -5724,12 +5845,12 @@ def main(argv: list[str]) -> int:
                 check_wrap()
                 return 0
             rule()
-            warn(STYLE.bold(f"{repo.label}/.git has changed since the last trust"))
+            warn(STYLE.bold(f"{repo.dotgit} has changed since the last trust"))
             show_changes(repo, old.entries, new, key)
             rule()
         save_trust(repo, refs, new)
         clear_pending(key)
-        info(f"trust state recorded for {repo.label}")
+        info(f"trust state recorded for {repo.title}")
         wt = [f"{s}:{p}" for s, p in refs]
         if wt:
             hint(f"the config references outside the gitdir: {' '.join(wt)} → watched too")
@@ -5739,16 +5860,16 @@ def main(argv: list[str]) -> int:
         return 0
     if mode == "diff":
         if old is None:
-            raise Refuse(f"no trust state for {repo.label} (gitguard trust)")
+            raise Refuse(f"no trust state for {repo.title} (gitguard trust)")
         if old.entries == new:
-            info(f"no changes in {repo.label}")
+            info(f"no changes in {repo.title}")
         else:
-            err(STYLE.yellow(STYLE.bold(f"changes in {san(repo.label)}/.git:")))
+            err(STYLE.yellow(STYLE.bold(f"changes in {san(repo.dotgit)}:")))
             show_changes(repo, old.entries, new, key)
         return 0
     if mode == "restore":
         if old is None:
-            raise Refuse(f"no trust state for {repo.label} (gitguard trust)")
+            raise Refuse(f"no trust state for {repo.title} (gitguard trust)")
         restore(repo, key, old.entries, new, yes, old.refs)
         return 0
 
@@ -5760,7 +5881,7 @@ def main(argv: list[str]) -> int:
             if holder is not None:
                 save_trust(repo, refs, new)
                 clear_pending(key)
-                info(f"trusted with {holder}: {repo.label}")
+                info(f"trusted with {holder}: {repo.title}")
                 old = load_manifest(key)
         # A child never asks, waits, auto-accepts or notifies: it shares the
         # parent's terminal, which the parent git may be reading, and nobody
@@ -5769,7 +5890,7 @@ def main(argv: list[str]) -> int:
     except Refuse as e:
         if mode == "exec" and not e.recorded and (judged is not None or not has_tty()):
             kind = "never" if old is None or not old.current else "structural"
-            record_pending(key, kind, label, str(e), notify_user=judged is None)
+            record_pending(key, kind, label, str(e), notify_user=judged is None, gitdir=named)
             e.recorded = True
         raise
     if mode == "exec":
