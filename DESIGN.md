@@ -1918,8 +1918,8 @@ the files, not the order.
 - `VALUE_KEYS` is one inventory, the newest git's (2.56): a key an older
   git reads as a boolean and the newest no longer does (`merge.stat` in
   2.47) keeps the generic rule there, a tree file named `false` watched
-  (audit #2, L2-12; a union of inventories is the mechanical fix, not
-  decided).
+  (what is left of [129] for such a key; a union of inventories is the
+  mechanical fix, not decided).
 - `_git_maybe_bool` reads a `0b` literal as a number ([141]); git does so
   only where its libc has C23's strtol (glibc ≥ 2.38) and dies on it
   elsewhere (macOS): the parity test holds where git reads it, and the
