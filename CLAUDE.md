@@ -65,7 +65,9 @@ paid for by a bypass.
   judged gitdir, common dir, root and label, and covers the gitdir roots
   the walk descends (`gitdir_roots`), never a name or a prefix ([102]
   [103]); at another work tree root, only if what its config names there
-  was hashed ([115] [120]); a served repository, exactly ([121] [122]). It
+  was hashed ([115] [120]); a served repository, exactly ([121] [122]); a
+  repository a covered root borrows objects from, whose config and hooks
+  the scan watches like a local remote's (`alternate_repos`, [156]). It
   lives as long as the process that set it, pid and start time
   (`_ancestors`), never a clock ([104] [114]); a child git does not
   detach (`keep_attached`, [117]). A tree never trusted (a submodule, a
@@ -120,6 +122,7 @@ are honoured as git honours them.
 | structural refusals (nested `.git`, index names, todo files, symlinks, perms) | `check_structure`, `check_indexes`, `check_volatile_readers`, `VOLATILE_READERS` | What the script checks, 3 |
 | what is hashed in the gitdir | `walk_gitdir`, `_child_root`, `_volatile_*`, `VOLATILE_DIRS`, `VOLATILE_FILES` (paths relative to a gitdir root) | What the fingerprint watches in the gitdir |
 | paths the config makes git read | `ConfigScan` (`add`, `consider`, `run`), `config_refs`, `DIR_KEYS`, `DATA_KEYS`, `global_config_files`, `iter_global_config`, `env_config` | What the fingerprint watches outside the gitdir |
+| a repository git borrows objects from (`--reference`, alternates): its config watched, its child covered | `alternate_repos`, `alternate_object_dirs`, `_alternates_entries`, `_borrowed`, `ConfigScan.run`, `Judged.covers` | same, "A repository git borrows objects from"; Nested repositories |
 | the check pipeline (scan → structure → fingerprint) | `inspect`, `Inspection`, `save_trust` | Organization of gitguard.py |
 | config parser | `_Src`, `_parse_value`, `parse_git_config` | same, "Config files parsed" |
 | output, colours, `san` | `san`, `Style`, `set_output` | Display and sanitization |

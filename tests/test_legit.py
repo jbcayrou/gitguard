@@ -1550,3 +1550,138 @@ def test_worktree_add_with_a_tracking_branch_asks_nothing(gg: GG, repo: Path, tm
     wt = tmp_path / "wt"
     _silent(gg, repo, "worktree", "add", "-q", "-b", "feat", str(wt), "origin/main")
     assert "feat" in gg.git("config", "--get-regexp", r"^branch\.", cwd=repo).out
+
+
+# ------------------- a repository git borrows objects from ([156], 2026-11-13)
+def _objects(repo: Path) -> int:
+    """Object files the repository holds itself: loose objects and packs."""
+    od = repo / "objects" if (repo / "objects").is_dir() else repo / ".git/objects"
+    return sum(1 for p in od.rglob("*") if p.is_file() and "info" not in p.relative_to(od).parts)
+
+
+def _traced(gg: GG, *args: str, cwd: Path) -> str:
+    """The command through gitguard with git's trace on: no refusal, no
+    false change, and the trace, which says where git ran a child."""
+    gg.env["GIT_TRACE"] = "1"
+    r = gg.run("git", *args, cwd=cwd)
+    del gg.env["GIT_TRACE"]
+    assert r.rc == 0 and "✗" not in r.err and "has changed" not in r.err, r.text
+    return r.err
+
+
+def _enters(trace: str, gitdir: Path) -> bool:
+    return f"--git-dir={gitdir.resolve()} for-each-ref" in trace
+
+
+def _upstream(gg: GG, tmp_path: Path) -> Path:
+    src = make_source(gg, tmp_path, "upstream")
+    for i in range(3):
+        commit(gg, src, f"u{i}", str(i))
+    return src
+
+
+@pytest.mark.parametrize("form", ["bare", "worktree", "shared", "chain", "dissociate"])
+def test_clone_reference_borrows_and_stays_silent(gg: GG, tmp_path: Path, form: str) -> None:
+    """[156] `clone --reference <mirror>`: git asks the mirror what it holds
+    through a child, `git --git-dir=<mirror> for-each-ref`, during the
+    clone and at every later fetch. Refused, the clone downloaded what the
+    mirror already had and every fetch printed a false "has changed" with
+    the mirror's config. A bare mirror, a working clone, the source itself
+    (`--shared`), a mirror that borrows from another, `--dissociate`."""
+    src = _upstream(gg, tmp_path)
+    mirror, dst = tmp_path / "mirror.git", tmp_path / "dst"
+    if form == "worktree":
+        mirror = tmp_path / "mirror"
+        assert gg.git("clone", "-q", str(src), str(mirror)).rc == 0
+    elif form == "chain":
+        first = tmp_path / "first.git"
+        assert gg.git("clone", "-q", "--mirror", str(src), str(first)).rc == 0
+        assert gg.git("clone", "-q", "--mirror", "--reference", str(first), str(src), str(mirror)).rc == 0
+        assert (mirror / "objects/info/alternates").is_file()
+    elif form != "shared":
+        assert gg.git("clone", "-q", "--mirror", str(src), str(mirror)).rc == 0
+    opts = ["--shared"] if form == "shared" else ["--reference", str(mirror)]
+    if form == "dissociate":
+        opts.append("--dissociate")
+    url = str(src) if form == "shared" else f"file://{src}"
+    # `--shared`: the source is the alternate, everything it has is already
+    # there and git negotiates nothing — no child to enter it.
+    borrowed = {"bare": [mirror], "worktree": [mirror / ".git"], "shared": [],
+                "chain": [mirror, tmp_path / "first.git"], "dissociate": [mirror]}[form]
+
+    trace = _traced(gg, "clone", "-q", *opts, url, str(dst), cwd=tmp_path)
+    for g in borrowed:
+        assert _enters(trace, g), f"the clone no longer enters {g}\n{trace}"
+    if form != "dissociate":
+        assert _objects(dst) == 0, "the clone copied what it borrows"
+    assert not gg.check(dst).blocked, "auto-trust of the clone"
+    # A fetch that negotiates (the mirror is behind): git enters it again.
+    commit(gg, src, "ahead", "1")
+    trace = _traced(gg, "fetch", "-q", cwd=dst)
+    assert "gitguard:" not in trace, trace
+    for g in borrowed if form in ("bare", "worktree", "chain") else []:
+        assert _enters(trace, g), f"the fetch no longer enters {g}\n{trace}"
+    # One whose objects the mirror already holds: nothing is copied.
+    commit(gg, src, "later", "1")
+    if form == "worktree":
+        assert gg.git("pull", "-q", cwd=mirror).rc == 0
+    elif form in ("bare", "chain"):
+        assert gg.git("fetch", "-q", cwd=mirror).rc == 0
+    before = _objects(dst)
+    r = gg.run("git", "fetch", "-q", cwd=dst)
+    assert r.rc == 0 and not r.err, r.text
+    if form in ("bare", "worktree", "chain", "shared"):
+        assert _objects(dst) == before, "the fetch copied what the mirror holds"
+    r = gg.run("git", "status", "--short", cwd=dst)
+    assert r.rc == 0 and not r.err, r.text
+
+
+def test_reference_added_to_a_trusted_repository(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[156] an alternate written by hand into a trusted repository (`echo
+    <mirror>/objects >> .git/objects/info/alternates`): one question, the
+    file is hashed, then silence — the mirror's config is in the reference
+    and the child git runs there is covered."""
+    src = _upstream(gg, tmp_path)
+    mirror = tmp_path / "mirror.git"
+    assert gg.git("clone", "-q", "--mirror", str(src), str(mirror)).rc == 0
+    commit(gg, src, "ahead", "1")
+    gg.git("remote", "add", "origin", f"file://{src}", cwd=repo)
+    gg.trust(repo)
+    (repo / ".git/objects/info/alternates").write_text(f"{mirror}/objects\n")
+    r = gg.check(repo)
+    assert r.blocked and "objects/info/alternates" in r.err, r.text
+    gg.trust(repo)
+    trace = _traced(gg, "fetch", "-q", "origin", cwd=repo)
+    assert _enters(trace, mirror) and "gitguard:" not in trace, trace
+    assert not gg.check(repo).blocked
+
+
+def test_submodule_updated_with_a_reference(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[156] `submodule update --init --reference <mirror>`: the submodule's
+    clone borrows from the mirror — a clone run by a child git, under its
+    own marker — and so does every later fetch of the submodule, from the
+    superproject or from its own tree."""
+    src = make_source(gg, tmp_path)
+    for i in range(3):
+        commit(gg, src, f"s{i}", str(i))
+    mirror = tmp_path / "submirror.git"
+    assert gg.git("clone", "-q", "--mirror", str(src), str(mirror)).rc == 0
+    add_submodule(gg, repo, tmp_path)
+    # A URL, as for a submodule fetched over the network: git negotiates
+    # (a plain path is copied, and nothing is asked of the mirror).
+    assert gg.git("config", "-f", ".gitmodules", "submodule.sub.url", f"file://{src}", cwd=repo).rc == 0
+    assert gg.git("commit", "-qam", "url", cwd=repo).rc == 0
+    clone = tmp_path / "clone"
+    assert gg.run("git", "clone", "-q", f"file://{repo}", str(clone), cwd=tmp_path).rc == 0
+    allow = ["-c", "protocol.file.allow=always"]
+    trace = _traced(gg, *allow, "submodule", "update", "-q", "--init", "--reference", str(mirror), cwd=clone)
+    assert _enters(trace, mirror), f"the submodule's clone no longer enters the mirror\n{trace}"
+    assert (clone / ".git/modules/sub/objects/info/alternates").is_file()
+    assert _objects(clone / ".git/modules/sub") == 0, "the submodule's clone copied what it borrows"
+    gg.trust(clone)
+    commit(gg, src, "ahead", "1")
+    trace = _traced(gg, *allow, "fetch", "-q", "--recurse-submodules=yes", cwd=clone)
+    assert _enters(trace, mirror) and "gitguard:" not in trace, trace
+    commit(gg, src, "ahead", "2")
+    trace = _traced(gg, "fetch", "-q", cwd=clone / "sub")
+    assert _enters(trace, mirror), trace

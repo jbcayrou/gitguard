@@ -54,7 +54,7 @@ import shlex
 import stat
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from functools import cached_property
 from pathlib import Path
 
@@ -1517,6 +1517,144 @@ def gitdir_roots(base: Path) -> Iterator[Path]:
                 stack.append(c)
 
 
+# ------------------------------------------------------------- alternates
+# A repository that borrows objects (`clone --reference`, `--shared`, a
+# line in `objects/info/alternates`) makes git enter the repository it
+# borrows from: at every negotiation — a clone, a fetch, a push received —
+# git lists that repository's refs through a child, `git --git-dir=<repo>
+# for-each-ref` (for_each_alternate_ref), which reads its config. Ports of
+# the readers that decide where that child runs (object-file.c up to git
+# 2.49, odb.c since; the same text from 2.39 to 2.56), held to git in
+# tests/test_git_parity.py. [156]
+#
+#   _unquote_c_style        unquote_c_style        (quote.c)
+#   _alternates_entries     parse_alt_odb_entry    (parse_alternates since 2.51)
+#   alternate_object_dirs   read_info_alternates, link_alt_odb_entry,
+#                           alt_odb_usable
+#   alternate_repos         refs_from_alternate_cb
+ALTERNATES_DEPTH = 5     # git: "ignoring alternate object stores, nesting too deep"
+_C_ESCAPES = {ord(c): v for c, v in zip("abfnrtv", b"\a\b\f\n\r\t\v")}
+
+
+def _unquote_c_style(buf: bytes, i: int) -> tuple[bytes, int] | None:
+    """unquote_c_style at the `"` of buf[i]: the bytes, and the index after
+    the closing quote. `\\a \\b \\f \\n \\r \\t \\v`, `\\\\`, `\\"`, three
+    octal digits the first of which is 0 to 3. None where git gives up
+    (another escape, no closing quote): the caller then reads the entry
+    unquoted, its quote included."""
+    out = bytearray()
+    i += 1
+    while True:
+        j = i
+        while j < len(buf) and buf[j] not in b'"\\':
+            j += 1
+        out += buf[i:j]
+        if j == len(buf):
+            return None
+        i = j + 1
+        if buf[j] == ord('"'):
+            return bytes(out), i
+        ch = buf[i:i + 1]
+        i += 1
+        if ch and ch[0] in _C_ESCAPES:
+            out.append(_C_ESCAPES[ch[0]])
+        elif ch in (b"\\", b'"'):
+            out += ch
+        elif ch and ch in b"0123":
+            low = buf[i:i + 2]
+            if len(low) != 2 or any(d not in b"01234567" for d in low):
+                return None
+            out.append((ch[0] - 48) << 6 | (low[0] - 48) << 3 | (low[1] - 48))
+            i += 2
+        else:
+            return None
+
+
+def _alternates_entries(buf: bytes) -> list[bytes]:
+    """The entries of an `info/alternates` file, as parse_alt_odb_entry cuts
+    them: one per line; a line starting with `#` is a comment; one starting
+    with `"` is a C-quoted path when it unquotes — which may run over
+    several lines — and then the one character after the closing quote is
+    dropped, whatever it is; an empty entry is skipped. Nothing is trimmed:
+    a trailing blank or CR is part of the path."""
+    out, i = [], 0
+    while i < len(buf):
+        entry, quoted = b"", None
+        if buf[i] == ord('"'):
+            quoted = _unquote_c_style(buf, i)
+        if quoted is not None:
+            entry, end = quoted
+        else:
+            end = buf.find(b"\n", i)
+            end = len(buf) if end < 0 else end
+            if buf[i] != ord("#"):
+                entry = buf[i:end]
+        i = end + 1
+        if entry:
+            out.append(entry)
+    return out
+
+
+def alternate_object_dirs(objdir: Path) -> tuple[list[Path], list[Path]]:
+    """(the object directories git links as alternates of `objdir`, the
+    `info/alternates` files it reads to find them). An entry is absolute or
+    relative to the object directory whose file names it, resolved
+    (strbuf_realpath), kept when it is a directory git has not linked yet;
+    each one's own file is then read, six levels in all. A superset where
+    git compares names ignoring case. NUL: git stops reading there (C
+    string), refused here as in every file read as a path ([53])."""
+    dirs: list[Path] = []
+    files: list[Path] = []
+    seen = {os.path.realpath(objdir)}
+
+    def read(base: str, depth: int) -> None:
+        f = Path(base) / "info/alternates"
+        try:
+            buf = read_file(f)
+        except OSError:
+            return
+        files.append(f)
+        if b"\0" in buf:
+            raise Refuse(f"{f}: NUL byte")
+        if depth > ALTERNATES_DEPTH:
+            return
+        for entry in _alternates_entries(buf):
+            p = os.fsdecode(entry)
+            real = os.path.realpath(p if p.startswith("/") else f"{os.path.realpath(base)}/{p}")
+            if real in seen or not os.path.isdir(real):
+                continue
+            seen.add(real)
+            dirs.append(Path(real))
+            read(real, depth + 1)
+
+    read(str(objdir), 0)
+    return dirs, files
+
+
+def alternate_repos(root: Path) -> tuple[list[tuple[Path, Path]], list[Path]]:
+    """What git enters for the alternates of the gitdir root `root`: the
+    (gitdir, common dir) of each repository where it runs `git
+    --git-dir=<gitdir> for-each-ref` — an alternate whose resolved path
+    ends in `/objects`, with a `refs` directory beside it — and the files
+    that decide it: the alternates files, each such gitdir's `commondir`.
+    The common dir as open_repo finds it for that child (git clears
+    GIT_COMMON_DIR for it): its config is the one the child reads. A
+    `commondir` naming nothing is refused, as for a local remote: git
+    dies there. [156]"""
+    dirs, files = alternate_object_dirs(root / "objects")
+    repos = []
+    for d in dirs:
+        g = d.parent
+        if d.name != "objects" or not (g / "refs").is_dir():
+            continue
+        common, cd = g, g / "commondir"
+        if cd.is_file():
+            files.append(cd)
+            common = _resolve_existing(g / _read_path_file(cd), cd)
+        repos.append((g, common))
+    return repos, files
+
+
 def _read_todo(p: Path) -> None:
     """Rebase/cherry-pick todo lists accept `exec <cmd>` lines that git runs
     verbatim. The container can inject some during an in-progress rebase:
@@ -2430,6 +2568,25 @@ class ConfigScan:
         for b in sub_bases:
             if (b / ".lfsconfig").is_file():
                 out[b / ".lfsconfig"] = "wt" if repo.root in b.parents else "ext"
+        # A repository this one borrows objects from (`clone --reference`,
+        # `--shared`): at every negotiation git runs `for-each-ref` there,
+        # a child that reads that repository's config — from the tree the
+        # fetch runs in, the root or a submodule's. Watched like a local
+        # remote: its config, the files that say where it is, and its
+        # hooks/ — git runs none from there, but the marker covers the
+        # repository, not that one command (Judged.covers). That child,
+        # refused, cost `--reference` its purpose and printed the mirror's
+        # config as a change of the borrower at every fetch. [156]
+        sub_tree = {cf.parent: b for cf, b in sub_configs}
+        for r in dict.fromkeys([*gitdir_roots(repo.gitdir), *gitdir_roots(repo.common)]):
+            borrowed, files = alternate_repos(r)
+            for f in files:
+                self.add(f, f)
+            for gd, common in borrowed:
+                for f in (common / "config", gd / "config.worktree"):
+                    self.add(f, f)
+                    queue.append((f, sub_tree.get(r, repo.root), False, False))
+                self.add(common / "hooks", common / "hooks", allow_dir=True)
         # A file is read once per (file, base, origin), not once: one file
         # included by the superproject's config and a submodule's (a
         # `~/team.gitconfig`) has its relative values resolved in each; one
@@ -4574,7 +4731,11 @@ def run_git(args: list[str], orig: Path, newrepo: NewRepo | None, git: str,
     # `<dir>/.git`, or the `--separate-git-dir` target. [113]
     preexisting = any(g.exists() or g.is_symlink()
                       for g in (d / ".git", *([newrepo.gitdir] if newrepo.gitdir else [])))
-    set_judged("new", *newrepo.paths)     # its children, the submodule clones included
+    # Its children, the submodule clones included. A clone that creates its
+    # gitdir also enters the repositories it borrows from (`--reference`,
+    # `--shared`): the alternates file there is git's own, written from the
+    # command line — a gitdir found there may hold anybody's. [156]
+    set_judged("clone" if newrepo.sub == "clone" and not preexisting else "new", *newrepo.paths)
     rc = subprocess.call([git, *args])
     if rc == 0 and newrepo.auto_trust:
         d = d.resolve()
@@ -5066,7 +5227,9 @@ class Judged:
     for a served repository, which nobody judged as a whole)
     or `<pid>.<start>:new=<path>[,<gitdir>]` (a clone/init in progress: the
     repository does not exist yet; it and its submodule clones are under
-    `path`, its gitdir at `gitdir` for `--separate-git-dir`). Paths are
+    `path`, its gitdir at `gitdir` for `--separate-git-dir`; `clone=` in
+    place of `new=` for a clone that creates its gitdir, which also enters
+    the repositories it borrows from, [156]). Paths are
     hex-encoded: they hold anything but NUL. `pid`, `start`: the process
     that set the marker — gitguard, which execs the real git under its own
     pid, or stays its parent for a clone — and its start time. The marker
@@ -5104,6 +5267,12 @@ class Judged:
           ([107]). A served repository's marker
           names a gitdir nobody walked: that gitdir and common dir exactly
           ([121]: its `worktrees/*` and `modules/*` were covered too).
+        - or a repository one of those roots borrows objects from, where
+          git lists the refs through a child at every negotiation
+          (alternate_repos): the parent hashed the alternates files that
+          name it, its config and its hooks/ (ConfigScan.run). The gitdir
+          and the common dir git opens there, exactly; not for a served
+          repository, whose alternates nobody read. [156]
         - what its config names in its tree, when its tree is not the
           judged one (a submodule, a linked worktree, `filter-branch`'s
           `.git-rewrite/t`, `--work-tree=<site>`): a relative hooksPath,
@@ -5116,13 +5285,24 @@ class Judged:
 
         A clone in progress covers anything whose gitdir, common dir or root
         is under the new path ([101]: the clone's index-pack runs with
-        `GIT_DIR=<new>/.git` from the user's cwd).
+        `GIT_DIR=<new>/.git` from the user's cwd), and the repositories the
+        new gitdir borrows from: `--reference <mirror>`, entered before any
+        fingerprint holds the mirror's config — the first use, as for a
+        local source, of a repository the command line names; what the
+        child git runs there executes is held to git in test_claims.py.
+        Not for an init, nor for a gitdir that was there before the
+        command: its alternates file is not git's own. [156]
 
         Reads the child's config and the parent's manifest for the other-root
         case; raises Refuse as `inspect` would on a config git dies on."""
-        if self.kind == "new":
-            return any(n == p or n in p.parents for n in map(Path, self.paths)
-                       for p in (repo.gitdir, repo.common, repo.root))
+        if self.kind in ("new", "clone"):
+            news = [Path(p) for p in self.paths]
+            if any(n == p or n in p.parents for n in news for p in (repo.gitdir, repo.common, repo.root)):
+                return True
+            if self.kind == "new":
+                return False
+            new = news[1] if len(news) > 1 else news[0] / ".git" if (news[0] / ".git").is_dir() else news[0]
+            return (repo.gitdir, repo.common) in _borrowed(gitdir_roots(new))
         gitdir, common = Path(self.paths[0]), Path(self.paths[1])
         root = Path(self.paths[2]) if self.paths[2] else None
         if root is None:
@@ -5132,7 +5312,8 @@ class Judged:
             roots = set(gitdir_roots(gitdir))
             if common != gitdir:
                 roots |= set(gitdir_roots(common))
-            if repo.gitdir not in roots or repo.common not in roots:
+            if ((repo.gitdir not in roots or repo.common not in roots)
+                    and (repo.gitdir, repo.common) not in _borrowed(roots)):
                 return False
             if repo.root == root:
                 return True
@@ -5163,6 +5344,12 @@ class Judged:
                     err(san(f"child git: {p} is named by the config in another tree, not hashed"))
                 return False
         return True
+
+
+def _borrowed(roots: Iterable[Path]) -> set[tuple[Path, Path]]:
+    """The (gitdir, common dir) of every repository the gitdir roots
+    `roots` borrow objects from (alternate_repos)."""
+    return {pair for r in roots for pair in alternate_repos(r)[0]}
 
 
 def _proc_linux(pid: int) -> tuple[int, int]:
@@ -5231,7 +5418,7 @@ def read_judged() -> Judged | None:
         paths = [os.fsdecode(bytes.fromhex(h)) for h in value.split(",")]
         ok = (kind == "repo" and len(paths) == 4 and paths[0] and paths[1]
               and bool(paths[2]) == bool(paths[3])     # a root with its label, or neither (served)
-              or kind == "new" and 1 <= len(paths) <= 2 and all(paths))
+              or kind in ("new", "clone") and 1 <= len(paths) <= 2 and all(paths))
         if not dot or not eq or not ok:
             raise ValueError
         j = Judged(int(pid), int(start), kind, paths)

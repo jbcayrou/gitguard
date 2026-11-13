@@ -832,3 +832,69 @@ def attack_alias_quoted_program_tab(gg: GG, repo: Path, tmp_path: Path) -> None:
     cfg.write_bytes(cfg.read_bytes() + b"[alias]\n\tzz = !'./my\ttools/ed'\n")
     gg.trust(repo)
     write_exec(repo / "my tools/ed")
+
+
+# [156] a repository the trusted one borrows objects from (`clone
+# --reference`, `objects/info/alternates`): git runs `for-each-ref` there at
+# every fetch, a child gitguard lets through; what that child reads is
+# watched like a local remote's.
+def _borrows(gg: GG, repo: Path, tmp_path: Path) -> Path:
+    """The user: `repo` borrows from a mirror of the volume, and trusted it so."""
+    mirror = tmp_path / "vol-mirror.git"
+    gg.git("init", "-q", "--bare", str(mirror))
+    (repo / ".git/objects/info/alternates").write_text(f"{mirror}/objects\n")
+    gg.trust(repo)
+    return mirror
+
+
+def attack_alternate_repository_config(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[156] the config of the repository an alternate belongs to, rewritten: the `for-each-ref` child of every fetch reads it"""
+    mirror = _borrows(gg, repo, tmp_path)
+    with open(mirror / "config", "a") as f:
+        f.write("[core]\n\tfsmonitor = touch /tmp/evil\n")
+
+
+def attack_alternate_repository_include(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[156] a file the alternate's config includes, rewritten"""
+    mirror = tmp_path / "vol-mirror.git"
+    gg.git("init", "-q", "--bare", str(mirror))
+    (mirror / "extra.inc").write_text("[core]\n\tabbrev = 12\n")
+    gg.git("config", "include.path", "extra.inc", cwd=mirror)
+    (repo / ".git/objects/info/alternates").write_text(f"{mirror}/objects\n")
+    gg.trust(repo)
+    (mirror / "extra.inc").write_text("[core]\n\tfsmonitor = touch /tmp/evil\n")
+
+
+def attack_alternate_repository_commondir(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[156] `commondir` planted in the alternate's repository: the child takes its config from the directory it names"""
+    mirror = _borrows(gg, repo, tmp_path)
+    evil = tmp_path / "vol-evil.git"
+    gg.git("init", "-q", "--bare", str(evil))
+    gg.git("config", "core.fsmonitor", "touch /tmp/evil", cwd=evil)
+    (mirror / "commondir").write_text(f"{evil}\n")
+
+
+def attack_alternate_of_the_alternate(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[156] the alternate's own `objects/info/alternates`, planted: git follows it and enters the repository it names"""
+    mirror = _borrows(gg, repo, tmp_path)
+    evil = tmp_path / "vol-evil.git"
+    gg.git("init", "-q", "--bare", str(evil))
+    gg.git("config", "core.fsmonitor", "touch /tmp/evil", cwd=evil)
+    (mirror / "objects/info/alternates").write_text(f"{evil}/objects\n")
+
+
+def attack_alternate_object_store_becomes_a_repository(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[156] an alternate that was a bare object store (no `refs/` beside it, git entered nothing): the sandbox makes it a repository, config included"""
+    store = tmp_path / "vol-store"
+    (store / "objects").mkdir(parents=True)
+    (repo / ".git/objects/info/alternates").write_text(f"{store}/objects\n")
+    gg.trust(repo)
+    (store / "refs").mkdir()
+    (store / "HEAD").write_text("ref: refs/heads/main\n")
+    (store / "config").write_text("[core]\n\tfsmonitor = touch /tmp/evil\n")
+
+
+def attack_alternate_repository_hook(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[156] a hook planted in the alternate's repository: the marker covers every git a child runs there, not `for-each-ref` alone"""
+    mirror = _borrows(gg, repo, tmp_path)
+    write_exec(mirror / "hooks/pre-auto-gc", "#!/bin/sh\ntouch /tmp/evil\n")

@@ -669,6 +669,52 @@ def test_program_key_naming_a_tree_script_is_watched(gg: GG, repo: Path, key: st
     assert gg.check(repo).blocked, key
 
 
+# ================= [156] the child git runs in a repository it borrows from
+# `clone --reference <mirror>` enters the mirror before any fingerprint holds
+# its config (the clone's auto-trust records it, as it does a local
+# source's): the claim is that the child git runs there — `git
+# --git-dir=<mirror> for-each-ref --format=%(objectname)`, its output read
+# by the clone — runs nothing that config names. One program key at a time,
+# the real git and its raw child, no pin; the control is the same payload
+# reached through an alias in that mirror.
+def _mirror_with(gg: GG, tmp_path: Path, key: str) -> tuple[Path, Path, Path]:
+    from tests.attacks._helpers import commit, make_source, payload
+    src = make_source(gg, tmp_path, "upstream")
+    commit(gg, src)
+    mirror = tmp_path / "mirror.git"
+    assert gg.git("clone", "-q", "--mirror", str(src), str(mirror)).rc == 0
+    assert gg.git("config", key, PROGRAM_KEYS[key].format(p=payload(tmp_path)), cwd=mirror).rc == 0
+    return src, mirror, tmp_path / "RAN"
+
+
+@pytest.mark.parametrize("key", sorted(PROGRAM_KEYS))
+def test_alternate_refs_child_runs_nothing_of_the_mirror(gg: GG, tmp_path: Path, key: str) -> None:
+    src, mirror, ran = _mirror_with(gg, tmp_path, key)
+    gg.env["GIT_TRACE"] = "1"
+    r = gg.git("clone", "-q", "--reference", str(mirror), f"file://{src}", str(tmp_path / "dst"))
+    assert r.rc == 0, r.text
+    assert f"--git-dir={mirror.resolve()} for-each-ref --format=%(objectname)" in r.err.replace("'", ""), \
+        f"git no longer lists a mirror's refs through this child: alternate_repos, DESIGN.md\n{r.err}"
+    assert not ran.exists(), f"`for-each-ref` in the mirror ran its {key}: the clone's first use is no longer safe"
+
+
+def test_alternate_refs_child_runs_no_hook_of_the_mirror(gg: GG, tmp_path: Path) -> None:
+    from tests.attacks._helpers import PLANTED_HOOKS, payload
+    src, mirror, ran = _mirror_with(gg, tmp_path, "core.pager")
+    for h in PLANTED_HOOKS:
+        os.symlink(payload(tmp_path), mirror / "hooks" / h)
+    assert gg.git("clone", "-q", "--reference", str(mirror), f"file://{src}", str(tmp_path / "dst")).rc == 0
+    assert not ran.exists(), "`for-each-ref` in the mirror ran one of its hooks"
+
+
+def test_alternate_refs_control_the_mirror_config_is_live(gg: GG, tmp_path: Path) -> None:
+    """Positive control: the payload does run when git is asked to run
+    something of that config."""
+    _, mirror, ran = _mirror_with(gg, tmp_path, "alias.x")
+    gg.git(f"--git-dir={mirror}", "x", cwd=tmp_path)
+    assert ran.exists()
+
+
 def test_value_key_wildcards_match_their_section() -> None:
     """[139] an inventory entry ending in `.` is a wildcard section
     (`notes.rewrite.`: notes-utils.c compares `starts_with(k,

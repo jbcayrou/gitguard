@@ -222,7 +222,11 @@ own trust key for the **user's** commands, as before.
   trusted cwd reported a false diff of it); the submodule clones of
   `--recurse-submodules` run under `<path>`. Every form of clone and init
   sets it, bare and template included (`NewRepo`); only the auto-trust
-  is withheld for those.
+  is withheld for those. A clone that creates its gitdir sets `clone=`
+  in place of `new=`: the same coverage, plus the repositories the new
+  gitdir borrows objects from (`--reference`, `--shared`), read from the
+  alternates file git has just written (`alternate_repos`; DESIGN.md,
+  Nested repositories, [156]).
 - A **served repository**: `git-receive-pack`, `git-upload-pack`,
   `git-upload-archive` (`TRANSPORT`, the dashed names sshd runs) and the
   same as a first word (`SERVERS`: what `git daemon`, `http-backend` and

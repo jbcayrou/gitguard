@@ -80,6 +80,9 @@ That silence is the signal.
 - a local remote (`remote.*.url` = a path in the volume): the config and
   hooks of the repository `push` enters, opened as git opens it; `git push
   <path>` to a repository no remote names is refused;
+- a repository yours borrows objects from (`clone --reference <mirror>`,
+  `--shared`): its config and hooks too — git asks it what it holds at
+  every fetch;
 - the paths named by the system and global configs: a global
   `core.hooksPath` pointing into the mounted volume is a bypass otherwise
   (the files themselves are parsed, not hashed: the sandbox cannot write

@@ -1417,3 +1417,110 @@ def test_insteadof_rewrite_contains_what_git_uses(gg: GG, repo: Path, rules, url
     assert all(used), used
     rewrites = [(prefix, base) for base, key, prefix in rules]
     assert used <= set(gg_mod._rewritten(url, rewrites)), (used, rules)
+
+
+# ------------------------------- [156] objects/info/alternates → where git enters
+# name: (the alternates file of the repository, the stores git must enter,
+# [the alternates file of {a}]). {a} {b}: two repositories; {sp}: one whose
+# path holds a blank, {nl} a newline; {store}: objects with no refs beside
+# them; {link}: a symlink to {a}/objects; {own}: the repository's gitdir.
+ALTERNATES_VARIANTS = {
+    "plain": ("{a}/objects\n", "a"),
+    "no_final_newline": ("{a}/objects", "a"),
+    "two": ("{a}/objects\n{b}/objects\n", "ab"),
+    "blank_lines": ("\n\n{a}/objects\n\n", "a"),
+    "comment": ("#{a}/objects\n{b}/objects\n", "b"),
+    "comment_after_blank_is_a_path": (" #{a}/objects\n{b}/objects\n", "b"),
+    "comment_after_path_is_the_path": ("{a}/objects # x\n{b}/objects\n", "b"),
+    "trailing_blank": ("{a}/objects \n{b}/objects\n", "b"),
+    "trailing_cr": ("{a}/objects\r\n{b}/objects\n", "b"),
+    "trailing_slashes": ("{a}/objects///\n", "a"),
+    "dot_segments": ("{a}/./objects/../objects\n", "a"),
+    "relative": ("../../../a/objects\n", "a"),
+    "tilde_not_expanded": ("~/a/objects\n{b}/objects\n", "b"),
+    "quoted": ('"{a}/objects"\n', "a"),
+    "quoted_octal_blank": ('"{sp_octal}/objects"\n', "s"),
+    "unquoted_blank": ("{sp}/objects\n", "s"),
+    "quoted_newline": ('"{nl}/objects"\n{b}/objects\n', "nb"),
+    "quoted_then_one_dropped": ('"{a}/objects"x{b}/objects\n', "ab"),
+    "quoted_unterminated": ('"{a}/objects\n{b}/objects\n', "b"),
+    "quoted_bad_escape": ('"{a}/objects\\q"\n{b}/objects\n', "b"),
+    "quoted_escaped_quote": ('"{a}/objects\\"\n{b}/objects\n', "b"),
+    "twice": ("{a}/objects\n{a}/objects\n{b}/objects\n", "ab"),
+    "itself": ("{own}/objects\n{b}/objects\n", "b"),
+    "not_named_objects": ("{a}/objs\n{b}/objects\n", "b"),
+    "symlink_to_objects": ("{link}\n", "a"),
+    "no_refs_beside": ("{store}/objects\n{b}/objects\n", "b"),
+    "missing": ("{a}/nothing/objects\n{b}/objects\n", "b"),
+    "nested": ("{a}/objects\n", "ab", "{b}/objects\n"),
+    "nested_relative": ("{a}/objects\n", "ab", "../../b/objects\n"),
+    "nested_back_to_itself": ("{a}/objects\n", "a", "{own}/objects\n{a}/objects\n"),
+}
+
+
+def _alternate_stores(tmp_path: Path) -> dict[str, Path]:
+    stores = {"a": tmp_path / "a", "b": tmp_path / "b", "s": tmp_path / "s p", "n": tmp_path / "n\nl",
+              "store": tmp_path / "store"}
+    for k, d in stores.items():
+        (d / "objects/info").mkdir(parents=True)
+        if k != "store":
+            (d / "refs").mkdir()
+    (stores["a"] / "objs").mkdir()
+    os.symlink(stores["a"] / "objects", tmp_path / "link")
+    return stores
+
+
+def _git_alternate_repos(gg: GG, repo: Path, tmp_path: Path) -> set[str]:
+    """Oracle: where git goes for the refs of `repo`'s alternates —
+    `core.alternateRefsCommand` is run in place of `git --git-dir=<path>
+    for-each-ref`, with that path."""
+    log = tmp_path / "entered"
+    write_exec(tmp_path / "refs-of", f"#!/bin/sh\nprintf '%s\\0' \"$1\" >> '{log}'\n")
+    r = gg.git("-c", f"core.alternateRefsCommand={tmp_path / 'refs-of'}", "rev-list", "--alternate-refs",
+               "--all", cwd=repo)
+    assert r.rc == 0, r.text
+    return {os.fsdecode(p) for p in log.read_bytes().split(b"\0")[:-1]} if log.exists() else set()
+
+
+def _gg_alternate_repos(repo: Path) -> set[str]:
+    return {str(g) for g, _ in gg_mod.alternate_repos(repo.resolve() / ".git")[0]}
+
+
+@pytest.mark.parametrize("name", ALTERNATES_VARIANTS)
+def test_alternate_repositories_as_git_enters_them(gg: GG, repo: Path, tmp_path: Path, name: str) -> None:
+    """[156] alternate_repos against git: the repositories git lists the
+    refs of are the ones gitguard watches and covers, byte variant by byte
+    variant; the expected column pins the reading itself."""
+    text, want, *nested = ALTERNATES_VARIANTS[name]
+    stores = _alternate_stores(tmp_path)
+    fmt = {**{k: str(v) for k, v in stores.items()}, "sp": str(stores["s"]), "nl": str(stores["n"]),
+           "sp_octal": str(stores["s"]).replace(" ", "\\040"), "link": str(tmp_path / "link"),
+           "own": str(repo / ".git")}
+    (repo / ".git/objects/info/alternates").write_bytes(os.fsencode(text.format(**fmt)))
+    if nested:
+        (stores["a"] / "objects/info/alternates").write_bytes(os.fsencode(nested[0].format(**fmt)))
+    entered = _git_alternate_repos(gg, repo, tmp_path)
+    assert entered == {str(stores[k].resolve()) for k in want}, name
+    assert _gg_alternate_repos(repo) == entered, name
+
+
+def test_alternates_nesting_stops_where_git_stops(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[156] a chain of alternates: git follows it for a fixed number of
+    levels ("nesting too deep") and gitguard as far."""
+    chain = [tmp_path / f"c{i}" for i in range(9)]
+    for d in chain:
+        (d / "objects/info").mkdir(parents=True)
+        (d / "refs").mkdir()
+    for d, nxt in zip([repo / ".git", *chain], chain):
+        (d / "objects/info/alternates").write_text(f"{nxt}/objects\n")
+    entered = _git_alternate_repos(gg, repo, tmp_path)
+    assert 1 < len(entered) < len(chain), entered
+    assert _gg_alternate_repos(repo) == entered
+
+
+def test_alternates_nul_is_refused(repo: Path) -> None:
+    """[156] a NUL in an alternates file: git stops reading there (C
+    string); refused, like every file read as a path ([53])."""
+    (repo / ".git/objects/info/alternates").write_bytes(b"/a/objects\0\n/b/objects\n")
+    with pytest.raises(gg_mod.Refuse):
+        gg_mod.alternate_repos(repo / ".git")

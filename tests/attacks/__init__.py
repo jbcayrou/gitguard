@@ -1196,6 +1196,29 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      and a consistent one planted in a directory of the tree moves whoever
      works there to another HEAD and index. Held to git in
      tests/test_claims.py; what is not accepted, in tests/test_nested.py.
+[156] False positive, with a loss: a repository that borrows objects
+     (`clone --reference <mirror>`, `--shared`, `submodule update
+     --reference`) makes git list the mirror's refs through a child, `git
+     --git-dir=<mirror> for-each-ref`, at the clone and at every fetch
+     that negotiates. That child was judged under the key of the directory
+     it ran in ([72]) and refused: the clone downloaded everything the
+     mirror held — `--reference` for nothing — and every later fetch
+     printed twice "<clone>/.git has changed" with the mirror's config as
+     the diff, and left a pending record; trusting the mirror changed
+     nothing, and a bare one cannot be trusted. Found by the fourth
+     agentic audit, 2026-11-03; replayed 2026-11-13. Fix: the mirror is
+     watched by the repository that borrows, like a local remote ([45]
+     [61]) — alternate_repos, a port of git's reading of
+     `objects/info/alternates` (comments, C-quoting, relative entries,
+     nested files, the `/objects` suffix and the `refs` beside it), held
+     to git in test_git_parity.py: its config, its `commondir`, the
+     alternates files, its hooks/ — and the marker covers a child there,
+     for a judged repository and for a clone that creates its gitdir
+     (`clone=`, the first use, what `for-each-ref` executes of a config
+     held to git in test_claims.py). What the sandbox does to the mirror
+     is then a change of the borrower (tests/attacks/config_scope.py); not
+     covered: a served repository's alternates, the environment's
+     (DESIGN.md, Known limitations).
 """
 from __future__ import annotations
 

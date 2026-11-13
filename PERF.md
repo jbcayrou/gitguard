@@ -194,6 +194,24 @@ The rest of the pass adds `try/except` around reads that already
 happened and a presence test on two environment variables: nothing
 measurable. Not re-measured end to end.
 
+## 2026-11-13: alternates ([156])
+
+Every check now looks for `objects/info/alternates` in each gitdir root
+(one failed `open` where there is none, the common case) and, where a
+repository borrows objects, hashes the mirror's `config` and `hooks/` as it
+does a local remote's. A/B of the plain check (`ab.py` below, N = 40,
+macOS, a clone of gitguard, which has one local remote):
+
+|                                             | before  | after   |
+|---------------------------------------------|---------|---------|
+| small repository                            | 52.0 ms | 52.9 ms |
+| the same, `clone --reference <bare mirror>` | 49.8 ms | 52.3 ms |
+
+Under 1 ms where nothing is borrowed, about half of it the longer script
+to compile; +2.5 ms with one mirror (its config and the fourteen sample
+hooks of a `clone --mirror`). What the fix gives back is not in the
+table: the clone no longer downloads what the mirror holds.
+
 ## Where the time goes (2026-10-17 figures)
 
 | component                                             | cost            |

@@ -761,6 +761,44 @@ of a leading short option too (`ssh -F./c`, `-vF./c`: `-v`, then `-F`
 holding the rest): the whole word was dropped and ssh read a file nobody
 watched ([96]).
 
+**A repository git borrows objects from** (`clone --reference`, `--shared`,
+`submodule update --reference`, a line in `objects/info/alternates`). The
+objects are data; but at every negotiation — a clone, a fetch, a push
+received — git also asks that repository what it holds, through a child:
+`git --git-dir=<repo> for-each-ref --format=%(objectname)`
+(`for_each_alternate_ref`), which reads that repository's config. With
+gitguard at the exec path that child was judged as a repository of its
+own and refused: under the key of the directory the fetch ran in (the
+`--git-dir` rule of [72]), so `clone --reference` downloaded everything
+the mirror held, and every later fetch printed "has changed" with the
+mirror's config as the diff; and a bare mirror, the usual one, can be
+trusted by nobody ([156]). It is now watched like a local remote, by the
+repository that borrows: `alternate_repos` reads the alternates files as
+git does — a port of `parse_alt_odb_entry`, `link_alt_odb_entry` and
+`refs_from_alternate_cb`, the same text from git 2.39 to 2.56: one entry
+per line, `#` comments, C-quoted entries, relative to the object directory
+that names them, resolved, each alternate's own file followed, six levels
+in all; git enters where the resolved path ends in `/objects` and a `refs`
+directory sits beside it — and for each such repository the scan watches
+its `config` and `config.worktree` (parsed, their values read against the
+tree the fetch runs in: the root, or the submodule's for a submodule's
+alternate), its `commondir`, the alternates files outside the gitdir, and
+its `hooks/`. git runs no hook from there; they are watched because the
+marker covers that repository, not that one command (Nested
+repositories), exactly as for a local remote. Scope `ext`, or `wt` for a
+mirror kept in the tree; a mirror the user cannot write
+(`/srv/mirrors/…`, root-owned) is not watched, like any other file the
+sandbox cannot replace. The cost is the one of a local remote: a mirror
+shared by fifty clones whose config changes is asked about in each. Held
+to git in `test_git_parity.py` (`core.alternateRefsCommand` as the oracle:
+git runs it in place of the child, with the path it would enter), thirty
+byte variants. Deliberate divergence, fail-closed: a NUL in an alternates
+file (git stops reading there, gitguard refuses). Not read:
+`GIT_ALTERNATE_OBJECT_DIRECTORIES` and `GIT_OBJECT_DIRECTORY` naming
+another repository — the child there is judged on its own, as before (git
+sets both for a quarantine, where they name the repository being served,
+already covered).
+
 ## Display and sanitization
 
 **Streams.** gitguard's own output goes to stderr by default (`OUT`): in
@@ -1207,7 +1245,15 @@ its tree (a relative hooksPath, an include, a script: `tree_named`) was
 hashed by the parent, or is the same content at the same place in the
 judged tree — otherwise it is judged on its own ([111] [115] [120]); a
 served repository covers its gitdir and common dir exactly, and nothing
-in a tree ([105] [121] [122]). A child git does not detach either
+in a tree ([105] [121] [122]). One kind of repository outside the walk is
+covered too, because the parent hashed it as well: a repository a covered
+gitdir root **borrows objects from**, where git lists the refs through a
+child at every fetch (`alternate_repos`, "What the fingerprint watches
+outside the gitdir") — the gitdir and the common dir git opens there,
+exactly, found again from the alternates files as `gitdir_roots` are from
+the directories; from another tree than the judged one, on the terms of
+any other root; not for a served repository, whose alternates nobody
+read ([156]). A child git does not detach either
 (`keep_attached`): a daemonized `maintenance run --detach` left the
 command's process tree and found the marker dead ([117]); the option is
 read as parse-options reads it, any unique prefix (`--det`, [132]),
@@ -1256,7 +1302,18 @@ destination alone ([108]). The children of a served repository
 `TRANSPORT` and `SERVERS`, `upload-archive--writer <dir>` [118], whose `index-pack` runs in a bare repository
 gitguard does not handle) inherit a marker for that repository, opened as
 enter_repo opens it; the submodule clones and the `index-pack` of a clone
-in progress inherit `new` ([101]). What stays
+in progress inherit `new` ([101]). A clone that creates its gitdir sets
+`clone` instead, which also covers the repositories the new gitdir
+borrows from: `clone --reference <mirror>` enters the mirror before any
+fingerprint holds its config — the clone's auto-trust records it. The
+first use of a repository the command line names, as for a local source
+(whose hooks the same auto-trust records unseen, and which `upload-pack`
+serves unjudged); the difference is that `upload-pack` is the command git
+itself hardens for an untrusted repository and `for-each-ref` is not, so
+what it executes of a config is a claim, held to git key by key and hook
+by hook (`test_alternate_refs_child_runs_nothing_of_the_mirror`, the real
+git and no pin). Not for an `init`, nor for a gitdir that was there
+before the command: its alternates file is not git's own ([156]). What stays
 with the child-process barrier as a claim to re-test at each git release
 (`tests/test_claims.py`): git enters a submodule through a child for
 `status`, `commit -a`, a partial commit, `--submodule=diff`; and the
@@ -1762,6 +1819,18 @@ the files, not the order.
   rewrites into a local path is ([151]: every rule that matches, a
   superset of git's longest match — with overlapping rules, a repository
   git does not use may be watched too).
+- Alternates ([156]), what is not covered: a **hub that itself borrows**
+  objects (a mirror made with `clone --mirror --reference`, a `--shared`
+  clone used as a remote) — the `receive-pack` or `upload-pack` serving it
+  lists its alternate's refs through the same child, under the served
+  repository's marker, which covers that repository exactly ([121]): the
+  child is refused as never trusted, the message printed once on each
+  side of the push, which goes through without the `.have` lines
+  (replayed 2026-11-13); alternates named by the environment
+  (`GIT_ALTERNATE_OBJECT_DIRECTORIES`) rather than by a file. And the
+  first use: the mirror a `clone --reference` names is entered during the
+  clone, its config recorded by the auto-trust unseen, as a local
+  source's is — `gitguard trust` in the clone names both.
 - Ordinary commands that still prompt once, by design: `git fsck
   --lost-found` writes `.git/lost-found/` — kept watched, because fsck
   writes the dangling blobs' content there by opening each path, through

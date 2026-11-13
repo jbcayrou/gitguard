@@ -421,6 +421,83 @@ def test_judged_covers_what_the_walk_hashed(tmp_path: Path, monkeypatch) -> None
     assert not j.covers(_repo(tmp_path / "newer", tmp_path / "newer/.git"))
 
 
+def _store(d: Path, refs: bool = True) -> Path:
+    """What refs_from_alternate_cb looks at: `objects`, and `refs` beside it."""
+    (d / "objects/info").mkdir(parents=True)
+    if refs:
+        (d / "refs").mkdir()
+    return d
+
+
+def test_judged_covers_the_repositories_it_borrows_from(tmp_path: Path, monkeypatch) -> None:
+    """[156] coverage reaches the repositories git enters for the alternates
+    of a covered gitdir root (alternate_repos): the mirror named by
+    `objects/info/alternates`, the mirror's own alternate, a submodule's —
+    the gitdir and the common dir git opens there, exactly. Not an object
+    store without `refs`, not a repository no alternates file names; from
+    another tree, only while its config names nothing there. A served
+    repository's marker covers that repository alone ([121]); a clone in
+    progress, what the new repository borrows from — not an init, not a
+    gitdir that was already there."""
+    root, g = _layout(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    _as_parent(monkeypatch)
+    m, m2, sm, store, other = (_store(tmp_path / n, n != "store") for n in ("m", "m2", "sm", "store", "other"))
+    (g / "objects/info").mkdir(parents=True)
+    (g / "objects/info/alternates").write_text(f"# the mirrors\n{m}/objects\n{store}/objects\n")
+    (m / "objects/info/alternates").write_text(f"{m2}/objects\n")
+    (g / "modules/sub/objects/info").mkdir(parents=True)
+    (g / "modules/sub/objects/info/alternates").write_text(f"{sm}/objects\n")
+    gg_mod.set_judged("repo", str(g), str(g), str(root), str(root))
+    j = gg_mod.read_judged()
+    assert j.covers(_repo(root, m)) and j.covers(_repo(root, m2)), "the mirror and the mirror's mirror"
+    assert j.covers(_repo(root / "sub", sm)), "a submodule's mirror, entered from its tree"
+    assert not j.covers(_repo(root, store)), "no refs beside the objects: git enters nothing"
+    assert not j.covers(_repo(root, other)), "named by no alternates file"
+    assert not j.covers(_repo(root, m, other)), "another common dir than the one git opens"
+    (m / "commondir").write_text(f"{other}\n")
+    assert j.covers(_repo(root, m, other)) and not j.covers(_repo(root, m))
+    (m / "commondir").unlink()
+    (m / "config").write_text("[core]\n\thooksPath = .githooks\n")
+    (tmp_path / "elsewhere/.githooks").mkdir(parents=True)
+    assert j.covers(_repo(root, m)), "from the judged tree: the parent read that config against it"
+    assert not j.covers(_repo(tmp_path / "elsewhere", m)), "hooks named in another tree [72]"
+    (m / "config").unlink()
+    assert j.covers(_repo(tmp_path / "elsewhere", m))
+    # served: the served repository alone, not what it borrows from
+    gg_mod.set_judged("repo", str(g), str(g), "", "")
+    assert not gg_mod.read_judged().covers(_repo(root, m))
+    # a clone in progress: what the new repository borrows from; not for an init
+    new = tmp_path / "new"
+    for gitdir in (new / ".git", tmp_path / "sep", tmp_path / "bare.git"):
+        (gitdir / "objects/info").mkdir(parents=True)
+        (gitdir / "objects/info/alternates").write_text(f"{m}/objects\n")
+    for paths in ([new], [new, tmp_path / "sep"], [tmp_path / "bare.git"]):
+        gg_mod.set_judged("clone", *map(str, paths))
+        j = gg_mod.read_judged()
+        assert j.covers(_repo(tmp_path, m)) and j.covers(_repo(tmp_path, m2)), paths
+        assert not j.covers(_repo(tmp_path, other)) and not j.covers(_repo(tmp_path, store)), paths
+        gg_mod.set_judged("new", *map(str, paths))
+        assert not gg_mod.read_judged().covers(_repo(tmp_path, m)), paths
+
+
+@pytest.mark.parametrize("text,want", [
+    (b"", []), (b"\n\n", []), (b"/a\n/b", [b"/a", b"/b"]), (b"/a \n", [b"/a "]), (b"/a\r\n", [b"/a\r"]),
+    (b"# /a\n/b\n", [b"/b"]), (b" # /a\n", [b" # /a"]), (b"/a # x\n", [b"/a # x"]),
+    (b'"/a b"\n/c\n', [b"/a b", b"/c"]), (b'"/a\\tb\\303\\251\\"\\\\"\n', [b'/a\tb\xc3\xa9"\\']),
+    (b'"/a\nb"\n/c\n', [b"/a\nb", b"/c"]),                    # a quoted entry runs over the newline
+    (b'"/a"x/b\n/c\n', [b"/a", b"/b", b"/c"]),                # one character dropped after the quote
+    (b'"/a\n/c\n', [b'"/a', b"/c"]),                          # no closing quote: unquoted, quote kept
+    (b'"/a\\x"\n', [b'"/a\\x"']), (b'"/a\\8"\n', [b'"/a\\8"']), (b'"/a\\400"\n', [b'"/a\\400"']),
+    (b'"/a\\37"\n', [b'"/a\\37"']), (b'""\n/c\n', [b"/c"]), (b'/a"b"\n', [b'/a"b"']),
+])
+def test_alternates_entries(text: bytes, want: list[bytes]) -> None:
+    """[156] parse_alt_odb_entry, entry by entry (the parity test asks git
+    where it goes for the same bytes: test_git_parity.py)."""
+    assert gg_mod._alternates_entries(text) == want
+
+
 # ------------------------------------------------------------ walk_gitdir filter
 def test_walk_gitdir_excludes_volatile(tmp_path: Path) -> None:
     g = tmp_path / ".git"
