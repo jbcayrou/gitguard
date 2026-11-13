@@ -183,19 +183,30 @@ def test_no_inheritance_for_a_worktree_the_main_tree_has_not_seen(gg: GG, repo: 
 def test_no_inheritance_when_the_worktree_hook_differs(gg: GG, repo: Path, tmp_path: Path) -> None:
     """A relative `core.hooksPath` resolves in the worktree's own tree
     ([120]): another branch's hooks, or the sandbox's, were shown to
-    nobody."""
+    nobody. The same file is the same bytes and the same mode, as the
+    reference compares everywhere."""
     gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
     write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
     gg.git("add", "-A", cwd=repo)
     gg.git("commit", "-qm", "hooks", cwd=repo)
+    (repo / ".githooks/pre-commit").unlink()
+    assert gg.git("checkout", "--", ".githooks", cwd=repo).rc == 0     # the mode git gives, in both trees
     wt = tmp_path / "wt"
     assert gg.git("worktree", "add", "-q", str(wt), cwd=repo).rc == 0
     gg.trust(repo)
-    write_exec(wt / ".githooks/pre-commit", "#!/bin/sh\necho other\n")
+    hook = wt / ".githooks/pre-commit"
+    mode = hook.stat().st_mode
+    hook.chmod(0o700)
     _refused(gg, wt)
-    write_exec(wt / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    hook.write_text("#!/bin/sh\necho other\n")
+    hook.chmod(mode)
+    _refused(gg, wt)
+    hook.write_text("#!/bin/sh\nexit 0\n")
     write_exec(wt / ".githooks/post-checkout", "#!/bin/sh\necho new\n")
     _refused(gg, wt)
+    (wt / ".githooks/post-checkout").unlink()
+    r = gg.run("git", "status", "--short", cwd=wt)                    # the control: nothing differs, it inherits
+    assert r.rc == 0 and f"trusted with {repo}" in r.err, r.text
 
 
 # ------------------------------- [155] what a `git worktree` command does not get accepted

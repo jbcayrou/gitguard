@@ -1485,11 +1485,15 @@ def test_linked_worktree_is_trusted_with_the_main_tree(gg: GG, repo: Path, tmp_p
     question `worktree add` raises, answered), a git run from the worktree
     has nothing left to show. Hooks the config names in the tree are the
     worktree's own copy: covered when they are the bytes trusted at the
-    same place in the main tree."""
+    same place in the main tree, with the same mode — both as git checks
+    them out (0775 under the umask 002 of a Debian 13 or Ubuntu account,
+    where a hook left at 0755 in the main tree is another file)."""
     gg.git("config", "core.hooksPath", ".githooks", cwd=repo)
     write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
     gg.git("add", "-A", cwd=repo)
     gg.git("commit", "-qm", "hooks", cwd=repo)
+    (repo / ".githooks/pre-commit").unlink()
+    assert gg.git("checkout", "--", ".githooks", cwd=repo).rc == 0
     wt = tmp_path / "wt"
     assert gg.git("worktree", "add", "-q", str(wt), cwd=repo).rc == 0
     gg.trust(repo)

@@ -936,7 +936,11 @@ with <holder>: <tree>`) and from then on has its own reference, when:
   mode, at the same absolute path — or, for what the config names in a
   linked worktree's tree (a relative `core.hooksPath` resolves there,
   [120]), the same content at the same place in the holder's tree: the
-  hooks of the commit both have checked out, not another branch's. The
+  hooks of the commit both have checked out, not another branch's. Mode
+  included, as everywhere in the reference: git checks a hook out at
+  0775 under the umask 002 of a Debian 13 or Ubuntu account, and one
+  left at 0755 in the main tree is another file (the first run of the
+  distribution jobs failed on exactly that, in a test). The
   tree's own structure (its gitfile, `.gitmodules`, the gitfiles of its
   submodules) is not asked of the holder: no config names it ([125]),
   `check_structure` judged it.
