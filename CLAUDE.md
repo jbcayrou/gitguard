@@ -96,7 +96,13 @@ gitguard git <args>      check, then exec the real git (symlink `git → gitguar
 gitguard list | forget <repo>… | --missing | prune | retrust
 gitguard pending [<repo>… | -a | -c <repo>…]   decisions of terminal-less gits
 gitguard exec-path [<dir>]   (re)build an exec path whose git is gitguard (macOS, no root)
+gitguard version             VERSION, read by ci/build-deb.sh
 ```
+
+The Debian/Ubuntu package (`packaging/deb/`: control, `preinst` adds the
+two diversions, `postrm` removes them) is built by `ci/build-deb.sh` and
+its life replayed by `ci/test-deb.sh`, as root in a throwaway container
+only: `GITGUARD_DEB_TEST=throwaway`, it installs and removes git.
 
 Environment: `GITGUARD_STATE`, `GITGUARD_REAL_GIT`, `GITGUARD_ALLOW_REBASE_EXEC`,
 `GITGUARD_NO_PROMPT`, `GITGUARD_WAIT`, `GITGUARD_NO_NOTIFY`, `GITGUARD_KEEP_FSMONITOR`,

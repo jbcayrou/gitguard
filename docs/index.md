@@ -122,7 +122,7 @@ alias.ac = !sh tool.sh
    $ alias git='gitguard git'
    ```
 
-   System-wide on Debian: `dpkg-divert` the real git to `/usr/bin/git.real` and symlink `/usr/bin/git` to gitguard. gitguard finds a `git.real` next to itself; `git-receive-pack`, `git-upload-pack` and `git-upload-archive`, symlinks to `git` that sshd runs for every push and fetch to the machine, pass straight through to the real git. On macOS keep the `PATH` symlink and set `git.path` in VS Code.
+   System-wide on Debian and Ubuntu: `dpkg-divert` the real git to `/usr/bin/git.real` and symlink `/usr/bin/git` to gitguard — the package built by `ci/build-deb.sh` does it, at the exec path too, and `apt remove gitguard` undoes it. gitguard finds a `git.real` next to itself; `git-receive-pack`, `git-upload-pack` and `git-upload-archive`, symlinks to `git` that sshd runs for every push and fetch to the machine, pass straight through to the real git. On macOS keep the `PATH` symlink and set `git.path` in VS Code.
 
 3. Set the companion setting git already ships. It is independent of gitguard and closes a hole gitguard cannot reach from tools that bypass the wrapper.
 

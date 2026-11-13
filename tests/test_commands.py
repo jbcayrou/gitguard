@@ -545,6 +545,17 @@ def test_help(gg: GG) -> None:
     assert r.rc == 0 and "retrust" in r.out
 
 
+@pytest.mark.parametrize("arg", ["version", "--version"])
+def test_version(gg: GG, tmp_path: Path, arg: str) -> None:
+    """The version a package is built from (ci/build-deb.sh reads the same
+    constant): one line on stdout, from any directory, no repository read."""
+    import re
+    import gitguard as gg_mod
+    r = gg.run(arg, cwd=tmp_path)
+    assert r.rc == 0 and r.out == f"gitguard {gg_mod.VERSION}\n" and r.err == "", r.text
+    assert re.fullmatch(r"\d+\.\d+\.\d+", gg_mod.VERSION)
+
+
 def test_untrusted_message_colors_on_tty(gg: GG, tmp_path: Path) -> None:
     """On a terminal: colours emitted; in a pipe: none. In both cases the
     message's newline is a real newline."""

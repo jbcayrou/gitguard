@@ -67,6 +67,7 @@ gitguard forget <repo>... | --missing   remove entries (the repository becomes "
 gitguard prune         = forget --missing
 gitguard retrust       re-validate in bulk the "ok" or "legacy" repositories; anything
                        modified is skipped
+gitguard version       `VERSION`, which the package is built from
 gitguard help
 ```
 
@@ -86,7 +87,20 @@ System-wide (Debian): `dpkg-divert` the real git to `/usr/bin/git.real` and
 symlink `/usr/bin/git → gitguard`; the same for `/usr/lib/git-core/git`
 (`git.real` next to it), so that every child git is gitguard
 (DESIGN-exec-path.md, section 4: the dashed builtins there are symlinks to
-`git`, one diversion wraps them all). macOS keeps the PATH symlink
+`git`, one diversion wraps them all). The package does both
+(`packaging/deb/`, built by `ci/build-deb.sh` with `dpkg-deb`: the script
+with the system's python as its interpreter, the two symlinks as its own
+files): `preinst` adds the diversions before dpkg unpacks the links,
+`postrm remove` takes them away — dpkg never drops a diversion by itself,
+whatever `--package` says, and a `/usr/bin/gitguard` deleted with the
+diversions left is a `/usr/bin/git` that links to nothing and that
+reinstalling git does not repair. `ci/test-deb.sh` replays the package's
+life in a throwaway container against the distribution's own git —
+install, `apt install --reinstall git`, an upgrade of gitguard, remove,
+purge, the take-over of a hand-made install, the removal of git — and
+after each step holds one of two states: wrapped at both names with the
+distribution's bytes at `git.real`, or as if the package had never been
+there. macOS keeps the PATH symlink
 (`/usr/bin/git` is under SIP, renaming Homebrew's git is undone by `brew
 upgrade`) plus VS Code's `git.path`, and a `GIT_EXEC_PATH` directory for
 the children; `trust` warns when the exec path is not wrapped.

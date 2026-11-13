@@ -1,0 +1,22 @@
+Package: gitguard
+Version: @VERSION@
+Architecture: all
+Maintainer: @MAINTAINER@
+Installed-Size: @SIZE@
+Depends: git, python3 (>= 3.9)
+Section: vcs
+Priority: optional
+Homepage: https://github.com/jbcayrou/gitguard
+Bugs: https://github.com/jbcayrou/gitguard/issues
+Description: refuse to run git on a repository changed behind your back
+ gitguard fingerprints what git executes or reads as configuration in a
+ repository (.git/config, hooks, attributes, nested gitdirs, the files the
+ config names) and refuses to run git when it has changed since you last
+ trusted it: code in a sandbox that has the repository mounted writes
+ into .git/, and the next git on the host would run it.
+ .
+ This package installs gitguard as /usr/bin/git and as git's exec path
+ entry /usr/lib/git-core/git, so that every git on the machine and every
+ child git is checked; the real binaries are diverted to git.real
+ (dpkg-divert) and come back when the package is removed. Each user then
+ runs "gitguard trust" once in the repositories that already exist.

@@ -148,10 +148,25 @@ alias git='gitguard git'
 
 ### System-wide (Debian/Ubuntu)
 
-To wrap every git on the machine, cron and GUIs included, install gitguard
-*as* `/usr/bin/git` and divert the real one — and do the same at the exec
-path, `/usr/lib/git-core/git`. `dpkg-divert` keeps both diversions across
-`apt upgrade git`:
+To wrap every git on the machine, cron and GUIs included, gitguard is
+installed *as* `/usr/bin/git` and at the exec path, `/usr/lib/git-core/git`,
+and the real binaries are diverted to `git.real` beside them. The package
+does it:
+
+```sh
+ci/build-deb.sh                              # needs dpkg-deb; writes dist/gitguard_<version>_all.deb
+sudo apt install ./dist/gitguard_*_all.deb
+```
+
+`apt upgrade git` then installs every new git at the diverted names, never
+over gitguard, and `sudo apt remove gitguard` puts the real git back, byte
+for byte. dpkg does not drop a diversion by itself: the package's `postrm`
+does. Trust records live in each user's home and are left alone. The
+whole cycle — install, an upgrade of git, an upgrade of gitguard, remove,
+purge, the removal of git itself — is replayed at every push on Debian 12,
+Debian 13, Ubuntu 24.04 and Ubuntu 26.04 (`ci/test-deb.sh`).
+
+The same by hand, which the package takes over if you install it later:
 
 ```sh
 sudo install -m 755 gitguard.py /usr/bin/gitguard
@@ -169,11 +184,14 @@ systemd and GUIs would not get one). The 160 dashed builtins of
 command; under `git-receive-pack`, `git-upload-pack` and
 `git-upload-archive` (sshd, for every push and fetch *to* the machine) it
 passes straight to the real git, since they serve a repository named by
-argument and run nothing of the caller's. Upgrading gitguard is
-overwriting `/usr/bin/gitguard`. To undo:
+argument and run nothing of the caller's. Upgrading a hand-made install
+is overwriting `/usr/bin/gitguard`. To undo it — all three lines: with
+`/usr/bin/gitguard` deleted and the diversions left, `/usr/bin/git` links
+to nothing, and reinstalling git does not repair it (dpkg keeps writing
+the real one to `git.real`):
 
 ```sh
-sudo rm /usr/bin/git /usr/lib/git-core/git
+sudo rm /usr/bin/git /usr/lib/git-core/git /usr/bin/gitguard
 sudo dpkg-divert --package gitguard --rename --remove /usr/bin/git
 sudo dpkg-divert --package gitguard --rename --remove /usr/lib/git-core/git
 ```
@@ -405,6 +423,7 @@ links to; nothing else to redo.
 | `gitguard forget <repo>…` / `--missing` | Remove entries; the repository becomes "never trusted" again. |
 | `gitguard prune` | Same as `forget --missing`. |
 | `gitguard retrust` | Re-validate unchanged repositories after an upgrade. |
+| `gitguard version` | The version, which is the package's. |
 | `gitguard exec-path [<dir>]` | Build or rebuild an exec path whose `git` is gitguard, for `GIT_EXEC_PATH` (default `~/.local/lib/gitguard-exec`). |
 
 Management commands write to stdout (`gitguard list | grep modified`
@@ -487,7 +506,8 @@ against it. Every push runs it (`.github/workflows/tests.yml`) on Linux
 and macOS against git 2.39, 2.43, 2.47, 2.50 and 2.56, built from
 kernel.org by `ci/build-git.sh`; on Debian 12, Debian 13, Ubuntu 24.04
 and Ubuntu 26.04 with the distribution's own git and python; and once on
-Python 3.9.
+Python 3.9. On the same four distributions it builds the package and
+replays its life against the distribution's git (`ci/test-deb.sh`).
 
 gitguard never asks git its version. Where two supported gits read one
 file two ways — a tab between two words of a config value is a space

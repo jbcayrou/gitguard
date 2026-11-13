@@ -25,11 +25,13 @@ Usage:
   gitguard exec-path [<dir>]  (re)build an exec path whose git is gitguard, for
                         GIT_EXEC_PATH where git's own cannot be diverted (macOS,
                         no root; default ~/.local/lib/gitguard-exec)
+  gitguard version
   gitguard help
 
 Alias:    alias git='gitguard git'      Wrapper: ln -s ~/bin/gitguard ~/bin/git
 System:   /usr/bin/git → gitguard, the real git diverted to /usr/bin/git.real
-          (dpkg-divert); a `git.real` next to gitguard is used before the PATH
+          (dpkg-divert; the Debian package does it, ci/build-deb.sh); a
+          `git.real` next to gitguard is used before the PATH
 Env:      GITGUARD_STATE, GITGUARD_REAL_GIT, GITGUARD_ALLOW_REBASE_EXEC,
           GITGUARD_NO_PROMPT, GITGUARD_WAIT (seconds a terminal-less git waits
           for `gitguard pending`, 0 = never, default 60), GITGUARD_NO_NOTIFY,
@@ -56,6 +58,7 @@ from collections.abc import Callable, Iterator
 from functools import cached_property
 from pathlib import Path
 
+VERSION = "0.1.0"    # `gitguard version`; the package's (ci/build-deb.sh reads this line)
 FORMAT_VERSION = 4   # 4: symlink hashes include the target's content
 
 
@@ -5439,6 +5442,8 @@ def main(argv: list[str]) -> int:
             cmd_exec_path(argv[1:]); return 0
         elif cmd in ("help", "-h", "--help"):
             print(__doc__); return 0
+        elif cmd in ("version", "--version"):
+            print(f"gitguard {VERSION}"); return 0
         elif cmd:
             # A typo (`gitguard tust`) used to fall through to a silent check
             # whose exit 0 looked like a success of the intended command.

@@ -4,7 +4,8 @@ Branch `exec-path-wrap`, 2026-10-26. A working document: it will be reworked
 here and merged into DESIGN.md once the implementation has settled. Steps 1
 to 3 and 5 of the plan (section 8) are implemented on the branch and green
 on macOS (git 2.50) and on the Debian VM with the system-wide diversion
-(git 2.47.3); step 4's `.deb` is not written, the manual diversion is.
+(git 2.47.3); step 4's `.deb` came on 2026-11-12 (`packaging/deb/`,
+`ci/build-deb.sh`, replayed by `ci/test-deb.sh`).
 Correction found while testing, section 6: `ls-files` and `grep` with
 `--recurse-submodules` do run the nested repository's config in-process.
 
@@ -339,7 +340,8 @@ adds the two diversions (`--package gitguard`, so `apt upgrade git` and
 `apt remove gitguard` never fight), the package ships `/usr/bin/gitguard`
 and the two symlinks as its own files, `postrm remove` removes the
 diversions with `--rename` — `apt remove gitguard` restores the original
-git byte for byte. The example in `dpkg-divert(1)` is this shape.
+git byte for byte. The example in `dpkg-divert(1)` is this shape. Written
+as such: `packaging/deb/` (DESIGN.md, "Deployment").
 
 Verification from any directory:
 

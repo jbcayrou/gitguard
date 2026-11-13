@@ -1,0 +1,13 @@
+#!/bin/sh
+# The real git steps aside before dpkg unpacks this package's own
+# /usr/bin/git and /usr/lib/git-core/git; from then on dpkg installs every
+# git (apt upgrade git) at the diverted name, never over gitguard.
+# dpkg-divert(1), "Examples". --add is a no-op on a diversion already there:
+# an upgrade of this package, or the hand-made install of the README, which
+# registers the same two under the same package name.
+set -e
+if [ "$1" = install ] || [ "$1" = upgrade ]; then
+    for f in /usr/bin/git /usr/lib/git-core/git; do
+        dpkg-divert --package gitguard --add --rename --divert "$f.real" "$f"
+    done
+fi

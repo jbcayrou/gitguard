@@ -1,7 +1,9 @@
 # The suite takes git as its oracle: every supported git is a job, on both
 # systems. The versions are built from kernel.org (ci/build-git.sh) and
 # cached; `distro` runs a distribution's own git and python, patches
-# included, the target of the system-wide install (README).
+# included, the target of the system-wide install (README); `package`
+# builds the .deb there and replays its life against that git: install,
+# upgrades, remove, purge (ci/test-deb.sh).
 #
 # The Linux runner is named, not `ubuntu-latest`: that label moved to Ubuntu
 # 26.04 under the first run of this file, where git 2.39, 2.43 and 2.47 did
@@ -79,3 +81,19 @@ jobs:
           id user 2>/dev/null || useradd -m user
           chown -R user .
           su user -c 'git --version && python3 -m pytest'
+
+  package:
+    name: package on ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12", "debian:13", "ubuntu:24.04", "ubuntu:26.04"]
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v7
+      # As root, in the job's own container: the script installs and
+      # removes git, and says so before doing anything elsewhere.
+      - name: Build, install, upgrade, remove, purge
+        run: GITGUARD_DEB_TEST=throwaway ci/test-deb.sh
