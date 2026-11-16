@@ -755,6 +755,52 @@ def test_checkout_rewrites_tracked_hook_then_runs_it(gg: GG, repo: Path, tmp_pat
     assert not mark.exists(), "post-checkout from the container's commit was executed"
 
 
+@pytest.mark.xfail(strict=True, reason="[158] accepted limitation (DESIGN.md, Known limitations)")
+def test_rebase_runs_a_commit_body_as_a_todo_line(gg: GG, repo: Path, tmp_path: Path) -> None:
+    """[158] accepted limitation — `rebase.instructionFormat` holding a
+    `%n` (`%s%n%b`: subject, then body) in the user's own global config:
+    git writes each commit's body on lines of its own in the todo list it
+    then runs, and a body that says `exec …` is a command. refs/ and
+    objects/ are volatile: the container commits it. The state is clean
+    when gitguard checks, the todo is written and run by the same command
+    ([44]'s boundary) — and by the real git alone just as well."""
+    mark = tmp_path / "RAN"
+    assert gg.git("config", "--global", "rebase.instructionFormat", "%s%n%b").rc == 0
+    # the container
+    gg.git("checkout", "-q", "-b", "feat", cwd=repo)
+    (repo / "g").write_text("g\n")
+    gg.git("add", "g", cwd=repo)
+    assert gg.git("commit", "-q", "-m", "a subject", "-m", f"exec touch '{mark}'", cwd=repo).rc == 0
+    gg.git("checkout", "-q", "main", cwd=repo)
+    commit(gg, repo, "h", "h")
+    gg.git("checkout", "-q", "feat", cwd=repo)
+    assert not mark.exists() and not gg.check(repo).blocked
+    # the user
+    r = gg.run("git", "rebase", "main", cwd=repo)
+    assert r.rc == 0, r.text
+    assert not mark.exists(), "the body of the container's commit was run as a todo line"
+
+
+def test_fake_loose_objects_are_not_seen_and_git_still_commits(gg: GG, repo: Path) -> None:
+    """[159] accepted limitation — forty files named like loose objects in
+    `objects/17/`: git's `gc --auto` counts that one directory, takes the
+    repository for one with thousands of loose objects and collects at
+    every commit; the files are no objects, the collection fails, and
+    since a child git does not detach ([117]) it fails in the foreground,
+    with its errors, every time (430 ms against 30 on git 2.50). A
+    nuisance, nothing runs: the object store is volatile by design, the
+    check stays silent, the commit is made."""
+    fanout = repo / ".git/objects/17"
+    fanout.mkdir(exist_ok=True)
+    for i in range(40):
+        (fanout / f"{i:038d}").write_text("x")
+    assert not gg.check(repo).blocked
+    (repo / "f").write_text("c\n")
+    r = gg.run("git", "commit", "-qam", "c", cwd=repo)
+    assert r.rc == 0 and "gitguard:" not in r.err, r.text
+    assert gg.git("log", "-1", "--format=%s", cwd=repo).out.strip() == "c"
+
+
 def _plant_gitlink(gg: GG, r: Path, mark: Path, ref: str = "refs/heads/main",
                    zone: Path | None = None) -> None:
     """The sandbox of [66]: an untracked repository `vendor/x` whose config runs

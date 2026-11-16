@@ -1791,3 +1791,63 @@ def test_another_gitdir_named_from_a_trusted_tree_is_not_its_change(gg: GG, repo
     assert str(other / ".git") in pending and "never" in pending, pending
     r = gg.run("pending", "-c", str(other / ".git"))
     assert "cleared" in r.text and "nothing pending" in gg.run("pending").text, r.text
+
+
+# ------------- ordinary setups that still ask: the records (2026-11-13)
+@pytest.mark.xfail(strict=True, reason="[160] accepted limitation (DESIGN.md, Known limitations): the file a "
+                   "credential helper stores into is a word of a program's command line")
+def test_credential_store_file_rewritten_by_git_is_silent(gg: GG, repo: Path) -> None:
+    """[160] OPEN — `credential.helper = store --file <f>`: `<f>` holds
+    data, and git rewrites it at every credential it approves or rejects.
+    It is watched as any file a program key names (the helper is a command
+    line, and nothing in it says which word is a script and which a data
+    file), so each rewrite is a change. The way out: the helper's default
+    file, which no config names (`credential.helper = store`)."""
+    import subprocess
+    creds = Path(gg.env["HOME"]) / "creds"
+    creds.write_text("https://u:p@example.com\n")
+    assert gg.git("config", "credential.helper", f"store --file {creds}", cwd=repo).rc == 0
+    gg.trust(repo)
+    r = subprocess.run(["git", "credential", "approve"], cwd=repo, env=gg.raw_env, text=True, capture_output=True,
+                       input="protocol=https\nhost=other.example\nusername=u2\npassword=p2\n\n")
+    assert r.returncode == 0 and "other.example" in creds.read_text(), r.stderr
+    r = gg.run("git", "status", "--short", cwd=repo)
+    assert not r.blocked and "gitguard:" not in r.err, r.text
+
+
+@pytest.mark.xfail(strict=True, reason="[161] accepted limitation (DESIGN.md, Known limitations): an includeIf "
+                   "is followed whatever its condition")
+def test_clone_is_auto_trusted_despite_a_template_in_an_inactive_include(gg: GG, tmp_path: Path) -> None:
+    """[161] OPEN — a global `includeIf "gitdir:~/work/"` whose file sets
+    `init.templateDir`: git applies it to the repositories under that
+    directory only; the gate of the auto-trust reads every include,
+    whatever its condition (a superset, as the scan does: evaluating git's
+    conditions is one more reader to hold to git), and withholds the
+    auto-trust of every clone. One `gitguard trust` per clone."""
+    home = Path(gg.env["HOME"])
+    (tmp_path / "tpl/hooks").mkdir(parents=True)
+    (home / "work.inc").write_text(f"[init]\n\ttemplateDir = {tmp_path / 'tpl'}\n")
+    assert gg.git("config", "--global", "includeIf.gitdir:/nowhere/at/all/.path", str(home / "work.inc")).rc == 0
+    src, dst = make_source(gg, tmp_path), tmp_path / "dst"
+    r = gg.run("git", "clone", "-q", f"file://{src}", str(dst), cwd=tmp_path)
+    assert r.rc == 0, r.text
+    assert not gg.check(dst).blocked, r.text
+
+
+def test_a_large_config_is_read_whole_whatever_it_costs(gg: GG, repo: Path) -> None:
+    """[162] no ceiling on what a config may weigh: an included megabyte is
+    read to its last line, and what that line names is watched. gitguard's
+    reader is a port of git's, character by character, in Python: about
+    3 MB a second where git reads a hundred; a ceiling was considered and
+    left out — one more refusal of a repository git accepts, for a file
+    whose change is refused anyway."""
+    write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    lines = "".join(f"\tkey{i:07d} = an ordinary value of forty characters\n" for i in range(20000))
+    (repo / "big.inc").write_text(f"[section]\n{lines}[core]\n\thooksPath = .githooks\n")
+    assert (repo / "big.inc").stat().st_size > 1_000_000
+    assert gg.git("config", "include.path", "../big.inc", cwd=repo).rc == 0
+    gg.trust(repo)
+    assert not gg.check(repo).blocked
+    write_exec(repo / ".githooks/pre-commit", "#!/bin/sh\ntouch /tmp/evil\n")
+    r = gg.check(repo)
+    assert r.blocked and ".githooks/pre-commit" in r.err, r.text

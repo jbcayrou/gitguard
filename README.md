@@ -382,6 +382,18 @@ Same for a script that runs `git -c core.sshCommand='ssh -i ~/.ssh/deploy'
 …`: name the key in `~/.ssh/config` (`IdentityFile`) instead, or set
 `core.sshCommand` in the repository's config once.
 
+Two settings of your own that keep asking, and what settles them:
+
+- `credential.helper = store --file <f>`: git rewrites `<f>` at every
+  credential it saves, and a file the config names is watched. Use the
+  helper's default file (`credential.helper = store`), which no config
+  names, or a helper that keeps no file (`osxkeychain`, `libsecret`,
+  `cache`).
+- a global `includeIf "gitdir:~/work/"` whose file sets
+  `init.templateDir`: no clone is trusted automatically any more, under
+  `~/work/` or elsewhere — gitguard does not evaluate the condition. Run
+  `gitguard trust` in the clone, as its message says.
+
 Tried on Debian with the system-wide install, on a repository modified
 behind the user's back: starship, oh-my-zsh, fish and `__git_ps1` prompts
 go quiet with no delay (their git has the terminal: refused at once);

@@ -216,6 +216,29 @@ The state key of [157] costs one `stat` and one `resolve` per check, to
 tell whether the gitdir is the one `<directory>/.git` leads to: within
 the noise of the same A/B (53.1–53.8 ms before, 53.7–53.8 ms after).
 
+## 2026-11-13: a very large config ([162])
+
+The config reader is a port of git's parser, character by character
+(`_Src.get`, one Python call per character): it is the price of reading
+every byte as git does. Plain check, macOS, an included file of 8 MB in
+a small repository (40 ms with that file empty):
+
+| the 8 MB are                      | gitguard | git (`config --get-all`) |
+|-----------------------------------|----------|--------------------------|
+| `key = value` lines (150 000)     | 2.85 s   | 0.06 s                   |
+| comment lines                     | 0.54 s   | 0.05 s                   |
+| one comment line                  | 0.53 s   | 0.04 s                   |
+| `[branch "…"]` sections (93 000)  | 3.49 s   | 0.05 s                   |
+
+About 3 MB a second on ordinary lines. The sizes people have: 100 KB
+(1 166 tracked branches) costs 50 ms more per command, 1 MB (11 651)
+0.45 s. For the branch sections more than half of the time is not the
+parser: `_local_remote` is asked once per `branch.<n>.remote = origin`,
+a score of `stat` each for the same answer; memoised per URL in a
+prototype, 1 166 branches go from 70 to 40 ms and 11 651 from 450 to
+150 ms. Not done: kept for the next work on `ConfigScan`. No ceiling on
+the size ([162], DESIGN.md, Known limitations).
+
 ## Where the time goes (2026-10-17 figures)
 
 | component                                             | cost            |

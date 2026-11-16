@@ -138,7 +138,7 @@ are honoured as git honours them.
 
 ## Tests
 
-`python3 -m pytest` (~1300 tests, expected failures: [44], [71], [74], [95], [123], [126], [129], the accepted limitations; ~280 s), before
+`python3 -m pytest` (~1780 tests, expected failures: [44], [71], [74], [95], [123], [126], [129], [158], [160], [161], the accepted limitations; ~410 s), before
 any change. pytest is not on the system python: `python3 -m venv <scratch>/venv
 && venv/bin/pip install pytest`.
 

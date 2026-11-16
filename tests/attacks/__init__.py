@@ -1240,6 +1240,55 @@ gitguard.py refer to this list (how the project reviews itself: DESIGN.md,
      gitdir the tree has: the same key as before. A reference recorded
      earlier for such a repository is under the directory's key: trusted
      once more.
+[158] RCE, accepted (precondition: `rebase.instructionFormat` holding a
+     `%n` in the user's own config, `%s%n%b`): git writes each commit's
+     body on lines of its own in the rebase todo list it then runs, and
+     a body that says `exec <cmd>` is a command. The sandbox commits one
+     (objects and refs are volatile); `git rebase main` runs it, through
+     gitguard as with the real git alone. The todo is written and run by
+     one command, nothing watched moves before it: [44]'s boundary, and
+     git's own behaviour. Found by the fourth agentic audit, 2026-11-03;
+     replayed 2026-11-13. Accepted (xfail record
+     test_rebase_runs_a_commit_body_as_a_todo_line); to report to git.
+[159] Nuisance, accepted: forty files named like loose objects in
+     `objects/17/` make `gc --auto` take the repository for one with
+     thousands of loose objects, at every commit; the collection fails
+     on them, and since a child git does not detach ([117]) it fails in
+     the foreground: four lines of errors and 430 ms where a commit took
+     30 (git 2.50). Nothing runs; the object store is volatile by
+     design, and a sandbox that writes the volume has cheaper ways to be
+     a nuisance. Found by the fourth agentic audit; replayed 2026-11-13.
+     Record: test_fake_loose_objects_are_not_seen_and_git_still_commits.
+[160] False positive, accepted: `credential.helper = store --file <f>`
+     names `<f>`, a file of data git rewrites at every credential it
+     approves or rejects; watched as any file a program key names, each
+     rewrite is refused at the next command. The helper is a command
+     line: no reader says which of its words is a script and which a
+     data file, and a list of helpers and their options would be curated
+     by hand ([71] [74]'s rule). Way out: the helper's default file,
+     which no config names. Found by the fourth agentic audit; replayed
+     2026-11-13 (xfail record
+     test_credential_store_file_rewritten_by_git_is_silent).
+[161] False positive, accepted: a global `includeIf "gitdir:<dir>/"`
+     whose file sets `init.templateDir` withholds the auto-trust of
+     every clone, under `<dir>` or not: the gate reads every include
+     whatever its condition, as the scan does — a superset; evaluating
+     git's conditions (`gitdir`, `gitdir/i`, `onbranch`,
+     `hasconfig:remote.*.url`, their globbing and symlink rules) is one
+     more reader to hold to git, for one `gitguard trust` per clone.
+     Found by the third agentic audit, 2026-11-03; replayed 2026-11-13
+     (xfail record
+     test_clone_is_auto_trusted_despite_a_template_in_an_inactive_include).
+[162] Slow, accepted: the config reader is a port of git's, character
+     by character, in Python — about 3 MB a second where git reads a
+     hundred (8 MB of `key = value` lines: 2.9 s against 0.06; of
+     comments: 0.5 s). A watched file the sandbox inflates delays the
+     refusal of the change it is; a legitimate megabyte (11 600 tracked
+     branches) costs half a second per command. A ceiling was considered
+     and left out (2026-11-13): one more refusal of a repository git
+     accepts, and a constant to justify, for a nuisance like [159]'s.
+     Found by the third agentic audit. Record:
+     test_a_large_config_is_read_whole_whatever_it_costs.
 """
 from __future__ import annotations
 

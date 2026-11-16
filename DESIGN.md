@@ -1399,8 +1399,8 @@ read) and python 3.9 is not offered — the Linux runner is named
 (`ubuntu-24.04`), and Ubuntu 26.04 is tested with its own git. A new git
 enters the matrix with its inventory.
 
-**`python3 -m pytest`** (~1300 tests, expected failures [44], [71], [74], [95], [123], [126], [129] — accepted
-limitations; ~280 s, ~60 s with `-n 8` on the command line),
+**`python3 -m pytest`** (~1780 tests, expected failures [44], [71], [74], [95], [123], [126], [129], [158],
+[160], [161] — accepted limitations; ~410 s, ~70 s with `-n 8` on the command line),
 to run before any change:
 
 - `tests/attacks/` — **the attack corpus**, one module per family (`gitdir`,
@@ -1919,11 +1919,65 @@ the files, not the order.
   git reads as a boolean and the newest no longer does (`merge.stat` in
   2.47) keeps the generic rule there, a tree file named `false` watched
   (what is left of [129] for such a key; a union of inventories is the
-  mechanical fix, not decided).
+  mechanical fix, left out on 2026-11-13: four more snapshots to classify
+  at every git upgrade, for a file named `false` watched under an old
+  git).
 - `_git_maybe_bool` reads a `0b` literal as a number ([141]); git does so
   only where its libc has C23's strtol (glibc ≥ 2.38) and dies on it
   elsewhere (macOS): the parity test holds where git reads it, and the
   answer is safe on both.
+- **Accepted [158]**, the [44] boundary for a rebase: with
+  `rebase.instructionFormat` holding a `%n` in the user's own config
+  (`%s%n%b`, subject then body), git writes each commit's body on lines
+  of its own in the todo list it then runs, and a body that says
+  `exec <cmd>` is a command. The sandbox commits one — objects and refs
+  are volatile — and `git rebase main` runs it. The todo is written and
+  run by one command: nothing gitguard watches moves before it, and the
+  todo readers (`check_volatile_readers`) see the files of a sequence
+  that is stopped, not of one that has not started. git does the same
+  without gitguard; it is git's to fix (to report), and the setting is a
+  rare one. Way out: no `%n` in `rebase.instructionFormat`. xfail record:
+  `test_rebase_runs_a_commit_body_as_a_todo_line`.
+- **Accepted [159]**, a nuisance: forty files named like loose objects in
+  `objects/17/` — the one directory `gc --auto` counts — make git collect
+  at every commit; the files are no objects, the collection fails, and
+  because a child git does not detach ([117], `keep_attached`) it fails
+  in the foreground: four lines of errors and 430 ms where a commit took
+  30 (git 2.50, replayed 2026-11-13). The real git alone fails the same
+  way, out of sight. Nothing runs; the object store is volatile by
+  design, the check stays silent, the commit is made. Way out: delete
+  the files (`git fsck` names them).
+- **Accepted [160]**: `credential.helper = store --file <f>` names `<f>`,
+  where git writes every credential it approves and erases every one it
+  rejects; a file a program key names is watched, so each rewrite is a
+  change, refused at the next command. A helper is a command line:
+  nothing in git's source says which of its words is a script and which
+  a data file (the mechanical exclusions, `DATA_KEYS` and `VALUE_KEYS`,
+  are keys, not words), and a table of helpers and their options would
+  be curated by hand — the rule of [71] [74]. Way out: the helper's
+  default file, which no config names (`credential.helper = store`), or
+  a helper that keeps no file (`osxkeychain`, `libsecret`, `cache`).
+  xfail record: `test_credential_store_file_rewritten_by_git_is_silent`.
+- **Accepted [161]**: a global `includeIf "gitdir:~/work/"` whose file
+  sets `init.templateDir` withholds the auto-trust of **every** clone,
+  under `~/work/` or not. The gate reads every include whatever its
+  condition (`iter_global_config`), as the scan does: a superset.
+  Evaluating the conditions as git does — `gitdir` and `gitdir/i` with
+  their globbing, trailing-slash and symlink rules, `onbranch`,
+  `hasconfig:remote.*.url` — is one more reader to hold to git, and
+  reading them wrongly auto-trusts a clone built from a template of the
+  volume ([42] [150]); the cost of not reading them is one `gitguard
+  trust` per clone, which the message asks for. xfail record:
+  `test_clone_is_auto_trusted_despite_a_template_in_an_inactive_include`.
+- **Accepted [162]**, slow on a very large config: the reader is a port
+  of git's, character by character, in Python — about 3 MB a second
+  where git reads a hundred (PERF.md). A megabyte of config, 11 600
+  tracked branches, costs half a second per command; a watched file the
+  sandbox inflates to 50 MB delays by seconds the refusal of the change
+  it is. A ceiling on the size was considered and left out: one more
+  refusal of a repository git accepts and a constant to justify, for a
+  nuisance of [159]'s kind. Record:
+  `test_a_large_config_is_read_whole_whatever_it_costs`.
 - gitguard.py has no dependency outside the stdlib (diff via `difflib`); the
   tests need `pytest` and `git`.
 - A context without a terminal and without a desktop session (ssh, cron,
